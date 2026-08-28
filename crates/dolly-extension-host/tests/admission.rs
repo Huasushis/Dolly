@@ -238,13 +238,18 @@ fn accepted_g1_frame_becomes_fenced_premise_and_replay_is_same_key() {
         CanonicalJsonValue::String("page".into()),
     )])
     .unwrap();
+    let authority = store.authenticated_host_connection().unwrap();
     let sdk_request = CapabilityRequest::new("host.block.get", arguments.clone()).unwrap();
-    let admitted_request = admit_sdk_capability(&admitted, sdk_request).unwrap();
+    let admitted_request =
+        admit_sdk_capability(&admitted, sdk_request.clone(), &store, &authority).unwrap();
     assert_eq!(admitted_request.method(), "host.block.get");
     assert_eq!(admitted_request.arguments(), &arguments);
+    let repeated_request =
+        admit_sdk_capability(&admitted, sdk_request.clone(), &store, &authority).unwrap();
+    assert_eq!(repeated_request, admitted_request);
     let fabricated = CapabilityRequest::new("host.model.invoke", arguments.clone()).unwrap();
     assert_eq!(
-        admit_sdk_capability(&admitted, fabricated).unwrap_err(),
+        admit_sdk_capability(&admitted, fabricated, &store, &authority).unwrap_err(),
         AdmissionError::CapabilityDenied
     );
     let result = ResultData::success(None, None);
@@ -267,6 +272,16 @@ fn accepted_g1_frame_becomes_fenced_premise_and_replay_is_same_key() {
     store
         .revoke_host_capability_grant(&authority, "org.example.extension", "timer")
         .unwrap();
+    assert_eq!(
+        admit_sdk_capability(
+            &admitted,
+            sdk_request.clone(),
+            &store,
+            &authority,
+        )
+        .unwrap_err(),
+        AdmissionError::CapabilityDenied
+    );
     assert_eq!(
         admit_activation(
             &premise,
@@ -315,6 +330,17 @@ fn accepted_g1_frame_becomes_fenced_premise_and_replay_is_same_key() {
         "org.example.extension",
         premise.fence().extension_generation(),
     );
+    assert_eq!(
+        admit_sdk_capability(
+            &admitted,
+            sdk_request.clone(),
+            &store,
+            &authority,
+        )
+        .unwrap_err(),
+        AdmissionError::CapabilityDenied
+    );
+
     let replay = {
         drop(store);
         let mut engine = RuntimeTransactionEngine::new(&mut connection).unwrap();
@@ -322,7 +348,7 @@ fn accepted_g1_frame_becomes_fenced_premise_and_replay_is_same_key() {
             .dispatch_execution(&premise, "g2-dispatch-replay", &lease_token, &input())
             .unwrap()
     };
-    let store = SqliteCoreStore::new(&mut connection).unwrap();
+    let mut store = SqliteCoreStore::new(&mut connection).unwrap();
     let replayed =
         admit_activation(&premise, &replay, &store, FrameLimits::defaults()).unwrap();
     assert_eq!(replayed.replay_key(), admitted.replay_key());
@@ -332,4 +358,45 @@ fn accepted_g1_frame_becomes_fenced_premise_and_replay_is_same_key() {
     assert_eq!(replay_receipt.replay_key(), receipt.replay_key());
     assert_eq!(replay_receipt.result_digest(), receipt.result_digest());
     assert_eq!(replay_receipt.receipt_digest(), receipt.receipt_digest());
+    let current_authority = store.authenticated_host_connection().unwrap();
+    let current_request =
+        admit_sdk_capability(&replayed, sdk_request.clone(), &store, &current_authority)
+            .unwrap();
+    let repeated_request =
+        admit_sdk_capability(&replayed, sdk_request.clone(), &store, &current_authority)
+            .unwrap();
+    assert_eq!(repeated_request, current_request);
+
+    let config_b = json!({
+        "execution_timeout_ms": 120000,
+        "lease_grace_ms": 30000,
+        "fencing_grace_ms": 5000,
+        "extension_connection_id": "g2-extension-connection-b",
+        "worker_epoch": "0198ab31-6c44-7e8a-b2bb-000000000111",
+        "worker_epoch_fence": 18
+    });
+    let config_b_transition = store
+        .transact(
+            &CoreCommand::InstallConfig(InstallConfigCommand {
+                command_id: "g2-config-b".into(),
+                revision: 2,
+                digest: digest(&config_b),
+                effective_config: config_b,
+            }),
+            &input(),
+        )
+        .unwrap();
+    assert_eq!(config_b_transition.outcome, TransitionOutcome::Committed);
+    let rotated_authority = store.rotate_host_connection(&current_authority).unwrap();
+    assert_eq!(rotated_authority.incarnation_revision(), 2);
+    assert_eq!(
+        admit_sdk_capability(
+            &replayed,
+            sdk_request,
+            &store,
+            &rotated_authority,
+        )
+        .unwrap_err(),
+        AdmissionError::CapabilityDenied
+    );
 }

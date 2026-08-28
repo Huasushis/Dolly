@@ -1045,6 +1045,43 @@ fn load_host_capability_grant_row(
         grant_digest: row_grant_digest,
     }))
 }
+fn load_current_host_capability_grant(
+    transaction: &Transaction<'_>,
+    authority: &HostConnectionAuthority,
+    extension_id: &str,
+    module_id: &str,
+    expected_grant: Option<(i64, &str)>,
+) -> StorageResult<Option<HostCapabilityGrant>> {
+    let snapshot = load_snapshot(transaction)?.0;
+    if host_connection_authority_from_snapshot(&snapshot)? != *authority {
+        return Err(StorageError::IdempotencyConflict);
+    }
+    let Some(grant) = load_host_capability_grant_row(transaction, extension_id, module_id)? else {
+        return Ok(None);
+    };
+    if grant.record.revoked {
+        return Ok(None);
+    }
+    let worker_epoch = authority.worker_epoch().to_string();
+    if grant.extension_id() != extension_id
+        || grant.module_id() != module_id
+        || grant.extension_connection_id() != authority.extension_connection_id()
+        || grant.worker_epoch() != worker_epoch
+        || grant.worker_epoch_fence() != authority.worker_epoch_fence()
+        || grant.incarnation_revision() != authority.incarnation_revision()
+    {
+        return Ok(None);
+    }
+    if let Some((expected_revision, expected_digest)) = expected_grant {
+        if grant.grant_revision() != expected_revision
+            || grant.grant_digest() != expected_digest
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(grant))
+}
+
 fn host_connection_identity_from_snapshot(
     snapshot: &CoreSnapshot,
 ) -> StorageResult<HostConnectionIdentity> {
@@ -1617,14 +1654,54 @@ impl<'connection> SqliteCoreStore<'connection> {
     /// Load the current active grant for one extension package and module.
     pub fn current_host_capability_grant(
         &self,
+        authority: &HostConnectionAuthority,
         extension_id: &str,
         module_id: &str,
     ) -> StorageResult<Option<HostCapabilityGrant>> {
         validate_grant_text(extension_id)?;
         validate_grant_text(module_id)?;
         ensure_host_capability_grant_schema(self.connection)?;
-        Ok(load_host_capability_grant_row(self.connection, extension_id, module_id)?
-            .filter(|grant| !grant.record.revoked))
+        let transaction = Transaction::new_unchecked(self.connection, TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let result = load_current_host_capability_grant(
+            &transaction,
+            authority,
+            extension_id,
+            module_id,
+            None,
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(result)
+    }
+
+    /// Verify one admitted premise against the current Host grant and authority
+    /// in one immediate SQLite read transaction.
+    pub fn verify_host_capability_grant(
+        &self,
+        authority: &HostConnectionAuthority,
+        extension_id: &str,
+        module_id: &str,
+        grant_revision: i64,
+        grant_digest: &str,
+    ) -> StorageResult<Option<HostCapabilityGrant>> {
+        validate_grant_text(extension_id)?;
+        validate_grant_text(module_id)?;
+        if !(1..=CORE_MAX_SAFE_INTEGER).contains(&grant_revision) {
+            return Err(StorageError::Corrupt);
+        }
+        validate_grant_digest(grant_digest)?;
+        ensure_host_capability_grant_schema(self.connection)?;
+        let transaction = Transaction::new_unchecked(self.connection, TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let result = load_current_host_capability_grant(
+            &transaction,
+            authority,
+            extension_id,
+            module_id,
+            Some((grant_revision, grant_digest)),
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(result)
     }
 
     /// Allocate a request identity while atomically checking the current Host

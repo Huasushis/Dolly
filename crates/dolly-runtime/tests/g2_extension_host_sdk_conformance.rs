@@ -407,6 +407,9 @@ fn g2_admission_001_valid_committed_g1_module_activate_reaches_one_host_admissio
     );
     let premise = &dispatch.premise;
     let store = SqliteCoreStore::new(&mut dispatch.connection).expect("core schema");
+    let authority = store
+        .authenticated_host_connection()
+        .expect("current Host authority");
     let admitted = dolly_extension_host::admit_activation(
         &dispatch.premise,
         &dispatch.result,
@@ -580,15 +583,26 @@ fn g2_admission_001_valid_committed_g1_module_activate_reaches_one_host_admissio
         dolly_extension_sdk::CapabilityRequest::new("host.block.get", arguments.clone())
             .expect("declared SDK capability");
     let admitted_request =
-        dolly_extension_host::admit_sdk_capability(&admitted, sdk_request)
-            .expect("declared capability must pass Host admission");
+        dolly_extension_host::admit_sdk_capability(
+            &admitted,
+            sdk_request.clone(),
+            &store,
+            &authority,
+        )
+        .expect("declared capability must pass Host admission");
     assert_eq!(admitted_request.method(), "host.block.get");
     assert_eq!(admitted_request.arguments(), &arguments);
     let fabricated =
         dolly_extension_sdk::CapabilityRequest::new("host.model.invoke", arguments)
             .expect("fabricated SDK capability");
     assert_eq!(
-        dolly_extension_host::admit_sdk_capability(&admitted, fabricated).unwrap_err(),
+        dolly_extension_host::admit_sdk_capability(
+            &admitted,
+            fabricated,
+            &store,
+            &authority,
+        )
+        .unwrap_err(),
         dolly_extension_host::AdmissionError::CapabilityDenied
     );
 }

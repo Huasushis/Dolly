@@ -126,7 +126,7 @@ fn host_grant_is_durable_sealed_monotonic_and_revocable() {
 
     install_grant(&mut store, &authority, 1, &["host.block.get"]);
     let first = store
-        .current_host_capability_grant("org.example.extension", "timer")
+        .current_host_capability_grant(&authority, "org.example.extension", "timer")
         .unwrap()
         .unwrap();
     assert_eq!(first.grant_revision(), 1);
@@ -141,7 +141,7 @@ fn host_grant_is_durable_sealed_monotonic_and_revocable() {
         &["host.block.get", "host.page.read"],
     );
     let updated = store
-        .current_host_capability_grant("org.example.extension", "timer")
+        .current_host_capability_grant(&authority, "org.example.extension", "timer")
         .unwrap()
         .unwrap();
     assert_eq!(updated.grant_revision(), 2);
@@ -194,7 +194,11 @@ fn host_grant_is_durable_sealed_monotonic_and_revocable() {
         )
         .unwrap();
     assert!(store
-        .current_host_capability_grant("org.example.extension", "timer")
+        .current_host_capability_grant(
+            &rotated_authority,
+            "org.example.extension",
+            "timer",
+        )
         .unwrap()
         .is_none());
     drop(store);
@@ -202,8 +206,13 @@ fn host_grant_is_durable_sealed_monotonic_and_revocable() {
 
     let mut reopened_connection = Connection::open(&path).unwrap();
     let reopened_store = SqliteCoreStore::new(&mut reopened_connection).unwrap();
+    let reopened_authority = reopened_store.authenticated_host_connection().unwrap();
     assert!(reopened_store
-        .current_host_capability_grant("org.example.extension", "timer")
+        .current_host_capability_grant(
+            &reopened_authority,
+            "org.example.extension",
+            "timer",
+        )
         .unwrap()
         .is_none());
 }

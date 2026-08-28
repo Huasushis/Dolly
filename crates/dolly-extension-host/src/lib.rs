@@ -22,7 +22,7 @@ use dolly_runtime::{
     DispatchResult, ExecutionOrder, ExecutionPremise, ReplayEvidence, ReplayMode, ReplayScope,
 };
 use dolly_schema::{ActivationManifest, BlockEnvelope, embedded_schema_catalog};
-use dolly_storage::{HostCapabilityGrant, SqliteCoreStore};
+use dolly_storage::{HostCapabilityGrant, HostConnectionAuthority, SqliteCoreStore};
 use serde::de::{DeserializeOwned, IntoDeserializer};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -308,20 +308,34 @@ impl AdmittedCapabilityRequest {
     }
 }
 
-/// Consume SDK request data only after the G1-derived premise exists.
+/// Consume SDK request data only after the G1-derived premise, current Host
+/// authority, and current durable grant have all been verified.
 pub fn admit_sdk_capability(
     premise: &FencedInvocationPremise,
     request: SdkCapabilityRequest,
+    store: &SqliteCoreStore<'_>,
+    authority: &HostConnectionAuthority,
 ) -> Result<AdmittedCapabilityRequest, AdmissionError> {
     let policy = premise
         .capability_policy
         .as_ref()
+        .ok_or(AdmissionError::CapabilityDenied)?;
+    let grant = store
+        .verify_host_capability_grant(
+            authority,
+            &policy.extension_id,
+            premise.module_id(),
+            policy.grant_revision,
+            &policy.grant_digest,
+        )
+        .map_err(|_| AdmissionError::CapabilityDenied)?
         .ok_or(AdmissionError::CapabilityDenied)?;
     if !policy.matches(premise)
         || !policy
             .allowed_methods
             .iter()
             .any(|method| method == request.method())
+        || !grant.allows(request.method())
     {
         return Err(AdmissionError::CapabilityDenied);
     }
@@ -330,6 +344,7 @@ pub fn admit_sdk_capability(
         arguments: request.arguments().clone(),
     })
 }
+
 
 /// Fail-closed G2 admission errors. Raw lease tokens are never included.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -388,8 +403,15 @@ pub fn admit_activation(
     let (extension_id, requested_methods) =
         derive_capability_methods(premise, dispatch, &parsed.manifest)?;
     let capability_binding = if let Some(extension_id) = extension_id {
+        let authority = store
+            .authenticated_host_connection()
+            .map_err(|_| AdmissionError::CapabilityDenied)?;
         let grant = store
-            .current_host_capability_grant(&extension_id, premise.identity().module_id())
+            .current_host_capability_grant(
+                &authority,
+                &extension_id,
+                premise.identity().module_id(),
+            )
             .map_err(|_| AdmissionError::CapabilityDenied)?
             .ok_or(AdmissionError::CapabilityDenied)?;
         validate_host_capability_grant(&grant, &extension_id, premise, &parsed.manifest)?;
