@@ -22,7 +22,6 @@ use serde_json::Value;
 
 use crate::database::map_sqlite_error;
 use crate::error::{StorageError, StorageResult};
-use crate::grant_fence;
 
 /// One atomic Core transition plus its journal under a single storage commit.
 ///
@@ -1250,7 +1249,7 @@ fn host_authority_matches(
         && authority.incarnation_revision() == incarnation_revision)
 }
 
-fn allocate_host_request_transition(
+pub fn allocate_host_request_transition(
     state: &CoreSnapshot,
     command_id: &str,
     authority: &HostConnectionAuthority,
@@ -1362,24 +1361,298 @@ fn allocate_host_request_transition(
     })
 }
 
-/// The exact durable Host grant fields one activation must match.
+/// One request-scoped transactional activation.
 ///
-/// The daemon fills this from the launch identity and the request manifest;
-/// the fence acquisition compares every field against the current grant
-/// inside the same immediate transaction that publishes the fence row.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GrantFenceExpectation {
-    pub extension_id: String,
-    pub module_id: String,
-    pub extension_connection_id: String,
-    pub worker_epoch: String,
-    pub worker_epoch_fence: i64,
-    pub incarnation_revision: i64,
-    pub extension_generation: i64,
-    pub descriptor_revision: i64,
-    pub manifest_revision: i64,
-    pub graph_revision: i64,
-    pub manifest_digest: String,
+/// Holds one immediate SQLite write transaction for the whole request: Host
+/// authority and grant validation, manifest acceptance, request allocation,
+/// lease issue, dispatch/journal, and the final G2 admission all execute
+/// inside it and commit once via [`Self::commit`]. Dropping without commit
+/// rolls back every request-owned activation, lease, journal, reservation,
+/// and operation row, so a daemon kill at any stage leaves no durable partial
+/// activation and no fence residue. The immediate transaction also holds the
+/// database write lock, which serializes grant replace/revoke commits from
+/// any other connection against this activation.
+pub struct ActivationTransaction<'connection> {
+    transaction: Option<Transaction<'connection>>,
+}
+
+impl<'connection> ActivationTransaction<'connection> {
+    /// Begin one immediate activation transaction and initialize the Core
+    /// schema inside it.
+    pub fn begin(connection: &'connection mut Connection) -> StorageResult<Self> {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        initialize_core_engine_schema_in_transaction(&transaction)?;
+        Ok(Self {
+            transaction: Some(transaction),
+        })
+    }
+
+    fn transaction(&self) -> StorageResult<&Transaction<'connection>> {
+        self.transaction.as_ref().ok_or(StorageError::Corrupt)
+    }
+
+    fn transaction_mut(&mut self) -> StorageResult<&mut Transaction<'connection>> {
+        self.transaction.as_mut().ok_or(StorageError::Corrupt)
+    }
+
+    /// The verified snapshot as of the last step of this transaction,
+    /// including its own uncommitted writes.
+    pub fn snapshot(&self) -> StorageResult<CoreSnapshot> {
+        load_snapshot(self.transaction()?).map(|(snapshot, _, _)| snapshot)
+    }
+
+    /// The exact current Host authority inside this transaction.
+    pub fn authority(&self) -> StorageResult<HostConnectionAuthority> {
+        let (snapshot, _, _) = load_snapshot(self.transaction()?)?;
+        host_connection_authority_from_snapshot(&snapshot)
+    }
+
+    /// The current active grant inside this transaction.
+    pub fn current_grant(
+        &self,
+        authority: &HostConnectionAuthority,
+        extension_id: &str,
+        module_id: &str,
+    ) -> StorageResult<Option<HostCapabilityGrant>> {
+        load_current_host_capability_grant(
+            self.transaction()?,
+            authority,
+            extension_id,
+            module_id,
+            None,
+        )
+    }
+
+    /// Reduce and persist one Core command as the next step of this
+    /// activation. An exact command replay returns the retained transition
+    /// without writing another state revision, operation, or journal row.
+    pub fn apply(
+        &mut self,
+        command: &CoreCommand,
+        input: &EnvironmentInput,
+    ) -> StorageResult<Transition> {
+        let (snapshot, state_revision, state_hash) = load_snapshot(self.transaction()?)?;
+        let transition = reduce(&snapshot, command, input);
+        self.write_transition(command, input, transition, &snapshot, &state_hash, state_revision)
+    }
+
+    /// Persist a caller-built transition (for example the storage
+    /// request-allocation transition) as the next step of this activation.
+    /// Replay identity and journaling behave exactly like [`Self::apply`].
+    pub fn apply_with_transition(
+        &mut self,
+        command: &CoreCommand,
+        input: &EnvironmentInput,
+        transition: Transition,
+    ) -> StorageResult<Transition> {
+        let (snapshot, state_revision, state_hash) = load_snapshot(self.transaction()?)?;
+        self.write_transition(
+            command,
+            input,
+            transition,
+            &snapshot,
+            &state_hash,
+            state_revision,
+        )
+    }
+
+    fn write_transition(
+        &mut self,
+        command: &CoreCommand,
+        input: &EnvironmentInput,
+        transition: Transition,
+        snapshot: &CoreSnapshot,
+        state_hash: &str,
+        state_revision: i64,
+    ) -> StorageResult<Transition> {
+        let (_, request_digest) = canonical_digest(&TransactionRequest { command, input })?;
+        let command_id = command.command_id().to_owned();
+        if !command_id.is_empty() {
+            let existing: Option<(String, String, Vec<u8>)> = self
+                .transaction()?
+                .query_row(
+                    "SELECT request_digest, transition_digest, transition_jcs
+                     FROM core_operations WHERE command_id = ?1",
+                    [&command_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(map_sqlite_error)?;
+            if let Some((stored_request_digest, stored_transition_digest, transition_bytes)) =
+                existing
+            {
+                if stored_request_digest != request_digest {
+                    return Err(StorageError::IdempotencyConflict);
+                }
+                let replayed = decode_canonical::<Transition>(&transition_bytes)?;
+                let (_, computed_transition_digest) = canonical_digest(&replayed)?;
+                if computed_transition_digest != stored_transition_digest {
+                    return Err(StorageError::Corrupt);
+                }
+                return Ok(replayed);
+            }
+        }
+        if transition.outcome == TransitionOutcome::RolledBack {
+            if transition.state != *snapshot {
+                return Err(StorageError::Corrupt);
+            }
+            if !command_id.is_empty() {
+                let (transition_bytes, transition_digest) = canonical_digest(&transition)?;
+                self.transaction_mut()?
+                    .execute(
+                        "INSERT INTO core_operations
+                         (command_id, request_digest, transition_digest, transition_jcs, state_revision)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            command_id,
+                            request_digest,
+                            transition_digest,
+                            transition_bytes,
+                            state_revision
+                        ],
+                    )
+                    .map_err(map_sqlite_error)?;
+            }
+            return Ok(transition);
+        }
+        let state_changed =
+            self.persist_committed(&command_id, &request_digest, &transition, state_hash, state_revision)?;
+        self.append_journal(&transition.events, state_changed)?;
+        Ok(transition)
+    }
+
+    fn persist_committed(
+        &mut self,
+        command_id: &str,
+        request_digest: &str,
+        transition: &Transition,
+        expected_state_hash: &str,
+        expected_state_revision: i64,
+    ) -> StorageResult<bool> {
+        let (state_bytes, state_hash) = encode_projection(&transition.state)?;
+        if state_hash != transition.state_hash
+            || transition.state.projection_kind != PROJECTION_KIND
+        {
+            return Err(StorageError::Corrupt);
+        }
+        let (current_hash, current_revision): (String, i64) = self
+            .transaction()?
+            .query_row(
+                "SELECT state_hash, state_revision FROM core_state WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(map_sqlite_error)?;
+        if &current_hash != expected_state_hash || current_revision != expected_state_revision {
+            return Err(StorageError::SequenceConflict);
+        }
+        let state_changed = current_hash != state_hash;
+        let next_revision = if state_changed {
+            expected_state_revision
+                .checked_add(1)
+                .ok_or(StorageError::SequenceConflict)?
+        } else {
+            expected_state_revision
+        };
+        if state_changed {
+            self.transaction_mut()?
+                .execute(
+                    "UPDATE core_state
+                     SET state_revision = ?1, state_hash = ?2, state_jcs = ?3
+                     WHERE singleton = 1",
+                    params![next_revision, state_hash, state_bytes],
+                )
+                .map_err(map_sqlite_error)?;
+        }
+        if !command_id.is_empty() {
+            let (transition_bytes, transition_digest) = canonical_digest(transition)?;
+            self.transaction_mut()?
+                .execute(
+                    "INSERT INTO core_operations
+                     (command_id, request_digest, transition_digest, transition_jcs, state_revision)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        command_id,
+                        request_digest,
+                        transition_digest,
+                        transition_bytes,
+                        next_revision
+                    ],
+                )
+                .map_err(map_sqlite_error)?;
+        }
+        Ok(state_changed)
+    }
+
+    fn append_journal(&mut self, events: &[CoreEvent], state_changed: bool) -> StorageResult<()> {
+        if !state_changed && !events.is_empty() {
+            return Err(StorageError::Corrupt);
+        }
+        let mut next_journal_seq: i64 = self
+            .transaction()?
+            .query_row(
+                "SELECT COALESCE(MAX(journal_seq), 0) + 1 FROM core_journal",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        for event in events {
+            if event.commit_seq <= 0 {
+                return Err(StorageError::Corrupt);
+            }
+            let (event_bytes, event_digest) = canonical_digest(event)?;
+            self.transaction_mut()?
+                .execute(
+                    "INSERT INTO core_journal
+                     (journal_seq, commit_seq, command_id, event_digest, event_jcs)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        next_journal_seq,
+                        event.commit_seq,
+                        event.command_id,
+                        event_digest,
+                        event_bytes
+                    ],
+                )
+                .map_err(map_sqlite_error)?;
+            next_journal_seq = next_journal_seq
+                .checked_add(1)
+                .ok_or(StorageError::SequenceConflict)?;
+        }
+        Ok(())
+    }
+
+    /// Commit the whole activation atomically.
+    pub fn commit(self) -> StorageResult<()> {
+        let transaction = self.transaction.ok_or(StorageError::Corrupt)?;
+        transaction.commit().map_err(map_sqlite_error)
+    }
+}
+
+/// Build the immutable Host request allocation Core command for one
+/// activation step. The identity is derived from the current snapshot, so it
+/// can be composed into the request-scoped [`ActivationTransaction`].
+pub fn host_request_allocation_command(
+    snapshot: &CoreSnapshot,
+    authority: &HostConnectionAuthority,
+    activation_id: &str,
+    lease_id: &str,
+) -> StorageResult<CoreCommand> {
+    let command_id = format!(
+        "runtime-host-request-allocation-{}",
+        snapshot.next_commit_seq
+    );
+    let block = serde_json::json!({
+        "activation_id": activation_id,
+        "lease_id": lease_id,
+        "extension_connection_id": authority.extension_connection_id(),
+        "worker_epoch_id": authority.worker_epoch().to_string(),
+        "worker_epoch": authority.worker_epoch_fence(),
+        "incarnation_revision": authority.incarnation_revision(),
+    });
+    host_lifecycle_command(command_id, "host_request_allocation", block)
 }
 
 /// The production Core store façade. It keeps semantic transitions on the
@@ -1683,14 +1956,10 @@ impl<'connection> SqliteCoreStore<'connection> {
             methods,
         )?;
         ensure_host_capability_grant_schema(self.connection)?;
-        grant_fence::ensure_grant_fence_schema(self.connection)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite_error)?;
-        if grant_fence::fence_is_active(&transaction)? {
-            return Err(StorageError::IdempotencyConflict);
-        }
         let snapshot = load_snapshot(&transaction)?.0;
         if host_connection_authority_from_snapshot(&snapshot)? != *authority {
             return Err(StorageError::IdempotencyConflict);
@@ -1734,14 +2003,10 @@ impl<'connection> SqliteCoreStore<'connection> {
         validate_grant_text(extension_id)?;
         validate_grant_text(module_id)?;
         ensure_host_capability_grant_schema(self.connection)?;
-        grant_fence::ensure_grant_fence_schema(self.connection)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite_error)?;
-        if grant_fence::fence_is_active(&transaction)? {
-            return Err(StorageError::IdempotencyConflict);
-        }
         let snapshot = load_snapshot(&transaction)?.0;
         if host_connection_authority_from_snapshot(&snapshot)? != *authority {
             return Err(StorageError::IdempotencyConflict);
@@ -1818,91 +2083,6 @@ impl<'connection> SqliteCoreStore<'connection> {
         Ok(result)
     }
 
-    /// Atomically re-validate the current durable Host grant against the
-    /// expectation and publish one active fence row.
-    ///
-    /// Until the matching [`Self::release_grant_fence`] commits, no other
-    /// connection can install or revoke this grant, so the activation's G1
-    /// transitions and its final G2 admission observe one frozen grant. The
-    /// comparison mirrors every request-controlled field the operational
-    /// admission checks against the same grant.
-    pub fn acquire_grant_fence(
-        &mut self,
-        authority: &HostConnectionAuthority,
-        expectation: &GrantFenceExpectation,
-    ) -> StorageResult<()> {
-        grant_fence::ensure_grant_fence_schema(self.connection)?;
-        let transaction =
-            Transaction::new_unchecked(self.connection, TransactionBehavior::Immediate)
-                .map_err(map_sqlite_error)?;
-        let (snapshot, _, _) = load_snapshot(&transaction)?;
-        if host_connection_authority_from_snapshot(&snapshot)? != *authority {
-            return Err(StorageError::IdempotencyConflict);
-        }
-        let grant = load_current_host_capability_grant(
-            &transaction,
-            authority,
-            &expectation.extension_id,
-            &expectation.module_id,
-            None,
-        )?
-        .ok_or(StorageError::IdempotencyConflict)?;
-        if grant.extension_id() != expectation.extension_id
-            || grant.module_id() != expectation.module_id
-            || grant.extension_connection_id() != expectation.extension_connection_id
-            || grant.worker_epoch() != expectation.worker_epoch
-            || grant.worker_epoch_fence() != expectation.worker_epoch_fence
-            || grant.incarnation_revision() != expectation.incarnation_revision
-            || grant.extension_generation() != expectation.extension_generation
-            || grant.descriptor_revision() != expectation.descriptor_revision
-            || grant.manifest_revision() != expectation.manifest_revision
-            || grant.graph_revision() != expectation.graph_revision
-            || grant.manifest_digest() != expectation.manifest_digest
-        {
-            return Err(StorageError::IdempotencyConflict);
-        }
-        let graph_digest = snapshot.graph.get("digest").and_then(Value::as_str);
-        let descriptor_digest = snapshot
-            .graph
-            .get("graph")
-            .and_then(|graph| graph.get("descriptors"))
-            .and_then(Value::as_object)
-            .and_then(|descriptors| descriptors.get(&expectation.module_id))
-            .and_then(|entry| entry.get("source_descriptor_digest"))
-            .and_then(Value::as_str);
-        if graph_digest != Some(grant.graph_digest())
-            || descriptor_digest != Some(grant.descriptor_digest())
-        {
-            return Err(StorageError::IdempotencyConflict);
-        }
-        transaction
-            .execute(
-                "INSERT INTO grant_activation_fence (owner, grant_revision, active)
-                 VALUES (?1, ?2, 1)
-                 ON CONFLICT(owner) DO UPDATE SET
-                     grant_revision = excluded.grant_revision, active = 1",
-                params![expectation.module_id, grant.grant_revision()],
-            )
-            .map_err(map_sqlite_error)?;
-        transaction.commit().map_err(map_sqlite_error)
-    }
-
-    /// Release the fence for one Module owner, restoring grant mutation
-    /// authority on every connection.
-    pub fn release_grant_fence(&mut self, module_id: &str) -> StorageResult<()> {
-        grant_fence::ensure_grant_fence_schema(self.connection)?;
-        let transaction =
-            Transaction::new_unchecked(self.connection, TransactionBehavior::Immediate)
-                .map_err(map_sqlite_error)?;
-        transaction
-            .execute(
-                "DELETE FROM grant_activation_fence WHERE owner = ?1",
-                params![module_id],
-            )
-            .map_err(map_sqlite_error)?;
-        transaction.commit().map_err(map_sqlite_error)
-    }
-
     /// Allocate a request identity while atomically checking the current Host
     /// connection authority.
     pub fn allocate_host_request(
@@ -1913,20 +2093,9 @@ impl<'connection> SqliteCoreStore<'connection> {
         input: &EnvironmentInput,
     ) -> StorageResult<Transition> {
         let seed = self.snapshot()?;
-        let command_id = format!(
-            "runtime-host-request-allocation-{}",
-            seed.next_commit_seq
-        );
-        let block = serde_json::json!({
-            "activation_id": activation_id,
-            "lease_id": lease_id,
-            "extension_connection_id": authority.extension_connection_id(),
-            "worker_epoch_id": authority.worker_epoch().to_string(),
-            "worker_epoch": authority.worker_epoch_fence(),
-            "incarnation_revision": authority.incarnation_revision(),
-        });
         let command =
-            host_lifecycle_command(command_id.clone(), "host_request_allocation", block)?;
+            host_request_allocation_command(&seed, authority, activation_id, lease_id)?;
+        let command_id = command.command_id().to_owned();
         let mut transaction = SqliteCoreTransaction::begin_for(self.connection, &command, input)?;
         let snapshot = transaction.load_command_snapshot(&command)?;
         let current_authority = host_connection_authority_from_snapshot(&snapshot)?;

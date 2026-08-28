@@ -534,7 +534,7 @@ fn g3_operable_local_001_uses_production_daemon_process_and_durable_g2_result() 
         &endpoint_path,
         &control_request(&prepared, generation.value()),
     );
-    assert!(response.accepted);
+    assert!(response.accepted, "activation rejected with {:?}", response);
     assert_eq!(response.code, "activation_dispatched");
     assert_eq!(
         response.activation_id.as_deref(),
@@ -762,7 +762,6 @@ fn g3_activation_rejects_atomically_when_grant_revoked_after_preflight() {
     let database_path = temp_dir.path().join("revoke-core.sqlite");
     let endpoint_path = endpoint(&temp_dir, "revoke-primary");
     let preflight_barrier = temp_dir.path().join("preflight.sock");
-    let fence_barrier = temp_dir.path().join("fence.sock");
     let prepared = prepare_database(&database_path, g1_case);
     let readiness = daemon_readiness(&prepared, prepared.extension_generation);
     let daemon = daemon_command(
@@ -776,10 +775,6 @@ fn g3_activation_rejects_atomically_when_grant_revoked_after_preflight() {
     .env(
         "DOLLY_ACTIVATION_BARRIER_PREFLIGHT",
         preflight_barrier.as_os_str().to_os_string(),
-    )
-    .env(
-        "DOLLY_ACTIVATION_BARRIER_FENCE",
-        fence_barrier.as_os_str().to_os_string(),
     );
     let mut supervisor = LocalDaemonSupervisor::with_readiness_at_generation(
         daemon,
@@ -849,14 +844,14 @@ fn g3_activation_rejects_atomically_when_grant_revoked_after_preflight() {
 }
 
 #[test]
-fn g3_activation_fence_defers_grant_revoke_until_admission() {
+fn g3_activation_serializes_with_grant_revoke_while_transaction_open() {
     let g1 = document(G1_MATRIX, "accepted G1");
     let g1_case = case(&g1, "G1-EXEC-001", "accepted G1");
 
-    let temp_dir = TempDir::new().expect("G3 fence temporary directory");
-    let database_path = temp_dir.path().join("fence-core.sqlite");
-    let endpoint_path = endpoint(&temp_dir, "fence-primary");
-    let fence_barrier = temp_dir.path().join("fence.sock");
+    let temp_dir = TempDir::new().expect("G3 serialization temporary directory");
+    let database_path = temp_dir.path().join("serial-core.sqlite");
+    let endpoint_path = endpoint(&temp_dir, "serial-primary");
+    let grant_barrier = temp_dir.path().join("grant.sock");
     let prepared = prepare_database(&database_path, g1_case);
     let readiness = daemon_readiness(&prepared, prepared.extension_generation);
     let daemon = daemon_command(
@@ -868,8 +863,8 @@ fn g3_activation_fence_defers_grant_revoke_until_admission() {
         OWNER_SEED,
     )
     .env(
-        "DOLLY_ACTIVATION_BARRIER_FENCE",
-        fence_barrier.as_os_str().to_os_string(),
+        "DOLLY_ACTIVATION_BARRIER_GRANT",
+        grant_barrier.as_os_str().to_os_string(),
     );
     let mut supervisor = LocalDaemonSupervisor::with_readiness_at_generation(
         daemon,
@@ -883,11 +878,13 @@ fn g3_activation_fence_defers_grant_revoke_until_admission() {
     let request = control_request(&prepared, generation.value());
     let thread_endpoint = endpoint_path.clone();
     let request_handle = std::thread::spawn(move || send_request(&thread_endpoint, &request));
-    wait_for_socket(&fence_barrier, Duration::from_secs(10));
+    wait_for_socket(&grant_barrier, Duration::from_secs(10));
 
-    // The activation published its durable fence after atomically validating
-    // grant generation 7. A grant replace/revoke on another connection must be
-    // refused inside the same serializable order.
+    // The activation transaction is open and has validated grant generation 7
+    // inside it. The database write lock serializes a concurrent grant
+    // replace/revoke: on a connection without a busy timeout it is refused
+    // with SQLITE_BUSY and changes nothing, so the activation commits first
+    // under generation 7 and the deferred revocation follows afterwards.
     let mut revoke_connection = Connection::open(&database_path).expect("revoke SQLite");
     let authority = {
         let mut store =
@@ -900,21 +897,21 @@ fn g3_activation_fence_defers_grant_revoke_until_admission() {
     let pre_revoke_snapshot = durable_snapshot(&database_path);
     assert!(matches!(
         revoke_store.revoke_host_capability_grant(&authority, EXTENSION_ID, &prepared.module_id),
-        Err(StorageError::IdempotencyConflict)
+        Err(StorageError::Busy)
     ));
     assert_eq!(
         durable_snapshot(&database_path),
         pre_revoke_snapshot,
-        "a refused grant revocation must not mutate durable state"
+        "a serialized grant revocation must not mutate durable state before the activation commits"
     );
 
-    release_barrier(&fence_barrier);
+    release_barrier(&grant_barrier);
     let response = request_handle.join().expect("request thread");
     assert!(response.accepted);
     assert_eq!(response.code, "activation_dispatched");
-    let mut connection = Connection::open(&database_path).expect("durable SQLite after fence");
-    let store = SqliteCoreStore::new(&mut connection).expect("core schema after fence");
-    let snapshot = store.snapshot().expect("durable snapshot after fence");
+    let mut connection = Connection::open(&database_path).expect("durable SQLite after serialization");
+    let store = SqliteCoreStore::new(&mut connection).expect("core schema after serialization");
+    let snapshot = store.snapshot().expect("durable snapshot after serialization");
     assert_eq!(
         snapshot
             .activations
@@ -932,8 +929,8 @@ fn g3_activation_fence_defers_grant_revoke_until_admission() {
         1
     );
 
-    // Once the activation commits and releases its fence, the deferred
-    // revocation follows and succeeds.
+    // Once the whole activation committed, the deferred revocation follows
+    // and succeeds.
     revoke_store
         .revoke_host_capability_grant(&authority, EXTENSION_ID, &prepared.module_id)
         .expect("revocation follows the completed activation");
@@ -942,9 +939,152 @@ fn g3_activation_fence_defers_grant_revoke_until_admission() {
         .expect("current grant read")
         .is_none());
 
-    supervisor.stop().expect("fence daemon stop");
+    supervisor.stop().expect("serialization daemon stop");
     let _ = fs::remove_file(&endpoint_path);
     assert!(!endpoint_path.exists());
+}
+
+/// Kill a production daemon at one activation stage while its single request
+/// transaction is open, then prove SQLite rolled back every request-owned row
+/// and that a fresh daemon can still run the same request on the database.
+fn assert_kill_point_rolls_back(kill_point: &str) {
+    let g1 = document(G1_MATRIX, "accepted G1");
+    let g1_case = case(&g1, "G1-EXEC-001", "accepted G1");
+
+    let temp_dir = TempDir::new().expect("G3 kill temporary directory");
+    let database_path = temp_dir
+        .path()
+        .join(format!("kill-{kill_point}.sqlite"));
+    let endpoint_path = endpoint(&temp_dir, &format!("kill-{kill_point}-primary"));
+    let barrier_path = temp_dir
+        .path()
+        .join(format!("kill-{kill_point}.sock"));
+    let prepared = prepare_database(&database_path, g1_case);
+    let readiness = daemon_readiness(&prepared, prepared.extension_generation);
+    let daemon = daemon_command(
+        &prepared,
+        &database_path,
+        &endpoint_path,
+        &prepared.module_id,
+        prepared.incarnation_revision,
+        OWNER_SEED,
+    )
+    .env(
+        format!("DOLLY_ACTIVATION_BARRIER_{kill_point}"),
+        barrier_path.as_os_str().to_os_string(),
+    );
+    let mut supervisor = LocalDaemonSupervisor::with_readiness_at_generation(
+        daemon,
+        readiness,
+        DaemonGeneration::new(prepared.extension_generation as u64).expect("generation"),
+    );
+    let generation = supervisor.start().expect("production daemon readiness");
+    assert_eq!(supervisor.state(), DaemonState::Running(generation));
+
+    let request = control_request(&prepared, generation.value());
+    let thread_endpoint = endpoint_path.clone();
+    let request_handle = std::thread::spawn(move || send_request(&thread_endpoint, &request));
+    wait_for_socket(&barrier_path, Duration::from_secs(10));
+
+    // Kill the child while the request transaction is open and uncommitted.
+    supervisor.stop().expect("kill at activation stage");
+    let _ = request_handle.join();
+
+    let mut recovery = Connection::open(&database_path).expect("recovery SQLite");
+    {
+        let store = SqliteCoreStore::new(&mut recovery).expect("recovery store");
+        let snapshot = store.snapshot().expect("recovery snapshot");
+        assert!(
+            snapshot.activations.is_empty(),
+            "no activation may survive the kill at {kill_point}"
+        );
+        assert!(
+            snapshot.leases.is_empty(),
+            "no lease may survive the kill at {kill_point}"
+        );
+        assert!(
+            snapshot.host_request_reservations.is_empty(),
+            "no request reservation may survive the kill at {kill_point}"
+        );
+        assert!(
+            !snapshot
+                .journal
+                .iter()
+                .any(|event| event.command_id.starts_with("dolly-local-daemon-")),
+            "no request journal may survive the kill at {kill_point}"
+        );
+    }
+    let table_names: Vec<String> = {
+        let mut statement = recovery
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .expect("table listing");
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("table query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("table names")
+    };
+    assert!(
+        !table_names
+            .iter()
+            .any(|name| name == "grant_activation_fence"),
+        "no durable fence may survive the kill at {kill_point}"
+    );
+
+    // Restart recovery: the same request succeeds exactly once on the same
+    // database, proving the rolled-back state is clean.
+    let recovery_endpoint = endpoint(&temp_dir, &format!("kill-{kill_point}-recovery"));
+    let recovery_command = daemon_command(
+        &prepared,
+        &database_path,
+        &recovery_endpoint,
+        &prepared.module_id,
+        prepared.incarnation_revision,
+        OWNER_SEED,
+    );
+    let mut recovery_supervisor = LocalDaemonSupervisor::with_readiness_at_generation(
+        recovery_command,
+        daemon_readiness(&prepared, prepared.extension_generation),
+        DaemonGeneration::new(prepared.extension_generation as u64).expect("recovery generation"),
+    );
+    let recovery_generation = recovery_supervisor
+        .start()
+        .expect("recovery daemon readiness");
+    let recovery_request = control_request(&prepared, recovery_generation.value());
+    let response = send_request(&recovery_endpoint, &recovery_request);
+    assert!(response.accepted);
+    assert_eq!(response.code, "activation_dispatched");
+    let mut verify = Connection::open(&database_path).expect("verify SQLite");
+    let verify_store = SqliteCoreStore::new(&mut verify).expect("verify store");
+    let snapshot = verify_store.snapshot().expect("verify snapshot");
+    assert_eq!(
+        snapshot
+            .activations
+            .get(&prepared.activation_id)
+            .expect("recovered activation")
+            .state,
+        dolly_core_reducer::ActivationState::Dispatched
+    );
+    assert_eq!(
+        snapshot
+            .journal
+            .iter()
+            .filter(|event| event.command_id == "dolly-local-daemon-dispatch")
+            .count(),
+        1
+    );
+
+    recovery_supervisor.stop().expect("recovery daemon stop");
+    let _ = fs::remove_file(&recovery_endpoint);
+    let _ = fs::remove_file(&endpoint_path);
+    assert!(!recovery_endpoint.exists());
+}
+
+#[test]
+fn g3_activation_crash_at_every_stage_leaves_no_request_rows() {
+    for kill_point in ["GRANT", "MANIFEST", "LEASE", "DISPATCH", "ADMIT"] {
+        assert_kill_point_rolls_back(kill_point);
+    }
 }
 
 #[test]

@@ -450,6 +450,41 @@ pub fn admit_activation(
     store: &SqliteCoreStore<'_>,
     limits: FrameLimits,
 ) -> Result<FencedInvocationPremise, AdmissionError> {
+    // The grant binding is only consulted when the descriptor declares an
+    // Extension, mirroring the lazy authority lookup of the predecessor.
+    let declared_extension = {
+        let parsed = parse_frame(dispatch, limits)?;
+        derive_capability_methods(premise, dispatch, &parsed.manifest)?.0
+    };
+    let (authority, grant) = match declared_extension {
+        Some(extension_id) => {
+            let authority = store
+                .authenticated_host_connection()
+                .map_err(|_| AdmissionError::CapabilityDenied)?;
+            let grant = store
+                .current_host_capability_grant(
+                    &authority,
+                    &extension_id,
+                    premise.identity().module_id(),
+                )
+                .map_err(|_| AdmissionError::CapabilityDenied)?;
+            (Some(authority), grant)
+        }
+        None => (None, None),
+    };
+    admit_activation_core(premise, dispatch, limits, authority.as_ref(), grant.as_ref())
+}
+
+/// Admission core with the current Host authority and grant supplied by the
+/// caller. It reads nothing from storage, so the operational daemon can run
+/// it inside its single request transaction before that transaction commits.
+fn admit_activation_core(
+    premise: &ExecutionPremise,
+    dispatch: &DispatchResult,
+    limits: FrameLimits,
+    authority: Option<&HostConnectionAuthority>,
+    grant: Option<&HostCapabilityGrant>,
+) -> Result<FencedInvocationPremise, AdmissionError> {
     let parsed = parse_frame(dispatch, limits)?;
     if dispatch.transition().outcome != TransitionOutcome::Committed {
         return Err(AdmissionError::DispatchNotCommitted);
@@ -459,18 +494,11 @@ pub fn admit_activation(
     let (extension_id, requested_methods) =
         derive_capability_methods(premise, dispatch, &parsed.manifest)?;
     let capability_binding = if let Some(extension_id) = extension_id {
-        let authority = store
-            .authenticated_host_connection()
-            .map_err(|_| AdmissionError::CapabilityDenied)?;
-        let grant = store
-            .current_host_capability_grant(
-                &authority,
-                &extension_id,
-                premise.identity().module_id(),
-            )
-            .map_err(|_| AdmissionError::CapabilityDenied)?
-            .ok_or(AdmissionError::CapabilityDenied)?;
-        validate_host_capability_grant(&grant, &extension_id, premise, &parsed.manifest)?;
+        if authority.is_none() {
+            return Err(AdmissionError::CapabilityDenied);
+        }
+        let grant = grant.ok_or(AdmissionError::CapabilityDenied)?;
+        validate_host_capability_grant(grant, &extension_id, premise, &parsed.manifest)?;
         let effective_methods = requested_methods
             .iter()
             .filter(|method| grant.allows(method))
@@ -545,6 +573,22 @@ pub fn admit_operational_activation(
     limits: FrameLimits,
 ) -> Result<OperationalPremise, AdmissionError> {
     admit_activation(premise, dispatch, store, limits).map(OperationalPremise::from_admitted)
+}
+
+/// Admit the G2 invocation with the current Host authority and grant already
+/// read inside the caller's single activation transaction.
+///
+/// No storage read happens here, so admission can run before that one
+/// transaction commits; a failure rolls back every request-owned row.
+pub fn admit_operational_activation_components(
+    premise: &ExecutionPremise,
+    dispatch: &DispatchResult,
+    limits: FrameLimits,
+    authority: &HostConnectionAuthority,
+    grant: Option<&HostCapabilityGrant>,
+) -> Result<OperationalPremise, AdmissionError> {
+    admit_activation_core(premise, dispatch, limits, Some(authority), grant)
+        .map(OperationalPremise::from_admitted)
 }
 
 /// Atomically admit and bind one G2 invocation to its exact daemon owner.

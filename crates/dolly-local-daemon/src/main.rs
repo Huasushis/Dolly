@@ -1,15 +1,19 @@
 use dolly_canonical_json::Sha256Digest;
 use dolly_core_domain::LeaseToken;
 use dolly_core_reducer::{
-    ActivationState, BuildManifestCommand, CoreSnapshot, EnvironmentInput, InstanceMode,
-    TransitionOutcome,
+    BuildManifestCommand, CoreSnapshot, EnvironmentInput, InstanceMode,
 };
 use dolly_extension_host::{
-    admit_operational_activation, ConfigurationStore, MODULE_ACTIVATE_METHOD,
+    admit_operational_activation_components, ConfigurationStore, MODULE_ACTIVATE_METHOD,
 };
 use dolly_protocol::FrameLimits;
-use dolly_runtime::{LeaseRequest, RuntimeTransactionEngine};
-use dolly_storage::{GrantFenceExpectation, SqliteCoreStore};
+use dolly_runtime::{
+    activation_stage_allocation, activation_stage_dispatch, activation_stage_lease,
+    activation_stage_manifest, LeaseRequest,
+};
+use dolly_storage::{
+    ActivationTransaction, HostCapabilityGrant, HostConnectionAuthority, SqliteCoreStore,
+};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -302,70 +306,132 @@ fn process_request(
     if activation_barrier("PREFLIGHT").is_err() {
         return ControlResponse::rejected("activation_rejected");
     }
-    let expectation = GrantFenceExpectation {
-        extension_id: launch.extension_id.clone(),
-        module_id: request.module_id.clone(),
-        extension_connection_id: launch.control_channel_id.clone(),
-        worker_epoch: launch.worker_epoch.clone(),
-        worker_epoch_fence: launch.worker_epoch_fence,
-        incarnation_revision: launch.incarnation_revision,
-        extension_generation: request.extension_generation,
-        descriptor_revision: request
-            .manifest
-            .get("descriptor_revision")
-            .and_then(Value::as_i64)
-            .unwrap_or(0),
-        manifest_revision: request
-            .manifest
-            .get("config_revision")
-            .and_then(Value::as_i64)
-            .unwrap_or(0),
-        graph_revision: request
-            .manifest
-            .get("graph_revision")
-            .and_then(Value::as_i64)
-            .unwrap_or(0),
-        manifest_digest: request
-            .manifest
-            .get("manifest_digest")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned(),
+    // The whole request runs in one immediate SQLite transaction: grant/Host
+    // validation, manifest acceptance, request allocation, lease issue,
+    // dispatch journal, and G2 admission. Commit happens only after admission
+    // succeeds, so any failure or daemon kill rolls back every request-owned
+    // row and never leaves a partial activation.
+    let mut activation = match ActivationTransaction::begin(connection) {
+        Ok(transaction) => transaction,
+        Err(_) => return ControlResponse::rejected("activation_rejected"),
     };
-    let fence_acquired = {
-        let mut store = match SqliteCoreStore::new(connection) {
-            Ok(store) => store,
-            Err(_) => return ControlResponse::rejected("activation_rejected"),
-        };
-        let authority = match store.authenticated_host_connection() {
-            Ok(authority) => authority,
-            Err(_) => return ControlResponse::rejected("activation_rejected"),
-        };
-        store.acquire_grant_fence(&authority, &expectation).is_ok()
+    let authority = match activation.authority() {
+        Ok(authority) => authority,
+        Err(_) => return ControlResponse::rejected("activation_rejected"),
     };
-    if !fence_acquired {
-        // A grant replace/revoke committed after preflight or the durable
-        // grant no longer matches the request. No request-owned row was
-        // written; nothing to roll back.
+    let grant = match activation
+        .current_grant(&authority, &launch.extension_id, &request.module_id)
+    {
+        Ok(grant) => grant,
+        Err(_) => return ControlResponse::rejected("activation_rejected"),
+    };
+    let snapshot = match activation.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(_) => return ControlResponse::rejected("activation_rejected"),
+    };
+    if !grant_matches(&authority, grant.as_ref(), &snapshot, launch, &request) {
+        // The durable grant does not match the request, or a concurrent
+        // replace/revoke committed before this transaction. Dropping the
+        // transaction rolls back every request-owned row.
         return ControlResponse::rejected("request_fence_mismatch");
     }
-    if activation_barrier("FENCE").is_err() {
-        let _ = release_fence(connection, &expectation.module_id);
+    if activation_barrier("GRANT").is_err() {
         return ControlResponse::rejected("activation_rejected");
     }
-    let result = perform_activation(connection, launch, request);
-    let _ = release_fence(connection, &expectation.module_id);
-    match result {
-        Ok(response) => response,
-        Err(_) => ControlResponse::rejected("activation_rejected"),
+    let lease_token = match request.lease_token.parse::<LeaseToken>() {
+        Ok(token) => token,
+        Err(_) => return ControlResponse::rejected("activation_rejected"),
+    };
+    let token_digest = Sha256Digest::compute(lease_token.expose_bytes()).to_canonical_string();
+    let input = EnvironmentInput {
+        now: request.now.clone(),
+        graph_revision: Some(1),
+        descriptor_revision: Some(1),
+        ..EnvironmentInput::default()
+    };
+    let build = BuildManifestCommand {
+        command_id: "dolly-local-daemon-build".to_owned(),
+        activation_id: request.activation_id.clone(),
+        manifest: request.manifest,
+        expected_graph_revision: Some(1),
+        expected_descriptor_revision: Some(1),
+    };
+    let lease = LeaseRequest::new(
+        "dolly-local-daemon-lease",
+        request.activation_id.clone(),
+        request.lease_id.clone(),
+        token_digest,
+        Some(request.extension_generation),
+    );
+    let outcome = (|| -> Result<(String, i64), ()> {
+        activation_stage_manifest(&mut activation, &build, &input).map_err(|_| ())?;
+        if activation_barrier("MANIFEST").is_err() {
+            return Err(());
+        }
+        let reservation = activation_stage_allocation(
+            &mut activation,
+            &authority,
+            &request.activation_id,
+            &request.lease_id,
+            &input,
+        )
+        .map_err(|_| ())?;
+        let (premise, _) =
+            activation_stage_lease(&mut activation, &lease, &reservation, &input)
+                .map_err(|_| ())?;
+        if activation_barrier("LEASE").is_err() {
+            return Err(());
+        }
+        let dispatch = activation_stage_dispatch(
+            &mut activation,
+            &premise,
+            "dolly-local-daemon-dispatch",
+            &lease_token,
+            &input,
+        )
+        .map_err(|_| ())?;
+        if activation_barrier("DISPATCH").is_err() {
+            return Err(());
+        }
+        let operational = admit_operational_activation_components(
+            &premise,
+            &dispatch,
+            FrameLimits::defaults(),
+            &authority,
+            grant.as_ref(),
+        )
+        .map_err(|_| ())?;
+        if operational.invocation().module_id() != launch.module_id
+            || operational.invocation().extension_id() != Some(launch.extension_id.as_str())
+        {
+            return Err(());
+        }
+        if activation_barrier("ADMIT").is_err() {
+            return Err(());
+        }
+        let durable_commit_seq = dispatch
+            .transition()
+            .events
+            .last()
+            .map(|event| event.commit_seq)
+            .ok_or(())?;
+        Ok((dispatch.frame_digest().to_owned(), durable_commit_seq))
+    })();
+    match outcome {
+        Ok((frame_digest, durable_commit_seq)) => {
+            if activation.commit().is_err() {
+                return ControlResponse::rejected("activation_rejected");
+            }
+            ControlResponse {
+                accepted: true,
+                code: "activation_dispatched",
+                activation_id: Some(request.activation_id),
+                frame_digest: Some(frame_digest),
+                durable_commit_seq: Some(durable_commit_seq),
+            }
+        }
+        Err(()) => ControlResponse::rejected("activation_rejected"),
     }
-}
-
-/// Release the durable grant fence after the activation outcome is final on
-/// every path that acquired it.
-fn release_fence(connection: &mut Connection, module_id: &str) -> Result<(), ()> {
-    let mut store = SqliteCoreStore::new(connection).map_err(|_| ())?;
-    store.release_grant_fence(module_id).map_err(|_| ())
 }
 
 /// Deterministic test barrier. When `DOLLY_ACTIVATION_BARRIER_<key>` names a
@@ -386,13 +452,10 @@ fn activation_barrier(key: &str) -> Result<(), ()> {
     Ok(())
 }
 
-/// Validate every request-controlled field that `admit_operational_activation`
-/// checks against the exact current durable Host grant and authenticated Host
-/// authority, before any Runtime or storage mutation commits. This guarantees
-/// that no later admission failure can follow tentative durable writes: the
-/// post-commit admission is deterministic over the same grant, authority,
-/// immutable graph, and the just-committed transitions, so its failure is
-/// unreachable once this pass succeeds.
+/// Earlier fast-path grant check. The authoritative grant/Host/premise
+/// validation repeats inside the single activation transaction, atomically
+/// with the first request-owned write, so no separate durable fence is
+/// needed.
 fn validate_request_against_grant(
     connection: &mut Connection,
     launch: &LaunchConfiguration,
@@ -403,10 +466,29 @@ fn validate_request_against_grant(
         let authority = store.authenticated_host_connection().map_err(|_| ())?;
         let grant = store
             .current_host_capability_grant(&authority, &launch.extension_id, &request.module_id)
-            .map_err(|_| ())?
-            .ok_or(())?;
+            .map_err(|_| ())?;
         let snapshot = store.snapshot().map_err(|_| ())?;
         (authority, grant, snapshot)
+    };
+    if grant_matches(&authority, grant.as_ref(), &snapshot, launch, request) {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+/// Compare the exact request fields against the current durable Host grant,
+/// Host authority, and installed graph, mirroring every request-controlled
+/// check the operational admission performs.
+fn grant_matches(
+    authority: &HostConnectionAuthority,
+    grant: Option<&HostCapabilityGrant>,
+    snapshot: &CoreSnapshot,
+    launch: &LaunchConfiguration,
+    request: &ControlRequest,
+) -> bool {
+    let Some(grant) = grant else {
+        return false;
     };
     if request.extension_generation != grant.extension_generation()
         || u64::try_from(request.extension_generation).ok() != Some(launch.generation)
@@ -415,14 +497,11 @@ fn validate_request_against_grant(
         || launch.worker_epoch != grant.worker_epoch()
         || launch.worker_epoch_fence != grant.worker_epoch_fence()
         || launch.incarnation_revision != grant.incarnation_revision()
-    {
-        return Err(());
-    }
-    if authority.extension_connection_id() != launch.control_channel_id
+        || authority.extension_connection_id() != launch.control_channel_id
         || authority.worker_epoch_fence() != launch.worker_epoch_fence
         || authority.incarnation_revision() != launch.incarnation_revision
     {
-        return Err(());
+        return false;
     }
     let manifest = &request.manifest;
     if manifest.get("descriptor_revision").and_then(Value::as_i64)
@@ -432,7 +511,7 @@ fn validate_request_against_grant(
         || manifest.get("graph_revision").and_then(Value::as_i64) != Some(grant.graph_revision())
         || manifest.get("manifest_digest").and_then(Value::as_str) != Some(grant.manifest_digest())
     {
-        return Err(());
+        return false;
     }
     let graph_digest = snapshot.graph.get("digest").and_then(Value::as_str);
     let descriptor_digest = snapshot
@@ -443,91 +522,6 @@ fn validate_request_against_grant(
         .and_then(|descriptors| descriptors.get(&request.module_id))
         .and_then(|entry| entry.get("source_descriptor_digest"))
         .and_then(Value::as_str);
-    if graph_digest != Some(grant.graph_digest())
-        || descriptor_digest != Some(grant.descriptor_digest())
-    {
-        return Err(());
-    }
-    Ok(())
-}
-
-fn perform_activation(
-    connection: &mut Connection,
-    launch: &LaunchConfiguration,
-    request: ControlRequest,
-) -> Result<ControlResponse, ()> {
-    let lease_token: LeaseToken = request.lease_token.parse().map_err(|_| ())?;
-    let token_digest = Sha256Digest::compute(lease_token.expose_bytes()).to_canonical_string();
-    let input = EnvironmentInput {
-        now: request.now.clone(),
-        graph_revision: Some(1),
-        descriptor_revision: Some(1),
-        ..EnvironmentInput::default()
-    };
-    let build = BuildManifestCommand {
-        command_id: "dolly-local-daemon-build".to_owned(),
-        activation_id: request.activation_id.clone(),
-        manifest: request.manifest,
-        expected_graph_revision: Some(1),
-        expected_descriptor_revision: Some(1),
-    };
-    let lease = LeaseRequest::new(
-        "dolly-local-daemon-lease",
-        request.activation_id.clone(),
-        request.lease_id,
-        token_digest,
-        Some(request.extension_generation),
-    );
-    let mut engine = RuntimeTransactionEngine::new(connection).map_err(|_| ())?;
-    let built = engine.accept_manifest(&build, &input).map_err(|_| ())?;
-    if built.outcome != TransitionOutcome::Committed {
-        return Err(());
-    }
-    let reservation = engine.allocate_request(&lease, &input).map_err(|_| ())?;
-    let premise = engine
-        .prepare_execution(&lease, &reservation, &input)
-        .map_err(|_| ())?;
-    let dispatch = engine
-        .dispatch_execution(
-            &premise,
-            "dolly-local-daemon-dispatch",
-            &lease_token,
-            &input,
-        )
-        .map_err(|_| ())?;
-    if dispatch.transition().outcome != TransitionOutcome::Committed
-        || dispatch
-            .transition()
-            .state
-            .activations
-            .get(&request.activation_id)
-            .map(|activation| activation.state)
-            != Some(ActivationState::Dispatched)
-    {
-        return Err(());
-    }
-    let durable_commit_seq = dispatch
-        .transition()
-        .events
-        .last()
-        .map(|event| event.commit_seq)
-        .ok_or(())?;
-    drop(engine);
-
-    let store = SqliteCoreStore::new(connection).map_err(|_| ())?;
-    let operational =
-        admit_operational_activation(&premise, &dispatch, &store, FrameLimits::defaults())
-            .map_err(|_| ())?;
-    if operational.invocation().module_id() != launch.module_id
-        || operational.invocation().extension_id() != Some(launch.extension_id.as_str())
-    {
-        return Err(());
-    }
-    Ok(ControlResponse {
-        accepted: true,
-        code: "activation_dispatched",
-        activation_id: Some(request.activation_id),
-        frame_digest: Some(dispatch.frame_digest().to_owned()),
-        durable_commit_seq: Some(durable_commit_seq),
-    })
+    graph_digest == Some(grant.graph_digest())
+        && descriptor_digest == Some(grant.descriptor_digest())
 }

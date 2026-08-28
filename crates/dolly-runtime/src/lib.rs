@@ -14,7 +14,7 @@ use dolly_core_reducer::{
     ActivationState, BuildManifestCommand, CoreCommand, DispatchLeaseCommand, DispatchState,
     EnvironmentInput, IssueLeaseCommand, Transition, TransitionOutcome,
 };
-use dolly_storage::{SqliteCoreStore, StorageError};
+use dolly_storage::{ActivationTransaction, SqliteCoreStore, StorageError};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -462,6 +462,283 @@ impl<'connection> RuntimeTransactionEngine<'connection> {
     }
 
 }
+
+// ---------------------------------------------------------------------------
+// One-transaction activation stages.
+//
+// Each stage reduces and persists exactly one Core command inside the
+// supplied `ActivationTransaction`. Together they form the whole request (Host
+// grant validation, manifest acceptance, request allocation, lease issue,
+// dispatch/journal, and final G2 admission) under one SQLite commit, so a
+// process kill at any stage rolls the request back completely.
+// ---------------------------------------------------------------------------
+
+/// Validate and persist the accepted Activation Manifest as the first
+/// request-owned stage.
+pub fn activation_stage_manifest(
+    transaction: &mut ActivationTransaction<'_>,
+    build: &BuildManifestCommand,
+    input: &EnvironmentInput,
+) -> RuntimeResult<Transition> {
+    if build.command_id.is_empty() || build.activation_id.is_empty() {
+        return Err(RuntimeError::ManifestInvalid {
+            detail: "command_id and activation_id are required".into(),
+        });
+    }
+    let (submitted_manifest, _) = validation::validate_manifest_for_replay(&build.manifest)?;
+    if submitted_manifest.activation_id.to_string() != build.activation_id {
+        return Err(RuntimeError::ReplayConflict {
+            detail: "Manifest activation_id does not match the transaction identity".into(),
+        });
+    }
+    let snapshot = transaction.snapshot()?;
+    if let Some(existing) = snapshot.manifests.get(&build.activation_id) {
+        let (existing_manifest, _) = validation::validate_manifest_for_replay(existing)?;
+        if !same_canonical(&existing_manifest, &submitted_manifest)? {
+            return Err(RuntimeError::ReplayConflict {
+                detail: "Activation Manifest identity already has different bytes".into(),
+            });
+        }
+    } else {
+        validation::validate_manifest_against_snapshot(
+            &build.manifest,
+            &snapshot,
+            input,
+            build.expected_graph_revision,
+            build.expected_descriptor_revision,
+        )?;
+    }
+    let transition =
+        transaction.apply(&CoreCommand::BuildManifest(build.clone()), input)?;
+    require_committed(&transition)?;
+    let retained = transition
+        .state
+        .manifests
+        .get(&build.activation_id)
+        .ok_or_else(|| RuntimeError::PremiseUnavailable {
+            detail: "committed Manifest is absent from the durable state".into(),
+        })?;
+    if !same_canonical(retained, &build.manifest)? {
+        return Err(RuntimeError::ReplayConflict {
+            detail: "durable Manifest differs from the submitted bytes".into(),
+        });
+    }
+    Ok(transition)
+}
+
+/// Allocate the Host request reservation as the second request-owned stage.
+pub fn activation_stage_allocation(
+    transaction: &mut ActivationTransaction<'_>,
+    authority: &HostConnectionAuthority,
+    activation_id: &str,
+    lease_id: &str,
+    input: &EnvironmentInput,
+) -> RuntimeResult<RequestReservation> {
+    let snapshot = transaction.snapshot()?;
+    let command =
+        dolly_storage::host_request_allocation_command(&snapshot, authority, activation_id, lease_id)?;
+    let command_id = command.command_id().to_owned();
+    let transition = dolly_storage::allocate_host_request_transition(
+        &snapshot,
+        &command_id,
+        authority,
+        activation_id,
+        lease_id,
+        input,
+    )?;
+    let transition = transaction.apply_with_transition(&command, input, transition)?;
+    require_committed(&transition)?;
+    let reservation_id = transition
+        .reply
+        .as_ref()
+        .and_then(|reply| reply.get("reservation_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| RuntimeError::PremiseUnavailable {
+            detail: "request allocation returned no reservation".into(),
+        })?;
+    request_reservation_from_state(&transition.state, reservation_id)
+}
+
+/// Issue the lease and build the exact Runtime premise as the third stage.
+pub fn activation_stage_lease(
+    transaction: &mut ActivationTransaction<'_>,
+    request: &LeaseRequest,
+    reservation: &RequestReservation,
+    input: &EnvironmentInput,
+) -> RuntimeResult<(ExecutionPremise, Transition)> {
+    let snapshot = transaction.snapshot()?;
+    let connection = host_connection_state(&snapshot)?;
+    validate_request_reservation(&snapshot, &connection, request, reservation)?;
+    let command = IssueLeaseCommand {
+        command_id: request.command_id.clone(),
+        activation_id: request.activation_id.clone(),
+        lease_id: request.lease_id.clone(),
+        token_digest: request.token_digest.clone(),
+        extension_connection_id: reservation.extension_connection_id.clone(),
+        reservation_id: Some(reservation.reservation_id.clone()),
+        request_id: Some(reservation.request_id.clone()),
+        worker_epoch: reservation.worker_epoch_fence,
+        worker_epoch_id: Some(reservation.worker_epoch.to_string()),
+        incarnation_revision: Some(reservation.incarnation_revision),
+        extension_generation: request.extension_generation,
+    };
+    validate_lease_request(&command)?;
+    let activation = snapshot
+        .activations
+        .get(&command.activation_id)
+        .ok_or_else(|| RuntimeError::LeaseUnavailable {
+            detail: "Activation is not present in durable state".into(),
+        })?;
+    let manifest_value = activation
+        .manifest
+        .as_ref()
+        .or_else(|| snapshot.manifests.get(&command.activation_id))
+        .ok_or_else(|| RuntimeError::LeaseUnavailable {
+            detail: "Activation has no retained Manifest".into(),
+        })?;
+    let (manifest, _) = validation::validate_manifest_for_replay(manifest_value)?;
+    if manifest.activation_id.to_string() != command.activation_id {
+        return Err(RuntimeError::ReplayConflict {
+            detail: "lease Activation identity does not match retained Manifest".into(),
+        });
+    }
+    let validated = validation::validate_manifest_against_snapshot(
+        manifest_value,
+        &snapshot,
+        input,
+        Some(manifest.graph_revision.value() as i64),
+        Some(manifest.descriptor_revision.value() as i64),
+    )?;
+    validate_generation(&snapshot, command.extension_generation)?;
+    validate_existing_lease_or_state(&snapshot, &command, activation.state)?;
+    let transition = transaction.apply(&CoreCommand::IssueLease(command.clone()), input)?;
+    require_committed(&transition)?;
+    let premise = build_premise(&transition.state, &command, validated)?;
+    Ok((premise, transition))
+}
+
+/// Build and persist the canonical `module.activate` dispatch marker as the
+/// fourth request-owned stage.
+pub fn activation_stage_dispatch(
+    transaction: &mut ActivationTransaction<'_>,
+    premise: &ExecutionPremise,
+    dispatch_command_id: &str,
+    lease_token: &LeaseToken,
+    input: &EnvironmentInput,
+) -> RuntimeResult<DispatchResult> {
+    if dispatch_command_id.is_empty() {
+        return Err(RuntimeError::DispatchInvalid {
+            detail: "dispatch command_id is required".into(),
+        });
+    }
+    let snapshot = transaction.snapshot()?;
+    let connection = host_connection_state(&snapshot)?;
+    if connection.extension_connection_id != premise.fence().extension_connection_id()
+        || connection.worker_epoch != *premise.fence().worker_epoch()
+        || connection.worker_epoch_fence != premise.fence().worker_epoch_fence()
+        || connection.incarnation_revision != premise.fence().incarnation_revision()
+    {
+        return Err(RuntimeError::PremiseUnavailable {
+            detail: "current Host connection no longer owns the prepared WorkerEpoch".into(),
+        });
+    }
+    let manifest_value = retained_manifest_for_dispatch(&snapshot, premise, lease_token)?;
+    let (manifest, _) = validation::validate_manifest_for_replay(&manifest_value)?;
+    let frame = json!({
+        "jsonrpc": "2.0",
+        "id": premise.fence().request_id(),
+        "method": "module.activate",
+        "params": {
+            "worker_epoch": premise.fence().worker_epoch(),
+            "extension_generation": premise.fence().extension_generation(),
+            "lease_generation": premise.fence().lease_generation(),
+            "lease_token": lease_token.expose_base64url(),
+            "attempt": premise.fence().attempt(),
+            "manifest": manifest_value,
+        }
+    });
+    let (frame_bytes, frame_digest) = canonicalize(&frame)
+        .map_err(|error| RuntimeError::DispatchInvalid {
+            detail: format!("cannot canonicalize module.activate frame: {error}"),
+        })
+        .map(|(bytes, digest)| (bytes.into_vec(), digest.to_canonical_string()))?;
+    let frame_size =
+        u64::try_from(frame_bytes.len()).map_err(|_| RuntimeError::DispatchInvalid {
+            detail: "module.activate frame size exceeds u64".into(),
+        })?;
+    if frame_size > manifest.required_frame_bytes {
+        return Err(RuntimeError::DispatchInvalid {
+            detail: format!(
+                "module.activate frame is {frame_size} bytes but Manifest permits {}",
+                manifest.required_frame_bytes
+            ),
+        });
+    }
+    let frame_depth = frame_nesting_depth(&frame);
+    if frame_depth > manifest.required_frame_nesting_depth {
+        return Err(RuntimeError::DispatchInvalid {
+            detail: format!(
+                "module.activate frame depth is {frame_depth} but Manifest permits {}",
+                manifest.required_frame_nesting_depth
+            ),
+        });
+    }
+    let transition = transaction.apply(
+        &CoreCommand::DispatchLease(DispatchLeaseCommand {
+            command_id: dispatch_command_id.into(),
+            activation_id: premise.identity().activation_id().into(),
+            lease_id: premise.fence().lease_id().into(),
+            dispatch_state: DispatchState::Started,
+            reservation_id: Some(premise.fence().reservation_id().into()),
+            request_id: Some(premise.fence().request_id().into()),
+            incarnation_revision: Some(premise.fence().incarnation_revision()),
+            extension_connection_id: Some(premise.fence().extension_connection_id().into()),
+            frame_digest: Some(frame_digest.clone()),
+        }),
+        input,
+    )?;
+    require_committed(&transition)?;
+    let committed_lease = transition
+        .state
+        .leases
+        .get(premise.fence().lease_id())
+        .ok_or_else(|| RuntimeError::PremiseUnavailable {
+            detail: "committed dispatch lease is absent".into(),
+        })?;
+    let committed_digest = committed_lease
+        .get("frame_digest")
+        .and_then(Value::as_str);
+    let committed_reservation_id = committed_lease
+        .get("reservation_id")
+        .and_then(Value::as_str);
+    let committed_request_id = committed_lease
+        .get("request_id")
+        .and_then(Value::as_str);
+    let committed_connection_id = committed_lease
+        .get("extension_connection_id")
+        .and_then(Value::as_str);
+    let committed_state = transition
+        .state
+        .activations
+        .get(premise.identity().activation_id())
+        .map(|activation| activation.state);
+    if committed_state != Some(ActivationState::Dispatched)
+        || committed_digest != Some(frame_digest.as_str())
+        || committed_request_id != Some(premise.fence().request_id())
+        || committed_connection_id != Some(premise.fence().extension_connection_id())
+        || committed_reservation_id != Some(premise.fence().reservation_id())
+    {
+        return Err(RuntimeError::PremiseUnavailable {
+            detail: "committed dispatch does not retain the exact request binding".into(),
+        });
+    }
+    Ok(DispatchResult {
+        frame_bytes,
+        frame_digest,
+        transition,
+    })
+}
+
 fn host_connection_state(
     snapshot: &dolly_core_reducer::CoreSnapshot,
 ) -> RuntimeResult<HostConnectionState> {
