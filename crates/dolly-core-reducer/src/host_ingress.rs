@@ -48,27 +48,12 @@ use crate::command::{CoreCommand, IngressCommand};
 /// Domain-separation prefix for the ingress-key derivation.
 const INGRESS_KEY_PREFIX: &[u8] = b"dolly.host-ingress\0key\0";
 
-/// Authority-bound facts the storage transaction derives from the opaque
-/// current Host grant and authority. A caller cannot pass these through the
-/// seam; they are filled inside the storage transaction before this
-/// derivation runs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IngressAuthorityFacts {
-    /// The authenticated principal (Host connection identity).
-    pub owner: String,
-    /// The granted Extension identity.
-    pub extension_id: String,
-    /// The granted Module identity.
-    pub module_id: String,
-    /// The granted instance identity (Host worker epoch).
-    pub instance_id: String,
-    /// The current grant's Extension generation.
-    pub generation: u64,
-    /// The current Host incarnation revision.
-    pub revision: i64,
-    /// The current grant's graph revision.
-    pub graph_revision: i64,
-}
+/// The derivation input is deliberately primitive. Ownership, source,
+/// generation, revision, and graph revision live inside the storage
+/// transaction, derived from the opaque current Host authority and capability
+/// grant; no seam API accepts them from a caller, so a caller cannot forge an
+/// authority claim into durable state — these parameters only ever produce a
+/// digest.
 
 /// A rejected request, named by the failing rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,20 +167,29 @@ pub fn validate_ingress_request(
     Ok(())
 }
 
-/// Derive the canonical identity of one premise from the store-derived
-/// authority facts and the caller's event content.
+/// Derive the canonical identity of one premise from the store-sealed
+/// principal primitives and the caller's event content. The primitives are
+/// handed in by the storage transaction only (never by a seam caller).
 pub fn derive_ingress_identity(
-    facts: &IngressAuthorityFacts,
+    owner: &str,
+    extension_id: &str,
+    module_id: &str,
+    instance_id: &str,
+    generation: u64,
+    revision: i64,
+    graph_revision: i64,
     request: &HostIngressSubmitRequest,
 ) -> Result<IngressIdentity, HostIngressPremiseError> {
     validate_ingress_request(request)?;
-    validate_facts(facts)?;
+    validate_principal(owner, extension_id, module_id, instance_id, generation, revision, graph_revision)?;
     let (_, payload_digest) = canonicalize(&request.payload).map_err(|_| {
         HostIngressPremiseError::InvalidExternalId("premise payload is not canonical JSON".into())
     })?;
-    let operation_digest = derive_operation_digest(facts, request, &payload_digest)?;
+    let operation_digest =
+        derive_operation_digest(owner, extension_id, module_id, instance_id, generation, revision,
+            graph_revision, request, &payload_digest)?;
     Ok(IngressIdentity {
-        key: derive_ingress_key(facts, &request.external_event_id),
+        key: derive_ingress_key(owner, extension_id, module_id, instance_id, &request.external_event_id),
         operation_digest,
         canonical_target_page_ids: canonical_target_page_ids(&request.target_page_ids),
         payload_digest: payload_digest.to_canonical_string(),
@@ -203,26 +197,32 @@ pub fn derive_ingress_identity(
 }
 
 /// Derive the ingress key of one external event identity under the given
-/// principal facts. Used both by submit (own external id) and by status and
-/// the referenced-event check (any external id of the same principal).
-pub fn derive_ingress_key(facts: &IngressAuthorityFacts, external_event_id: &str) -> HostIngressKey {
+/// principal identities. Used both by submit (own external id) and by status
+/// and the referenced-event check (any external id of the same principal).
+pub fn derive_ingress_key(
+    owner: &str,
+    extension_id: &str,
+    module_id: &str,
+    instance_id: &str,
+    external_event_id: &str,
+) -> HostIngressKey {
     let mut input = Vec::with_capacity(
         INGRESS_KEY_PREFIX.len()
-            + facts.owner.len()
-            + facts.extension_id.len()
-            + facts.module_id.len()
-            + facts.instance_id.len()
+            + owner.len()
+            + extension_id.len()
+            + module_id.len()
+            + instance_id.len()
             + external_event_id.len()
             + 5,
     );
     input.extend_from_slice(INGRESS_KEY_PREFIX);
-    input.extend_from_slice(facts.owner.as_bytes());
+    input.extend_from_slice(owner.as_bytes());
     input.push(0);
-    input.extend_from_slice(facts.extension_id.as_bytes());
+    input.extend_from_slice(extension_id.as_bytes());
     input.push(0);
-    input.extend_from_slice(facts.module_id.as_bytes());
+    input.extend_from_slice(module_id.as_bytes());
     input.push(0);
-    input.extend_from_slice(facts.instance_id.as_bytes());
+    input.extend_from_slice(instance_id.as_bytes());
     input.push(0);
     input.extend_from_slice(external_event_id.as_bytes());
     input.push(0);
@@ -233,26 +233,32 @@ pub fn derive_ingress_key(facts: &IngressAuthorityFacts, external_event_id: &str
 /// Derive the operation digest: SHA-256 of the canonical JSON record binding
 /// every authority fence and the ordered target-Page list.
 fn derive_operation_digest(
-    facts: &IngressAuthorityFacts,
+    owner: &str,
+    extension_id: &str,
+    module_id: &str,
+    instance_id: &str,
+    generation: u64,
+    revision: i64,
+    graph_revision: i64,
     request: &HostIngressSubmitRequest,
     payload_digest: &Sha256Digest,
 ) -> Result<String, HostIngressPremiseError> {
     let identity = OperationIdentity {
         schema: "dolly.host-ingress/operation/v1",
-        owner: &facts.owner,
+        owner,
         source: SourceIdentity {
-            extension_id: &facts.extension_id,
-            module_id: &facts.module_id,
-            instance_id: &facts.instance_id,
-            generation: facts.generation,
+            extension_id,
+            module_id,
+            instance_id,
+            generation,
         },
         external_event_id: &request.external_event_id,
         kind: request.kind.as_str(),
         references_external_event_id: request.references_external_event_id.as_deref(),
         target_page_ids: &canonical_target_page_ids(&request.target_page_ids),
         payload_digest: &payload_digest.to_canonical_string(),
-        revision: facts.revision,
-        graph_revision: facts.graph_revision,
+        revision,
+        graph_revision,
     };
     canonicalize(&identity)
         .map(|(_, digest)| digest.to_canonical_string())
@@ -294,18 +300,14 @@ struct SourceIdentity<'a> {
 pub fn build_ingress_command(
     identity: &IngressIdentity,
     block_id: &BlockId,
-    facts: &IngressAuthorityFacts,
+    runtime_source: &str,
     request: &HostIngressSubmitRequest,
 ) -> CoreCommand {
     let block = serde_json::to_value(&request.payload)
         .expect("a canonical payload always serializes to a JSON value");
-    let runtime_source = format!(
-        "{}#{}#{}",
-        facts.extension_id, facts.module_id, facts.instance_id
-    );
     CoreCommand::Ingress(IngressCommand {
         command_id: format!("host-ingress-{}", identity.key),
-        runtime_source,
+        runtime_source: runtime_source.to_owned(),
         ingress_key: identity.key.to_string(),
         operation_digest: identity.operation_digest.clone(),
         block_id: block_id.to_string(),
@@ -314,27 +316,35 @@ pub fn build_ingress_command(
     })
 }
 
-fn validate_facts(facts: &IngressAuthorityFacts) -> Result<(), HostIngressPremiseError> {
+fn validate_principal(
+    owner: &str,
+    extension_id: &str,
+    module_id: &str,
+    instance_id: &str,
+    generation: u64,
+    revision: i64,
+    graph_revision: i64,
+) -> Result<(), HostIngressPremiseError> {
     for (value, name) in [
-        (&facts.owner, "owner"),
-        (&facts.extension_id, "extension_id"),
-        (&facts.module_id, "module_id"),
-        (&facts.instance_id, "instance_id"),
+        (owner, "owner"),
+        (extension_id, "extension_id"),
+        (module_id, "module_id"),
+        (instance_id, "instance_id"),
     ] {
         validate_text(value, MAX_HOST_INGRESS_PRINCIPAL_TEXT_BYTES, name)
             .map_err(HostIngressPremiseError::InvalidExternalId)?;
     }
-    if facts.generation == 0 || facts.generation > MAX_HOST_INGRESS_REVISION as u64 {
+    if generation == 0 || generation > MAX_HOST_INGRESS_REVISION as u64 {
         return Err(HostIngressPremiseError::InvalidExternalId(
             "principal generation is out of the positive fence range".into(),
         ));
     }
-    if !(1..=MAX_HOST_INGRESS_REVISION).contains(&facts.revision) {
+    if !(1..=MAX_HOST_INGRESS_REVISION).contains(&revision) {
         return Err(HostIngressPremiseError::InvalidExternalId(
             "principal revision is out of the positive fence range".into(),
         ));
     }
-    if !(1..=MAX_HOST_INGRESS_REVISION).contains(&facts.graph_revision) {
+    if !(1..=MAX_HOST_INGRESS_REVISION).contains(&graph_revision) {
         return Err(HostIngressPremiseError::InvalidExternalId(
             "principal graph revision is out of the positive fence range".into(),
         ));

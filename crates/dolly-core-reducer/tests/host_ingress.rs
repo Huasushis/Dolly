@@ -6,9 +6,8 @@
 use dolly_canonical_json::CanonicalJsonValue;
 use dolly_core_domain::{HostIngressKind, HostIngressSubmitRequest, PageId};
 use dolly_core_reducer::{
-    CoreCommand, HostIngressPremiseError, IngressAuthorityFacts, build_ingress_command,
-    canonical_target_page_ids, derive_ingress_identity, derive_ingress_key,
-    validate_ingress_request,
+    CoreCommand, HostIngressPremiseError, build_ingress_command, canonical_target_page_ids,
+    derive_ingress_identity, derive_ingress_key, validate_ingress_request,
 };
 use serde_json::{Value, json};
 
@@ -20,16 +19,26 @@ fn payload(value: Value) -> CanonicalJsonValue {
     serde_json::from_value(value).expect("test payload must be canonical JSON")
 }
 
-fn facts() -> IngressAuthorityFacts {
-    IngressAuthorityFacts {
-        owner: "connection-a".into(),
-        extension_id: "org.dolly.channel".into(),
-        module_id: "receiver".into(),
-        instance_id: "0198ab31-6c44-7e8a-b2bb-000000000110".into(),
-        generation: 7,
-        revision: 3,
-        graph_revision: 1,
-    }
+fn facts_owner() -> &'static str {
+    "connection-a"
+}
+fn facts_extension() -> &'static str {
+    "org.dolly.channel"
+}
+fn facts_module() -> &'static str {
+    "receiver"
+}
+fn facts_instance() -> &'static str {
+    "0198ab31-6c44-7e8a-b2bb-000000000110"
+}
+fn facts_generation() -> u64 {
+    7
+}
+fn facts_revision() -> i64 {
+    3
+}
+fn facts_graph_revision() -> i64 {
+    1
 }
 
 fn request(
@@ -49,7 +58,17 @@ fn request(
 }
 
 fn identity(req: &HostIngressSubmitRequest) -> dolly_core_reducer::IngressIdentity {
-    derive_ingress_identity(&facts(), req).expect("test request must derive")
+    derive_ingress_identity(
+        facts_owner(),
+        facts_extension(),
+        facts_module(),
+        facts_instance(),
+        facts_generation(),
+        facts_revision(),
+        facts_graph_revision(),
+        req,
+    )
+    .expect("test request must derive")
 }
 
 // ---------------------------------------------------------------------------
@@ -67,48 +86,42 @@ fn key_binds_owner_source_instance_and_external_identity() {
     );
     let base_key = identity(&base).key;
 
-    let mut other_owner = facts();
-    other_owner.owner = "connection-b".into();
     assert_ne!(
-        derive_ingress_identity(&other_owner, &base).unwrap().key,
+        derive_ingress_key("connection-b", facts_extension(), facts_module(), facts_instance(), "msg-1"),
         base_key,
         "a different owner must be a different ingress key"
     );
-
-    let mut other_module = facts();
-    other_module.module_id = "other-module".into();
     assert_ne!(
-        derive_ingress_identity(&other_module, &base).unwrap().key,
+        derive_ingress_key(facts_owner(), "org.dolly.channel", "other-module", facts_instance(), "msg-1"),
         base_key,
         "a different source Module must be a different ingress key"
     );
-
-    let mut other_instance = facts();
-    other_instance.instance_id = "0198ab31-6c44-7e8a-b2bb-000000000999".into();
     assert_ne!(
-        derive_ingress_identity(&other_instance, &base).unwrap().key,
+        derive_ingress_key(facts_owner(), facts_extension(), facts_module(), "0198ab31-6c44-7e8a-b2bb-000000000999", "msg-1"),
         base_key,
         "a different instance must be a different ingress key"
     );
 
     // Fences and content are NOT part of the key: only the deduplication
     // namespace.
-    let mut other_fences = facts();
-    other_fences.generation = 8;
-    other_fences.revision = 4;
     assert_eq!(
-        derive_ingress_identity(&other_fences, &base).unwrap().key,
+        derive_ingress_identity(
+            facts_owner(), facts_extension(), facts_module(), facts_instance(),
+            8, 4, facts_graph_revision(), &base,
+        )
+        .unwrap()
+        .key,
         base_key,
         "the key must ignore fences"
     );
 
     assert_eq!(
-        derive_ingress_key(&facts(), "msg-1"),
+        derive_ingress_key(facts_owner(), facts_extension(), facts_module(), facts_instance(), "msg-1"),
         base_key,
         "status derives the same key for the same principal and external id"
     );
     assert_ne!(
-        derive_ingress_key(&facts(), "msg-2"),
+        derive_ingress_key(facts_owner(), facts_extension(), facts_module(), facts_instance(), "msg-2"),
         base_key,
         "a different external id is a different key"
     );
@@ -247,26 +260,33 @@ fn operation_digest_binds_content_kind_relation_generation_revision_and_graph_re
         "the referenced original must be bound"
     );
 
-    let mut different_generation = facts();
-    different_generation.generation = 8;
     assert_ne!(
-        derive_ingress_identity(&different_generation, &base).unwrap().operation_digest,
+        derive_ingress_identity(
+            facts_owner(), facts_extension(), facts_module(), facts_instance(),
+            8, facts_revision(), facts_graph_revision(), &base,
+        )
+        .unwrap()
+        .operation_digest,
         base_digest,
         "the source generation must be bound"
     );
-
-    let mut different_revision = facts();
-    different_revision.revision = 4;
     assert_ne!(
-        derive_ingress_identity(&different_revision, &base).unwrap().operation_digest,
+        derive_ingress_identity(
+            facts_owner(), facts_extension(), facts_module(), facts_instance(),
+            facts_generation(), 4, facts_graph_revision(), &base,
+        )
+        .unwrap()
+        .operation_digest,
         base_digest,
         "the revision fence must be bound"
     );
-
-    let mut different_graph = facts();
-    different_graph.graph_revision = 2;
     assert_ne!(
-        derive_ingress_identity(&different_graph, &base).unwrap().operation_digest,
+        derive_ingress_identity(
+            facts_owner(), facts_extension(), facts_module(), facts_instance(),
+            facts_generation(), facts_revision(), 2, &base,
+        )
+        .unwrap()
+        .operation_digest,
         base_digest,
         "the graph revision must be bound"
     );
@@ -338,7 +358,10 @@ fn oversized_payload_is_rejected_before_identity() {
         json!({"data": "x".repeat(520 * 1024)}),
     );
     assert!(matches!(
-        derive_ingress_identity(&facts(), &incoming),
+        derive_ingress_identity(
+            facts_owner(), facts_extension(), facts_module(), facts_instance(),
+            facts_generation(), facts_revision(), facts_graph_revision(), &incoming,
+        ),
         Err(HostIngressPremiseError::PayloadTooLarge(_))
     ));
 }
@@ -361,17 +384,24 @@ fn external_id_bounds_are_enforced() {
 }
 
 #[test]
-fn authority_facts_bounds_are_enforced() {
+fn principal_fence_bounds_are_enforced() {
     let incoming = request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({}));
-    let mut zero_generation = facts();
-    zero_generation.generation = 0;
-    assert!(derive_ingress_identity(&zero_generation, &incoming).is_err());
-    let mut zero_revision = facts();
-    zero_revision.revision = 0;
-    assert!(derive_ingress_identity(&zero_revision, &incoming).is_err());
-    let mut zero_graph = facts();
-    zero_graph.graph_revision = 0;
-    assert!(derive_ingress_identity(&zero_graph, &incoming).is_err());
+    assert!(derive_ingress_identity(
+        facts_owner(), facts_extension(), facts_module(), facts_instance(),
+        0, facts_revision(), facts_graph_revision(), &incoming,
+    ).is_err());
+    assert!(derive_ingress_identity(
+        facts_owner(), facts_extension(), facts_module(), facts_instance(),
+        facts_generation(), 0, facts_graph_revision(), &incoming,
+    ).is_err());
+    assert!(derive_ingress_identity(
+        facts_owner(), facts_extension(), facts_module(), facts_instance(),
+        facts_generation(), facts_revision(), 0, &incoming,
+    ).is_err());
+    assert!(derive_ingress_identity(
+        "", facts_extension(), facts_module(), facts_instance(),
+        facts_generation(), facts_revision(), facts_graph_revision(), &incoming,
+    ).is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -390,7 +420,12 @@ fn build_ingress_command_uses_minted_block_id_and_canonical_pages() {
     let base_id = identity(&incoming);
     let block_id: dolly_core_domain::BlockId =
         "0198ab31-6c44-7e8a-b2bb-000000000001".parse().unwrap();
-    let command = build_ingress_command(&base_id, &block_id, &facts(), &incoming);
+    let command = build_ingress_command(
+        &base_id,
+        &block_id,
+        "org.dolly.channel#receiver#0198ab31-6c44-7e8a-b2bb-000000000110",
+        &incoming,
+    );
 
     let CoreCommand::Ingress(ingress) = &command else {
         panic!("expected an Ingress command");

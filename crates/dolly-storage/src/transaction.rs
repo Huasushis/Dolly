@@ -319,6 +319,13 @@ pub(crate) fn request_identity_digest(
     Ok(digest)
 }
 
+/// Load and verify the current reducer snapshot from an existing connection
+/// (or transaction) when no per-command replay machinery is desired. The
+/// Host ingress slice uses this for one shared verification path.
+pub(crate) fn load_core_snapshot(connection: &Connection) -> StorageResult<CoreSnapshot> {
+    load_snapshot(connection).map(|(snapshot, _, _)| snapshot)
+}
+
 /// A SQLite transaction carrying one reducer command and its optimistic fence.
 pub struct SqliteCoreTransaction<'connection> {
     transaction: Option<Transaction<'connection>>,
@@ -397,6 +404,21 @@ impl<'connection> SqliteCoreTransaction<'connection> {
     pub(crate) fn load_authority(&self) -> StorageResult<HostConnectionAuthority> {
         let (snapshot, _, _) = load_snapshot(self.transaction()?)?;
         host_connection_authority_from_snapshot(&snapshot)
+    }
+
+    /// Crate-private binding of one command/input request identity after a
+    /// plain [`Self::begin`], so the Host ingress slice can reconcile an
+    /// existing mapping before allocating fresh identities and only then
+    /// drive the reducer through `load_command_snapshot`.
+    pub(crate) fn bind_request(
+        &mut self,
+        command: &CoreCommand,
+        input: &EnvironmentInput,
+    ) -> StorageResult<()> {
+        let digest = request_identity_digest(command, input)?;
+        self.expected_command_id = Some(command.command_id().to_owned());
+        self.request_digest = Some(digest);
+        Ok(())
     }
 
     fn transaction(&self) -> StorageResult<&Transaction<'connection>> {
