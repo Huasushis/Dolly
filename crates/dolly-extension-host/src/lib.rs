@@ -25,6 +25,7 @@ use dolly_runtime::{
 };
 use dolly_schema::{ActivationManifest, BlockEnvelope, embedded_schema_catalog};
 use dolly_storage::{HostCapabilityGrant, HostConnectionAuthority, SqliteCoreStore};
+use dolly_worker::daemon::DaemonWorkGuard;
 use serde::de::{DeserializeOwned, IntoDeserializer};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -409,6 +410,8 @@ pub enum AdmissionError {
     InvalidResult,
     #[error("capability is undeclared, cross-Extension, stale, or reversed")]
     CapabilityDenied,
+    #[error("operational lifecycle owner does not match the admitted invocation")]
+    LifecycleOwnerMismatch,
 }
 
 #[derive(Clone, Debug)]
@@ -525,8 +528,11 @@ pub fn admit_activation(
     }
     Ok(admitted)
 }
-/// Admit the G2 invocation and immediately expose the only premise accepted
-/// by the G3 operational boundaries.
+/// Admit the G2 invocation as an unbound operational premise.
+///
+/// This preserves the predecessor G2 boundary for tests and non-supervised
+/// inspection. External I/O authority rejects this premise until the Host
+/// uses [`admit_operational_activation_with_lifecycle`].
 pub fn admit_operational_activation(
     premise: &ExecutionPremise,
     dispatch: &DispatchResult,
@@ -536,6 +542,27 @@ pub fn admit_operational_activation(
     admit_activation(premise, dispatch, store, limits).map(OperationalPremise::from_admitted)
 }
 
+/// Atomically admit and bind one G2 invocation to its exact daemon owner.
+///
+/// The Host derives every expected owner field from the admitted premise and
+/// validates it against the sealed supervisor lifecycle before returning a
+/// usable operational premise. No caller-supplied owner fields are accepted.
+pub fn admit_operational_activation_with_lifecycle(
+    premise: &ExecutionPremise,
+    dispatch: &DispatchResult,
+    store: &SqliteCoreStore<'_>,
+    limits: FrameLimits,
+    work_guard: &DaemonWorkGuard,
+) -> Result<OperationalPremise, AdmissionError> {
+    let lifecycle = work_guard
+        .lifecycle_token()
+        .map_err(|_| AdmissionError::LifecycleOwnerMismatch)?;
+    let admitted = admit_activation(premise, dispatch, store, limits)?;
+    let operational = OperationalPremise::from_admitted(admitted);
+    operational
+        .bind_lifecycle(lifecycle)
+        .map_err(|_| AdmissionError::LifecycleOwnerMismatch)
+}
 
 fn validate_host_capability_grant(
     grant: &HostCapabilityGrant,

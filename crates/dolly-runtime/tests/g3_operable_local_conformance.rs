@@ -16,8 +16,8 @@ use dolly_protocol::FrameLimits;
 use dolly_runtime::{DispatchResult, ExecutionPremise, LeaseRequest, RuntimeTransactionEngine};
 use dolly_storage::SqliteCoreStore;
 use dolly_worker::daemon::{
-    DaemonCommand, DaemonError, DaemonGeneration, DaemonReadinessConfig, DaemonState,
-    LocalDaemonSupervisor, RestartBounds,
+    DaemonCommand, DaemonError, DaemonGeneration, DaemonLifecycleIdentity, DaemonReadinessConfig,
+    DaemonState, LocalDaemonSupervisor, RestartBounds,
 };
 use rusqlite::{Connection, types::Value as SqlValue};
 use serde_json::{Value, json};
@@ -460,14 +460,42 @@ fn daemon_command(mode: &str) -> DaemonCommand {
         .env("DOLLY_G3_DAEMON_MODE", mode)
 }
 
-fn daemon_readiness(dispatch: &G1Dispatch) -> DaemonReadinessConfig {
-    let fence = dispatch.premise.fence();
+fn daemon_lifecycle_identity(
+    dispatch: &G1Dispatch,
+    extension_id: &str,
+    module_id: &str,
+    extension_connection_id: &str,
+    incarnation_revision: i64,
+    worker_epoch: dolly_core_domain::WorkerEpoch,
+    worker_epoch_fence: i64,
+    control_channel_id: &str,
+) -> DaemonLifecycleIdentity {
+    DaemonLifecycleIdentity::new(
+        extension_id,
+        module_id,
+        extension_connection_id,
+        incarnation_revision,
+        worker_epoch,
+        worker_epoch_fence,
+        dispatch.premise.fence().extension_generation(),
+        control_channel_id,
+    )
+    .expect("daemon lifecycle identity")
+}
+
+fn daemon_readiness_for_owner(
+    dispatch: &G1Dispatch,
+    worker_epoch: &str,
+    control_channel_id: &str,
+    identity: DaemonLifecycleIdentity,
+) -> DaemonReadinessConfig {
     DaemonReadinessConfig::new(
-        fence.worker_epoch().to_string(),
-        fence.extension_connection_id().to_string(),
+        worker_epoch,
+        control_channel_id,
         dispatch.premise.identity().activation_id().to_string(),
     )
     .expect("daemon readiness")
+    .with_lifecycle_identity(identity)
     .with_storage_ready(true)
     .with_startup_timeout(Duration::from_millis(100))
     .with_stop_timeout(Duration::from_millis(100))
@@ -479,6 +507,27 @@ fn daemon_readiness(dispatch: &G1Dispatch) -> DaemonReadinessConfig {
             3,
         )
         .expect("daemon restart bounds"),
+    )
+}
+
+fn daemon_readiness(dispatch: &G1Dispatch) -> DaemonReadinessConfig {
+    let fence = dispatch.premise.fence();
+    let connection_id = fence.extension_connection_id();
+    let identity = daemon_lifecycle_identity(
+        dispatch,
+        "org.example.extension",
+        dispatch.premise.identity().module_id(),
+        connection_id,
+        fence.incarnation_revision(),
+        fence.worker_epoch().clone(),
+        fence.worker_epoch_fence(),
+        connection_id,
+    );
+    daemon_readiness_for_owner(
+        dispatch,
+        fence.worker_epoch().as_str(),
+        connection_id,
+        identity,
     )
 }
 
@@ -582,7 +631,7 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
 
     let mut supervisor = LocalDaemonSupervisor::with_readiness_at_generation(
         daemon_command("ready"),
-        readiness,
+        readiness.clone(),
         initial_generation,
     );
     let daemon_generation = supervisor
@@ -602,15 +651,14 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
             .expect("operational admission must be tracked");
         let store = SqliteCoreStore::new(&mut dispatch.connection)
             .expect("core schema for operational admission");
-        dolly_extension_host::admit_operational_activation(
+        dolly_extension_host::admit_operational_activation_with_lifecycle(
             &dispatch.premise,
             &dispatch.result,
             &store,
             FrameLimits::defaults(),
+            &work_guard,
         )
-        .expect("accepted G2 invocation must reach operational premise")
-        .bind_work_guard(&work_guard)
-        .expect("operational premise must bind the daemon generation")
+        .expect("accepted G2 invocation must bind the exact daemon owner")
     };
     let after_core = {
         let store = SqliteCoreStore::new(&mut dispatch.connection)
@@ -629,6 +677,149 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
     assert_eq!(before_core.pages, after_core.pages);
     assert_eq!(before_core.blocks, after_core.blocks);
     assert_operational_fences(&dispatch, &operational);
+    let fence = dispatch.premise.fence();
+    let connection_id = fence.extension_connection_id();
+    let module_id = dispatch.premise.identity().module_id();
+    let worker_epoch = fence.worker_epoch().clone();
+    let wrong_worker_epoch: dolly_core_domain::WorkerEpoch = "0198ab31-6c44-7e8a-b2bb-000000000111"
+        .parse()
+        .expect("alternate WorkerEpoch");
+    let owner_controls = vec![
+        (
+            "Extension",
+            daemon_lifecycle_identity(
+                &dispatch,
+                "org.other.extension",
+                module_id,
+                connection_id,
+                fence.incarnation_revision(),
+                worker_epoch.clone(),
+                fence.worker_epoch_fence(),
+                connection_id,
+            ),
+            worker_epoch.to_string(),
+            connection_id.to_string(),
+        ),
+        (
+            "Module",
+            daemon_lifecycle_identity(
+                &dispatch,
+                "org.example.extension",
+                "other-module",
+                connection_id,
+                fence.incarnation_revision(),
+                worker_epoch.clone(),
+                fence.worker_epoch_fence(),
+                connection_id,
+            ),
+            worker_epoch.to_string(),
+            connection_id.to_string(),
+        ),
+        (
+            "connection",
+            daemon_lifecycle_identity(
+                &dispatch,
+                "org.example.extension",
+                module_id,
+                "wrong-connection",
+                fence.incarnation_revision(),
+                worker_epoch.clone(),
+                fence.worker_epoch_fence(),
+                "wrong-connection",
+            ),
+            worker_epoch.to_string(),
+            "wrong-connection".into(),
+        ),
+        (
+            "Host incarnation",
+            daemon_lifecycle_identity(
+                &dispatch,
+                "org.example.extension",
+                module_id,
+                connection_id,
+                fence.incarnation_revision() + 1,
+                worker_epoch.clone(),
+                fence.worker_epoch_fence(),
+                connection_id,
+            ),
+            worker_epoch.to_string(),
+            connection_id.to_string(),
+        ),
+        (
+            "WorkerEpoch",
+            daemon_lifecycle_identity(
+                &dispatch,
+                "org.example.extension",
+                module_id,
+                connection_id,
+                fence.incarnation_revision(),
+                wrong_worker_epoch.clone(),
+                fence.worker_epoch_fence(),
+                connection_id,
+            ),
+            wrong_worker_epoch.to_string(),
+            connection_id.to_string(),
+        ),
+        (
+            "WorkerEpoch fence",
+            daemon_lifecycle_identity(
+                &dispatch,
+                "org.example.extension",
+                module_id,
+                connection_id,
+                fence.incarnation_revision(),
+                worker_epoch.clone(),
+                fence.worker_epoch_fence() + 1,
+                connection_id,
+            ),
+            worker_epoch.to_string(),
+            connection_id.to_string(),
+        ),
+    ];
+    for (label, identity, readiness_worker_epoch, readiness_control_channel) in owner_controls {
+        let mut other_supervisor = LocalDaemonSupervisor::with_readiness_at_generation(
+            daemon_command("ready"),
+            daemon_readiness_for_owner(
+                &dispatch,
+                &readiness_worker_epoch,
+                &readiness_control_channel,
+                identity,
+            ),
+            initial_generation,
+        );
+        let other_generation = other_supervisor
+            .start()
+            .unwrap_or_else(|error| panic!("{label} control did not start: {error}"));
+        assert_eq!(
+            other_generation, daemon_generation,
+            "{label} control must use the equal numeric generation"
+        );
+        let other_guard = other_supervisor
+            .acquire_work_guard(other_generation)
+            .expect("owner-control work guard");
+        let mismatch = {
+            let store = SqliteCoreStore::new(&mut dispatch.connection)
+                .expect("core schema for owner control");
+            dolly_extension_host::admit_operational_activation_with_lifecycle(
+                &dispatch.premise,
+                &dispatch.result,
+                &store,
+                FrameLimits::defaults(),
+                &other_guard,
+            )
+        };
+        assert!(
+            matches!(
+                mismatch,
+                Err(dolly_extension_host::AdmissionError::LifecycleOwnerMismatch)
+            ),
+            "{label} owner must be rejected before guarded execution"
+        );
+        assert_eq!(other_supervisor.active_in_flight_count(), 0);
+        other_supervisor
+            .stop()
+            .unwrap_or_else(|error| panic!("{label} control stop failed: {error}"));
+    }
     let target =
         dolly_extension_host::ExternalTarget::new("https", "api.example.test", 443, "/v1/data")
             .expect("external target");

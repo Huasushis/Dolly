@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use dolly_core_domain::ExtensionId;
 
-use dolly_worker::daemon::{DaemonError, DaemonLifecycleToken, DaemonWorkGuard, InFlightWork};
+use dolly_worker::daemon::{DaemonError, DaemonLifecycleToken, InFlightWork};
 
 use crate::FencedInvocationPremise;
 use crate::SecretRef;
@@ -37,16 +37,23 @@ impl OperationalPremise {
         }
     }
 
-    /// Bind the premise to the exact live daemon generation that admitted it.
-    ///
-    /// The guard remains private to the Host boundary; the shared lifecycle
-    /// state is rechecked whenever a later authority operation is attempted.
-    pub fn bind_work_guard(mut self, guard: &DaemonWorkGuard) -> Result<Self, ExternalIoError> {
-        let lifecycle = guard.lifecycle_token().map_err(map_lifecycle_error)?;
-        let expected_generation = u64::try_from(self.extension_generation()).ok();
-        if expected_generation != Some(lifecycle.generation().value()) {
+    pub(crate) fn bind_lifecycle(
+        mut self,
+        lifecycle: DaemonLifecycleToken,
+    ) -> Result<Self, ExternalIoError> {
+        let extension_id = self.extension_id().ok_or(ExternalIoError::Unauthorized)?;
+        if !lifecycle.matches_owner(
+            extension_id,
+            self.module_id(),
+            self.invocation.extension_connection_id(),
+            self.invocation.incarnation_revision(),
+            self.invocation.worker_epoch(),
+            self.invocation.worker_epoch_fence(),
+            self.extension_generation(),
+        ) {
             return Err(ExternalIoError::StaleGeneration);
         }
+        lifecycle.check().map_err(map_lifecycle_error)?;
         self.lifecycle = Some(lifecycle);
         Ok(self)
     }

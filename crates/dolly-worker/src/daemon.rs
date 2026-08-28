@@ -20,6 +20,7 @@ use std::{
 };
 
 use dolly_canonical_json::Sha256Digest;
+use dolly_core_domain::WorkerEpoch;
 use thiserror::Error;
 
 const READINESS_MAGIC: &str = "DOLLY_DAEMON_READY_V1";
@@ -53,6 +54,85 @@ impl fmt::Display for DaemonGeneration {
     }
 }
 
+/// Exact upstream owner identity for one supervised daemon lifecycle.
+///
+/// The identity combines Extension and Module ownership, the Host connection
+/// and incarnation, typed WorkerEpoch and its numeric fence, the Extension
+/// generation, and the daemon control channel. Fields are private so callers
+/// cannot alter an identity after it is admitted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DaemonLifecycleIdentity {
+    extension_id: String,
+    module_id: String,
+    extension_connection_id: String,
+    incarnation_revision: i64,
+    worker_epoch: WorkerEpoch,
+    worker_epoch_fence: i64,
+    extension_generation: i64,
+    control_channel_id: String,
+}
+
+impl DaemonLifecycleIdentity {
+    pub fn new(
+        extension_id: impl Into<String>,
+        module_id: impl Into<String>,
+        extension_connection_id: impl Into<String>,
+        incarnation_revision: i64,
+        worker_epoch: WorkerEpoch,
+        worker_epoch_fence: i64,
+        extension_generation: i64,
+        control_channel_id: impl Into<String>,
+    ) -> Result<Self, DaemonError> {
+        let extension_id = extension_id.into();
+        let module_id = module_id.into();
+        let extension_connection_id = extension_connection_id.into();
+        let control_channel_id = control_channel_id.into();
+        if extension_id.is_empty()
+            || module_id.is_empty()
+            || extension_connection_id.is_empty()
+            || control_channel_id.is_empty()
+            || extension_id.chars().any(char::is_whitespace)
+            || module_id.chars().any(char::is_whitespace)
+            || extension_connection_id.chars().any(char::is_whitespace)
+            || control_channel_id.chars().any(char::is_whitespace)
+            || incarnation_revision <= 0
+            || worker_epoch_fence <= 0
+            || extension_generation <= 0
+        {
+            return Err(DaemonError::InvalidLifecycleIdentity);
+        }
+        Ok(Self {
+            extension_id,
+            module_id,
+            extension_connection_id,
+            incarnation_revision,
+            worker_epoch,
+            worker_epoch_fence,
+            extension_generation,
+            control_channel_id,
+        })
+    }
+
+    fn matches(
+        &self,
+        extension_id: &str,
+        module_id: &str,
+        extension_connection_id: &str,
+        incarnation_revision: i64,
+        worker_epoch: &WorkerEpoch,
+        worker_epoch_fence: i64,
+        extension_generation: i64,
+    ) -> bool {
+        self.extension_id == extension_id
+            && self.module_id == module_id
+            && self.extension_connection_id == extension_connection_id
+            && self.control_channel_id == extension_connection_id
+            && self.incarnation_revision == incarnation_revision
+            && self.worker_epoch == *worker_epoch
+            && self.worker_epoch_fence == worker_epoch_fence
+            && self.extension_generation == extension_generation
+    }
+}
 /// Finite restart timing and crash-loop bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RestartBounds {
@@ -107,6 +187,7 @@ pub struct DaemonReadinessConfig {
     worker_epoch: String,
     control_channel_id: String,
     owner_token: String,
+    lifecycle_identity: Option<DaemonLifecycleIdentity>,
     storage_ready: bool,
     startup_timeout: Duration,
     stop_timeout: Duration,
@@ -137,6 +218,7 @@ impl DaemonReadinessConfig {
             worker_epoch: worker_epoch.into(),
             control_channel_id: control_channel_id.into(),
             owner_token: owner_token.into(),
+            lifecycle_identity: None,
             storage_ready: false,
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             stop_timeout: DEFAULT_STOP_TIMEOUT,
@@ -151,6 +233,7 @@ impl DaemonReadinessConfig {
             worker_epoch: String::new(),
             control_channel_id: String::new(),
             owner_token: String::new(),
+            lifecycle_identity: None,
             storage_ready: false,
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             stop_timeout: DEFAULT_STOP_TIMEOUT,
@@ -177,6 +260,11 @@ impl DaemonReadinessConfig {
         self.restart_bounds = restart_bounds;
         self
     }
+    /// Attach the owner identity obtained from authenticated upstream state.
+    pub fn with_lifecycle_identity(mut self, identity: DaemonLifecycleIdentity) -> Self {
+        self.lifecycle_identity = Some(identity);
+        self
+    }
 
     pub fn worker_epoch(&self) -> &str {
         &self.worker_epoch
@@ -197,7 +285,6 @@ impl DaemonReadinessConfig {
     fn stop_timeout(&self) -> Duration {
         self.stop_timeout
     }
-
     fn validate(&self) -> Result<(), DaemonError> {
         self.validate_static()?;
         if !self.storage_ready {
@@ -215,6 +302,13 @@ impl DaemonReadinessConfig {
             || self.owner_token.chars().any(char::is_whitespace)
         {
             return Err(DaemonError::ReadinessNotConfigured);
+        }
+        if let Some(identity) = &self.lifecycle_identity {
+            if identity.worker_epoch.to_string() != self.worker_epoch
+                || identity.control_channel_id != self.control_channel_id
+            {
+                return Err(DaemonError::LifecycleIdentityMismatch);
+            }
         }
         if self.startup_timeout.is_zero() || self.startup_timeout > MAX_STARTUP_TIMEOUT {
             return Err(DaemonError::InvalidReadinessBounds);
@@ -337,6 +431,10 @@ pub enum DaemonError {
     ReadinessMismatch,
     #[error("daemon readiness bounds are invalid")]
     InvalidReadinessBounds,
+    #[error("daemon lifecycle identity does not match readiness authority")]
+    LifecycleIdentityMismatch,
+    #[error("daemon lifecycle identity is invalid")]
+    InvalidLifecycleIdentity,
     #[error("daemon crash loop is quarantined at generation {0}")]
     CrashLoopQuarantined(DaemonGeneration),
     #[error("daemon work is not admitted")]
@@ -359,14 +457,16 @@ struct LifecycleStatus {
 
 struct LifecycleInner {
     generation: DaemonGeneration,
+    identity: Option<DaemonLifecycleIdentity>,
     status: Mutex<LifecycleStatus>,
     drained: Condvar,
 }
 
 impl LifecycleInner {
-    fn new(generation: DaemonGeneration) -> Self {
+    fn new(generation: DaemonGeneration, identity: Option<DaemonLifecycleIdentity>) -> Self {
         Self {
             generation,
+            identity,
             status: Mutex::new(LifecycleStatus {
                 admission_open: false,
                 cancelled: true,
@@ -396,14 +496,39 @@ impl fmt::Debug for DaemonLifecycleToken {
 }
 
 impl DaemonLifecycleToken {
-    fn new(generation: DaemonGeneration) -> Self {
+    fn new(generation: DaemonGeneration, identity: Option<DaemonLifecycleIdentity>) -> Self {
         Self {
-            inner: Arc::new(LifecycleInner::new(generation)),
+            inner: Arc::new(LifecycleInner::new(generation, identity)),
             guard_id: 0,
         }
     }
     pub fn generation(&self) -> DaemonGeneration {
         self.inner.generation
+    }
+
+    /// Verify every upstream owner field against this exact lifecycle.
+    pub fn matches_owner(
+        &self,
+        extension_id: &str,
+        module_id: &str,
+        extension_connection_id: &str,
+        incarnation_revision: i64,
+        worker_epoch: &WorkerEpoch,
+        worker_epoch_fence: i64,
+        extension_generation: i64,
+    ) -> bool {
+        u64::try_from(extension_generation).ok() == Some(self.generation().value())
+            && self.inner.identity.as_ref().is_some_and(|identity| {
+                identity.matches(
+                    extension_id,
+                    module_id,
+                    extension_connection_id,
+                    incarnation_revision,
+                    worker_epoch,
+                    worker_epoch_fence,
+                    extension_generation,
+                )
+            })
     }
 
     pub fn check(&self) -> Result<(), DaemonError> {
@@ -948,7 +1073,10 @@ impl LocalDaemonSupervisor {
             .unwrap_or(Ok(self.initial_generation.value()))?;
         let generation = DaemonGeneration::new(next_value)?;
         self.generation = Some(generation);
-        self.lifecycle = Some(DaemonLifecycleToken::new(generation));
+        self.lifecycle = Some(DaemonLifecycleToken::new(
+            generation,
+            self.readiness.lifecycle_identity.clone(),
+        ));
         self.state = DaemonState::Starting(generation);
 
         let mut command = Command::new(&self.command.program);
