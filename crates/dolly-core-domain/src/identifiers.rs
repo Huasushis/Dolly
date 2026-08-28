@@ -129,6 +129,82 @@ local_id_type!(
     ModuleId,
     "A human-configured local identifier for one Module."
 );
+// ---------------------------------------------------------------------------
+// SecretRef
+// ---------------------------------------------------------------------------
+
+/// An opaque Host-managed reference to secret material.
+///
+/// The reference identifies material without carrying the material itself.
+/// Only the Host secret authority may turn it into bytes at the point of use;
+/// this type deliberately has no accessor for secret contents.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SecretRef(String);
+
+impl SecretRef {
+    pub fn from_string(s: String) -> Result<Self, String> {
+        validate_secret_ref(&s)?;
+        Ok(Self(s))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn validate_secret_ref(value: &str) -> Result<(), String> {
+    if !(10..=255).contains(&value.len()) || !value.starts_with("secret://") {
+        return Err("SecretRef must use the secret:// URI form".to_string());
+    }
+    let name = &value["secret://".len()..];
+    if name.is_empty()
+        || name.starts_with('/')
+        || name.ends_with('/')
+        || name.contains("//")
+        || name.contains("..")
+        || name.bytes().any(|byte| {
+            !(byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'/' | b'_' | b'-' | b'.'))
+        })
+    {
+        return Err("SecretRef contains an invalid reference name".to_string());
+    }
+    Ok(())
+}
+
+impl fmt::Display for SecretRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Debug for SecretRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretRef(<redacted>)")
+    }
+}
+
+impl std::str::FromStr for SecretRef {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::from_string(value.to_owned())
+    }
+}
+
+impl Serialize for SecretRef {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretRef {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::from_string(value).map_err(de::Error::custom)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ExtensionId

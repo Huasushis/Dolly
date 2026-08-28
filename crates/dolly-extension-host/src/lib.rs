@@ -7,6 +7,8 @@
 //! and ordering fence, then returns immutable data for a later Extension
 //! handler. This crate has no transport writer, process launcher, or effect
 //! executor.
+pub mod operability;
+
 
 use dolly_canonical_json::{
     CanonicalBytes, CanonicalJsonObject, CanonicalJsonValue, ParseLimits, Sha256Digest,
@@ -26,6 +28,14 @@ use dolly_storage::{HostCapabilityGrant, HostConnectionAuthority, SqliteCoreStor
 use serde::de::{DeserializeOwned, IntoDeserializer};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+pub use dolly_core_domain::SecretRef;
+pub use operability::{
+    ExternalIoContext, ExternalIoError, ExternalIoExecutionError, ExternalIoPermit,
+    ExternalIoPolicy, ExternalIoRequest, ExternalTarget, HostExternalIoAuthority,
+    HostSecretAuthority, InMemorySecretProvider, IoPolicyError, OperationalPremise, SecretError,
+    SecretMaterial, SecretProvider,
+};
+
 use thiserror::Error;
 /// The only invocation method admitted by this G2 boundary.
 pub const MODULE_ACTIVATE_METHOD: &str = "module.activate";
@@ -35,7 +45,7 @@ pub const ACTIVATION_REQUEST_SCHEMA_ID: &str =
 
 
 /// The immutable G2 premise produced only after G1 dispatch admission.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct FencedInvocationPremise {
     activation_id: String,
     module_id: String,
@@ -62,6 +72,37 @@ pub struct FencedInvocationPremise {
     replay_scope: ReplayScope,
     capability_policy: Option<CapabilityPolicy>,
 }
+impl std::fmt::Debug for FencedInvocationPremise {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FencedInvocationPremise")
+            .field("activation_id", &self.activation_id)
+            .field("module_id", &self.module_id)
+            .field("request_id", &self.request_id)
+            .field("reservation_id", &self.reservation_id)
+            .field("lease_id", &self.lease_id)
+            .field("worker_epoch", &self.worker_epoch)
+            .field("worker_epoch_fence", &self.worker_epoch_fence)
+            .field("incarnation_revision", &self.incarnation_revision)
+            .field("extension_connection_id", &self.extension_connection_id)
+            .field("extension_generation", &self.extension_generation)
+            .field("lease_generation", &self.lease_generation)
+            .field("attempt", &self.attempt)
+            .field("lease_token", &self.lease_token)
+            .field("lease_token_digest", &self.lease_token_digest)
+            .field("frame_digest", &self.frame_digest)
+            .field("graph_digest", &self.graph_digest)
+            .field("descriptor_digest", &self.descriptor_digest)
+            .field("manifest_digest", &self.manifest_digest)
+            .field("effective_config_digest", &self.effective_config_digest)
+            .field(
+                "effective_config_schema_digest",
+                &self.effective_config_schema_digest,
+            )
+            .finish()
+    }
+}
+
 
 /// Host-owned capability policy bound to one admitted invocation premise.
 ///
@@ -185,6 +226,13 @@ impl FencedInvocationPremise {
             self.manifest_digest.to_canonical_string(),
         )
     }
+    /// Extension identity declared by the admitted capability policy.
+    pub fn extension_id(&self) -> Option<&str> {
+        self.capability_policy
+            .as_ref()
+            .map(|policy| policy.extension_id.as_str())
+    }
+
     fn bind_capability_policy(
         &mut self,
         extension_id: String,
@@ -477,6 +525,17 @@ pub fn admit_activation(
     }
     Ok(admitted)
 }
+/// Admit the G2 invocation and immediately expose the only premise accepted
+/// by the G3 operational boundaries.
+pub fn admit_operational_activation(
+    premise: &ExecutionPremise,
+    dispatch: &DispatchResult,
+    store: &SqliteCoreStore<'_>,
+    limits: FrameLimits,
+) -> Result<OperationalPremise, AdmissionError> {
+    admit_activation(premise, dispatch, store, limits).map(OperationalPremise::from_admitted)
+}
+
 
 fn validate_host_capability_grant(
     grant: &HostCapabilityGrant,

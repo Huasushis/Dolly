@@ -4,7 +4,9 @@ use dolly_core_reducer::{
     BuildManifestCommand, CoreCommand, EnvironmentInput, InstallConfigCommand, InstallGraphCommand,
     TransitionOutcome,
 };
-use dolly_extension_host::{admit_activation, admit_sdk_capability, AdmissionError};
+use dolly_extension_host::{
+    admit_activation, admit_operational_activation, admit_sdk_capability, AdmissionError,
+};
 use dolly_extension_sdk::{CapabilityRequest, ResultData};
 use dolly_protocol::FrameLimits;
 use dolly_runtime::{DispatchResult, LeaseRequest, RuntimeTransactionEngine};
@@ -224,6 +226,14 @@ fn accepted_g1_frame_becomes_fenced_premise_and_replay_is_same_key() {
     );
     let admitted =
         admit_activation(&premise, &dispatch, &store, FrameLimits::defaults()).unwrap();
+    let operational =
+        admit_operational_activation(&premise, &dispatch, &store, FrameLimits::defaults()).unwrap();
+    assert_eq!(operational.activation_id(), ACTIVATION_ID);
+    assert_eq!(operational.config_revision(), 1);
+    assert_eq!(
+        operational.extension_generation(),
+        premise.fence().extension_generation()
+    );
     assert_eq!(admitted.activation_id(), ACTIVATION_ID);
     assert_eq!(admitted.module_id(), "timer");
     assert_eq!(admitted.request_id(), premise.fence().request_id());
