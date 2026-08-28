@@ -9,7 +9,7 @@ use dolly_extension_host::{
 };
 use dolly_protocol::FrameLimits;
 use dolly_runtime::{LeaseRequest, RuntimeTransactionEngine};
-use dolly_storage::SqliteCoreStore;
+use dolly_storage::{GrantFenceExpectation, SqliteCoreStore};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -299,10 +299,91 @@ fn process_request(
     if validate_request_against_grant(connection, launch, &request).is_err() {
         return ControlResponse::rejected("request_fence_mismatch");
     }
-    match perform_activation(connection, launch, request) {
+    if activation_barrier("PREFLIGHT").is_err() {
+        return ControlResponse::rejected("activation_rejected");
+    }
+    let expectation = GrantFenceExpectation {
+        extension_id: launch.extension_id.clone(),
+        module_id: request.module_id.clone(),
+        extension_connection_id: launch.control_channel_id.clone(),
+        worker_epoch: launch.worker_epoch.clone(),
+        worker_epoch_fence: launch.worker_epoch_fence,
+        incarnation_revision: launch.incarnation_revision,
+        extension_generation: request.extension_generation,
+        descriptor_revision: request
+            .manifest
+            .get("descriptor_revision")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        manifest_revision: request
+            .manifest
+            .get("config_revision")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        graph_revision: request
+            .manifest
+            .get("graph_revision")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        manifest_digest: request
+            .manifest
+            .get("manifest_digest")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+    };
+    let fence_acquired = {
+        let mut store = match SqliteCoreStore::new(connection) {
+            Ok(store) => store,
+            Err(_) => return ControlResponse::rejected("activation_rejected"),
+        };
+        let authority = match store.authenticated_host_connection() {
+            Ok(authority) => authority,
+            Err(_) => return ControlResponse::rejected("activation_rejected"),
+        };
+        store.acquire_grant_fence(&authority, &expectation).is_ok()
+    };
+    if !fence_acquired {
+        // A grant replace/revoke committed after preflight or the durable
+        // grant no longer matches the request. No request-owned row was
+        // written; nothing to roll back.
+        return ControlResponse::rejected("request_fence_mismatch");
+    }
+    if activation_barrier("FENCE").is_err() {
+        let _ = release_fence(connection, &expectation.module_id);
+        return ControlResponse::rejected("activation_rejected");
+    }
+    let result = perform_activation(connection, launch, request);
+    let _ = release_fence(connection, &expectation.module_id);
+    match result {
         Ok(response) => response,
         Err(_) => ControlResponse::rejected("activation_rejected"),
     }
+}
+
+/// Release the durable grant fence after the activation outcome is final on
+/// every path that acquired it.
+fn release_fence(connection: &mut Connection, module_id: &str) -> Result<(), ()> {
+    let mut store = SqliteCoreStore::new(connection).map_err(|_| ())?;
+    store.release_grant_fence(module_id).map_err(|_| ())
+}
+
+/// Deterministic test barrier. When `DOLLY_ACTIVATION_BARRIER_<key>` names a
+/// path, bind a Unix socket there, wait for one peer connection, and block
+/// until the peer closes. Production launches never set the variable.
+fn activation_barrier(key: &str) -> Result<(), ()> {
+    let Some(path) = std::env::var_os(format!("DOLLY_ACTIVATION_BARRIER_{key}")) else {
+        return Ok(());
+    };
+    let path = PathBuf::from(path);
+    let _ = fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).map_err(|_| ())?;
+    let (mut stream, _) = listener.accept().map_err(|_| ())?;
+    let mut token = [0u8; 1];
+    let _ = stream.read(&mut token);
+    drop(listener);
+    let _ = fs::remove_file(&path);
+    Ok(())
 }
 
 /// Validate every request-controlled field that `admit_operational_activation`

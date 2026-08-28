@@ -9,6 +9,7 @@ pub mod attestation;
 pub mod database;
 pub mod effect_journal;
 pub mod error;
+pub mod grant_fence;
 pub mod host_authority;
 pub mod module_state;
 pub mod linux_host_verification;
@@ -32,7 +33,7 @@ pub use restore_identity::{
     RestoreIdentityPlannerErrorCode, evaluate_restore_identity_modes,
 };
 pub use transaction::{
-    CoreTransaction, HostCapabilityGrant, HostConnectionAuthority,
+    CoreTransaction, GrantFenceExpectation, HostCapabilityGrant, HostConnectionAuthority,
     HOST_CAPABILITY_GRANT_RECORD_SCHEMA, CORE_ENGINE_SCHEMA_SQL, CORE_ENGINE_SCHEMA_VERSION,
     SqliteCoreStore, SqliteCoreTransaction, initialize_core_engine_schema,
 };

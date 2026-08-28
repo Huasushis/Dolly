@@ -22,6 +22,7 @@ use serde_json::Value;
 
 use crate::database::map_sqlite_error;
 use crate::error::{StorageError, StorageResult};
+use crate::grant_fence;
 
 /// One atomic Core transition plus its journal under a single storage commit.
 ///
@@ -1361,6 +1362,26 @@ fn allocate_host_request_transition(
     })
 }
 
+/// The exact durable Host grant fields one activation must match.
+///
+/// The daemon fills this from the launch identity and the request manifest;
+/// the fence acquisition compares every field against the current grant
+/// inside the same immediate transaction that publishes the fence row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantFenceExpectation {
+    pub extension_id: String,
+    pub module_id: String,
+    pub extension_connection_id: String,
+    pub worker_epoch: String,
+    pub worker_epoch_fence: i64,
+    pub incarnation_revision: i64,
+    pub extension_generation: i64,
+    pub descriptor_revision: i64,
+    pub manifest_revision: i64,
+    pub graph_revision: i64,
+    pub manifest_digest: String,
+}
+
 /// The production Core store façade. It keeps semantic transitions on the
 /// reducer path and exposes only one mutable SQLite writer reference.
 pub struct SqliteCoreStore<'connection> {
@@ -1662,10 +1683,14 @@ impl<'connection> SqliteCoreStore<'connection> {
             methods,
         )?;
         ensure_host_capability_grant_schema(self.connection)?;
+        grant_fence::ensure_grant_fence_schema(self.connection)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite_error)?;
+        if grant_fence::fence_is_active(&transaction)? {
+            return Err(StorageError::IdempotencyConflict);
+        }
         let snapshot = load_snapshot(&transaction)?.0;
         if host_connection_authority_from_snapshot(&snapshot)? != *authority {
             return Err(StorageError::IdempotencyConflict);
@@ -1709,10 +1734,14 @@ impl<'connection> SqliteCoreStore<'connection> {
         validate_grant_text(extension_id)?;
         validate_grant_text(module_id)?;
         ensure_host_capability_grant_schema(self.connection)?;
+        grant_fence::ensure_grant_fence_schema(self.connection)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite_error)?;
+        if grant_fence::fence_is_active(&transaction)? {
+            return Err(StorageError::IdempotencyConflict);
+        }
         let snapshot = load_snapshot(&transaction)?.0;
         if host_connection_authority_from_snapshot(&snapshot)? != *authority {
             return Err(StorageError::IdempotencyConflict);
@@ -1787,6 +1816,91 @@ impl<'connection> SqliteCoreStore<'connection> {
         )?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(result)
+    }
+
+    /// Atomically re-validate the current durable Host grant against the
+    /// expectation and publish one active fence row.
+    ///
+    /// Until the matching [`Self::release_grant_fence`] commits, no other
+    /// connection can install or revoke this grant, so the activation's G1
+    /// transitions and its final G2 admission observe one frozen grant. The
+    /// comparison mirrors every request-controlled field the operational
+    /// admission checks against the same grant.
+    pub fn acquire_grant_fence(
+        &mut self,
+        authority: &HostConnectionAuthority,
+        expectation: &GrantFenceExpectation,
+    ) -> StorageResult<()> {
+        grant_fence::ensure_grant_fence_schema(self.connection)?;
+        let transaction =
+            Transaction::new_unchecked(self.connection, TransactionBehavior::Immediate)
+                .map_err(map_sqlite_error)?;
+        let (snapshot, _, _) = load_snapshot(&transaction)?;
+        if host_connection_authority_from_snapshot(&snapshot)? != *authority {
+            return Err(StorageError::IdempotencyConflict);
+        }
+        let grant = load_current_host_capability_grant(
+            &transaction,
+            authority,
+            &expectation.extension_id,
+            &expectation.module_id,
+            None,
+        )?
+        .ok_or(StorageError::IdempotencyConflict)?;
+        if grant.extension_id() != expectation.extension_id
+            || grant.module_id() != expectation.module_id
+            || grant.extension_connection_id() != expectation.extension_connection_id
+            || grant.worker_epoch() != expectation.worker_epoch
+            || grant.worker_epoch_fence() != expectation.worker_epoch_fence
+            || grant.incarnation_revision() != expectation.incarnation_revision
+            || grant.extension_generation() != expectation.extension_generation
+            || grant.descriptor_revision() != expectation.descriptor_revision
+            || grant.manifest_revision() != expectation.manifest_revision
+            || grant.graph_revision() != expectation.graph_revision
+            || grant.manifest_digest() != expectation.manifest_digest
+        {
+            return Err(StorageError::IdempotencyConflict);
+        }
+        let graph_digest = snapshot.graph.get("digest").and_then(Value::as_str);
+        let descriptor_digest = snapshot
+            .graph
+            .get("graph")
+            .and_then(|graph| graph.get("descriptors"))
+            .and_then(Value::as_object)
+            .and_then(|descriptors| descriptors.get(&expectation.module_id))
+            .and_then(|entry| entry.get("source_descriptor_digest"))
+            .and_then(Value::as_str);
+        if graph_digest != Some(grant.graph_digest())
+            || descriptor_digest != Some(grant.descriptor_digest())
+        {
+            return Err(StorageError::IdempotencyConflict);
+        }
+        transaction
+            .execute(
+                "INSERT INTO grant_activation_fence (owner, grant_revision, active)
+                 VALUES (?1, ?2, 1)
+                 ON CONFLICT(owner) DO UPDATE SET
+                     grant_revision = excluded.grant_revision, active = 1",
+                params![expectation.module_id, grant.grant_revision()],
+            )
+            .map_err(map_sqlite_error)?;
+        transaction.commit().map_err(map_sqlite_error)
+    }
+
+    /// Release the fence for one Module owner, restoring grant mutation
+    /// authority on every connection.
+    pub fn release_grant_fence(&mut self, module_id: &str) -> StorageResult<()> {
+        grant_fence::ensure_grant_fence_schema(self.connection)?;
+        let transaction =
+            Transaction::new_unchecked(self.connection, TransactionBehavior::Immediate)
+                .map_err(map_sqlite_error)?;
+        transaction
+            .execute(
+                "DELETE FROM grant_activation_fence WHERE owner = ?1",
+                params![module_id],
+            )
+            .map_err(map_sqlite_error)?;
+        transaction.commit().map_err(map_sqlite_error)
     }
 
     /// Allocate a request identity while atomically checking the current Host
