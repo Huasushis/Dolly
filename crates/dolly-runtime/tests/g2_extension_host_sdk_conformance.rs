@@ -605,6 +605,116 @@ fn g2_admission_001_valid_committed_g1_module_activate_reaches_one_host_admissio
         .unwrap_err(),
         dolly_extension_host::AdmissionError::CapabilityDenied
     );
+    let result_output = CanonicalJsonObject::try_from_iter([(
+        "status".into(),
+        CanonicalJsonValue::String("ready".into()),
+    )])
+    .expect("result output");
+    let result = dolly_extension_sdk::ResultData::success(Some(result_output), None);
+    let result_value = result
+        .canonical_value()
+        .expect("result data must be canonical");
+    let result_digest = result.digest().expect("result digest");
+    let expected_receipt = json!({
+        "invocation": {
+            "activation_id": admitted.activation_id(),
+            "module_id": admitted.module_id(),
+            "request_id": admitted.request_id(),
+            "frame_digest": admitted.frame_digest().to_string(),
+            "replay_key": {
+                "activation_id": admitted.activation_id(),
+                "manifest_digest": admitted.manifest_digest().to_string()
+            }
+        },
+        "result": {
+            "worker_epoch": admitted.worker_epoch().to_string(),
+            "extension_generation": admitted.extension_generation(),
+            "activation_id": admitted.activation_id(),
+            "manifest_digest": admitted.manifest_digest().to_string(),
+            "lease_generation": admitted.lease_generation(),
+            "lease_token": source["lease_token"].as_str().expect("lease token"),
+            "payload": result_value,
+            "result_digest": result_digest.to_string()
+        }
+    });
+    let (expected_receipt_bytes, expected_receipt_digest) =
+        canonicalize(&expected_receipt).expect("receipt must be canonical");
+    let receipt = admitted
+        .result_receipt(&result)
+        .expect("Host receipt must be constructed");
+    assert_eq!(receipt.bytes(), expected_receipt_bytes.as_bytes());
+    assert_eq!(receipt.receipt_digest(), &expected_receipt_digest);
+    assert_eq!(receipt.activation_id(), admitted.activation_id());
+    assert_eq!(receipt.manifest_digest(), admitted.manifest_digest());
+    assert_eq!(receipt.result_digest(), &result_digest);
+    assert_eq!(receipt.result(), &result);
+    assert_eq!(receipt.replay_key(), admitted.replay_key());
+    let receipt_value: Value =
+        serde_json::from_slice(receipt.bytes()).expect("receipt bytes must be JSON");
+    assert_eq!(receipt_value, expected_receipt);
+
+    let before_replay = store.snapshot().expect("pre-replay state");
+    let replay = {
+        drop(store);
+        let mut engine =
+            dolly_runtime::RuntimeTransactionEngine::new(&mut dispatch.connection)
+                .expect("runtime engine");
+        engine
+            .dispatch_execution(
+                &dispatch.premise,
+                "g2-exec-dispatch-replay",
+                &fixture_token,
+                &input(),
+            )
+            .expect("exact replay dispatch")
+    };
+    assert_eq!(replay.frame_bytes(), dispatch.result.frame_bytes());
+    assert_eq!(replay.frame_digest(), dispatch.result.frame_digest());
+    assert_eq!(replay.transition().state, before_replay);
+    let replay_store =
+        SqliteCoreStore::new(&mut dispatch.connection).expect("replay core schema");
+    let after_replay = replay_store.snapshot().expect("post-replay state");
+    assert_eq!(after_replay, before_replay);
+    let replayed = dolly_extension_host::admit_activation(
+        &dispatch.premise,
+        &replay,
+        &replay_store,
+        FrameLimits::defaults(),
+    )
+    .expect("exact replay must remain admissible");
+    let replay_receipt = replayed
+        .result_receipt(&result)
+        .expect("replay receipt must be constructed");
+    assert_eq!(replay_receipt.bytes(), receipt.bytes());
+    assert_eq!(replay_receipt.receipt_digest(), receipt.receipt_digest());
+    assert_eq!(replay_receipt.activation_id(), receipt.activation_id());
+    assert_eq!(
+        replay_receipt.manifest_digest(),
+        receipt.manifest_digest()
+    );
+    assert_eq!(replay_receipt.result_digest(), receipt.result_digest());
+    assert_eq!(replay_receipt.replay_key(), receipt.replay_key());
+    assert_eq!(replay_receipt.result(), receipt.result());
+    assert_eq!(replayed.activation_id(), admitted.activation_id());
+    assert_eq!(replayed.module_id(), admitted.module_id());
+    assert_eq!(
+        replayed.extension_connection_id(),
+        admitted.extension_connection_id()
+    );
+    assert_eq!(
+        replayed.incarnation_revision(),
+        admitted.incarnation_revision()
+    );
+    assert_eq!(replayed.request_id(), admitted.request_id());
+    assert_eq!(replayed.reservation_id(), admitted.reservation_id());
+    assert_eq!(replayed.lease_id(), admitted.lease_id());
+    assert_eq!(replayed.extension_generation(), admitted.extension_generation());
+    assert_eq!(replayed.lease_generation(), admitted.lease_generation());
+    assert_eq!(replayed.attempt(), admitted.attempt());
+    assert_eq!(replayed.manifest_digest(), admitted.manifest_digest());
+    assert_eq!(replayed.graph_digest(), admitted.graph_digest());
+    assert_eq!(replayed.frame_digest(), admitted.frame_digest());
+    assert_eq!(replayed.replay_key(), admitted.replay_key());
 }
 
 #[test]
