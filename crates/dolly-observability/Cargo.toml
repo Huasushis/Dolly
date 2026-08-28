@@ -8,7 +8,12 @@ license.workspace = true
 [dependencies]
 dolly-canonical-json = { path = "../dolly-canonical-json" }
 dolly-core-domain = { path = "../dolly-core-domain" }
+dolly-storage = { path = "../dolly-storage" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
+
+[dev-dependencies]
+dolly-core-reducer = { path = "../dolly-core-reducer" }
+rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
 

@@ -1,11 +1,16 @@
-use dolly_canonical_json::Sha256Digest;
+use dolly_canonical_json::{canonicalize, Sha256Digest};
 use dolly_core_domain::{ModuleId, ModuleStorageScopeId, Timestamp};
+use dolly_core_reducer::{
+    CoreCommand, EnvironmentInput, InstallConfigCommand, InstallGraphCommand, TransitionOutcome,
+};
 use dolly_observability::{
     BackupError, BoundedLogBuffer, LogError, LogLevel, LogLimits, LogPushOutcome, ModuleBackup,
-    ModuleRestoreRequest, ModuleState, ModuleStateProjection, PayloadAuthorization, ReplayError,
-    ReplayLimits, ReplayMode, ReplayRecorder, StructuredLogEvent,
+    ModuleRestoreRequest, ModuleStateProjection, PayloadAuthorization, ReplayError, ReplayLimits,
+    ReplayMode, ReplayRecorder, StructuredLogEvent,
 };
-use serde_json::{Map, Value, json};
+use dolly_storage::{HostConnectionAuthority, SqliteCoreStore};
+use rusqlite::Connection;
+use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
@@ -17,13 +22,112 @@ fn scope_id() -> ModuleStorageScopeId {
     ModuleStorageScopeId::from_uuid_v7("0198ab31-6c44-7e8a-b2bb-000000000154".parse().unwrap())
 }
 
-fn module_state_projection(
-    module: ModuleId,
-    scope: ModuleStorageScopeId,
-    revision: u64,
-    values: Vec<u64>,
-) -> ModuleStateProjection {
-    ModuleStateProjection::new(module, scope, revision, ModuleState::new(values)).unwrap()
+fn storage_module_id() -> ModuleId {
+    ModuleId::from_string("timer".to_owned()).unwrap()
+}
+
+fn digest(value: &Value) -> String {
+    canonicalize(value).unwrap().1.to_canonical_string()
+}
+
+fn storage_input() -> EnvironmentInput {
+    EnvironmentInput {
+        now: "2026-08-28T12:00:00.000000Z".into(),
+        ..Default::default()
+    }
+}
+
+fn storage_descriptor() -> Value {
+    json!({
+        "schema": "dolly.module-descriptor/v1",
+        "module_id": "timer",
+        "descriptor_revision": 1,
+        "display_name": "timer",
+        "accepts": {"summary": "input", "part_kinds": ["text"], "action_names": []},
+        "emits": {"summary": "output", "part_kinds": ["text"]},
+        "actions": [],
+        "activation_replay_contract": {
+            "mode": "fenced_replay",
+            "evidence": "pure_compute",
+            "ledger": null
+        },
+        "trust": "trusted",
+        "metadata": {}
+    })
+}
+
+fn storage_graph() -> Value {
+    let descriptor = storage_descriptor();
+    json!({
+        "receiving_module": "timer",
+        "input_pages": {},
+        "output_pages": {},
+        "subscriptions": {},
+        "descriptors": {
+            "timer": {
+                "module_id": "timer",
+                "descriptor_revision": 1,
+                "source_descriptor_digest": digest(&descriptor),
+                "value": descriptor
+            }
+        },
+        "authorized_metadata_namespaces": [],
+        "authorized_action_names": []
+    })
+}
+
+fn storage_setup() -> (Connection, HostConnectionAuthority) {
+    let mut connection = Connection::open_in_memory().unwrap();
+    let mut store = SqliteCoreStore::new(&mut connection).unwrap();
+    let config = json!({
+        "execution_timeout_ms": 120000,
+        "lease_grace_ms": 30000,
+        "fencing_grace_ms": 5000,
+        "extension_connection_id": "g3-backup-extension",
+        "worker_epoch": "0198ab31-6c44-7e8a-b2bb-000000000110",
+        "worker_epoch_fence": 17
+    });
+    let config_transition = store
+        .transact(
+            &CoreCommand::InstallConfig(InstallConfigCommand {
+                command_id: "g3-backup-config".into(),
+                revision: 1,
+                digest: digest(&config),
+                effective_config: config,
+            }),
+            &storage_input(),
+        )
+        .unwrap();
+    assert_eq!(config_transition.outcome, TransitionOutcome::Committed);
+    let graph = storage_graph();
+    let graph_transition = store
+        .transact(
+            &CoreCommand::InstallGraph(InstallGraphCommand {
+                command_id: "g3-backup-graph".into(),
+                revision: 1,
+                digest: digest(&graph),
+                graph,
+            }),
+            &storage_input(),
+        )
+        .unwrap();
+    assert_eq!(graph_transition.outcome, TransitionOutcome::Committed);
+    let authority = store.bootstrap_host_connection().unwrap();
+    drop(store);
+    (connection, authority)
+}
+
+fn storage_projection() -> (Connection, HostConnectionAuthority, ModuleStateProjection) {
+    let (mut connection, authority) = storage_setup();
+    let mut store = SqliteCoreStore::new(&mut connection).unwrap();
+    store
+        .admit_module(&authority, &storage_module_id())
+        .unwrap();
+    let projection = store
+        .issue_module_state_projection(&authority, &storage_module_id())
+        .unwrap();
+    drop(store);
+    (connection, authority, projection)
 }
 
 fn timestamp(value: &str) -> Timestamp {
@@ -230,54 +334,81 @@ fn replay_recovery_rejects_truncated_evidence() {
 }
 
 #[test]
-fn module_backup_is_canonical_scope_bound_and_restores_typed_data() {
-    let projection = module_state_projection(module_id(), scope_id(), 7, vec![1, 2]);
+fn module_backup_is_canonical_scope_bound_and_restores_storage_state() {
+    let (_connection, _authority, projection) = storage_projection();
     let backup = ModuleBackup::capture(&projection).unwrap();
     let bytes = backup.canonical_bytes().unwrap().into_vec();
     let recovered = ModuleBackup::recover_from_bytes(&bytes).unwrap();
     assert_eq!(recovered, backup);
 
-    let request =
-        ModuleRestoreRequest::new(module_id(), scope_id(), 7, backup.backup_digest().clone())
-            .unwrap();
+    let request = ModuleRestoreRequest::new(
+        storage_module_id(),
+        projection.storage_scope_id().clone(),
+        projection.revision(),
+        backup.backup_digest().clone(),
+    )
+    .unwrap();
     let restored = backup.restore(&request).unwrap();
-    assert_eq!(restored.state(), backup.state());
-    assert_eq!(restored.state().values(), &[1, 2]);
     assert_eq!(restored.state_bytes(), backup.state_bytes());
     assert_eq!(restored.module_id(), backup.module_id());
     assert_eq!(restored.storage_scope_id(), backup.storage_scope_id());
-    assert_eq!(restored.revision(), 7);
+    assert_eq!(restored.revision(), projection.revision());
+    assert_eq!(
+        restored.durable_commit_seq(),
+        projection.durable_commit_seq()
+    );
 }
-
 #[test]
 fn module_backup_rejects_cross_module_restore_and_validates_revision_and_digest() {
-    let projection = module_state_projection(module_id(), scope_id(), 7, vec![9]);
+    let (mut connection, authority, projection) = storage_projection();
+    let mut store = SqliteCoreStore::new(&mut connection).unwrap();
+    let wrong_module = ModuleId::from_string("other-module".to_owned()).unwrap();
+    assert_eq!(
+        store.admit_module(&authority, &wrong_module),
+        Err(dolly_storage::StorageError::IdempotencyConflict)
+    );
+    assert_eq!(
+        store.issue_module_state_projection(&authority, &wrong_module),
+        Err(dolly_storage::StorageError::IdempotencyConflict)
+    );
+    drop(store);
     let backup = ModuleBackup::capture(&projection).unwrap();
-    let wrong_module = ModuleId::from_string("memory-other".to_owned()).unwrap();
-    let request =
-        ModuleRestoreRequest::new(wrong_module, scope_id(), 7, backup.backup_digest().clone())
-            .unwrap();
+    let request = ModuleRestoreRequest::new(
+        wrong_module,
+        projection.storage_scope_id().clone(),
+        projection.revision(),
+        backup.backup_digest().clone(),
+    )
+    .unwrap();
     assert_eq!(backup.restore(&request), Err(BackupError::IdentityMismatch));
 
     let wrong_scope =
         ModuleStorageScopeId::from_uuid_v7("0198ab31-6c44-7e8a-b2bb-000000000155".parse().unwrap());
-    let request =
-        ModuleRestoreRequest::new(module_id(), wrong_scope, 7, backup.backup_digest().clone())
-            .unwrap();
+    let request = ModuleRestoreRequest::new(
+        storage_module_id(),
+        wrong_scope,
+        projection.revision(),
+        backup.backup_digest().clone(),
+    )
+    .unwrap();
     assert_eq!(backup.restore(&request), Err(BackupError::IdentityMismatch));
 
-    let request =
-        ModuleRestoreRequest::new(module_id(), scope_id(), 8, backup.backup_digest().clone())
-            .unwrap();
+    let request = ModuleRestoreRequest::new(
+        storage_module_id(),
+        projection.storage_scope_id().clone(),
+        projection.revision() + 1,
+        backup.backup_digest().clone(),
+    )
+    .unwrap();
     assert!(matches!(
         backup.restore(&request),
         Err(BackupError::RevisionMismatch { .. })
     ));
 
     let request = ModuleRestoreRequest::new(
-        module_id(),
-        scope_id(),
-        7,
+        storage_module_id(),
+        projection.storage_scope_id().clone(),
+        projection.revision(),
         Sha256Digest::compute(b"different"),
     )
     .unwrap();
@@ -288,15 +419,67 @@ fn module_backup_rejects_cross_module_restore_and_validates_revision_and_digest(
 }
 
 #[test]
-fn module_backup_public_api_has_no_untyped_secret_capture_path() {
-    let projection = module_state_projection(module_id(), scope_id(), 1, vec![42]);
-    let backup = ModuleBackup::capture(&projection).unwrap();
-    let bytes = backup.canonical_bytes().unwrap();
-    let text = std::str::from_utf8(bytes.as_bytes()).unwrap();
-    assert!(!text.contains("g3-secret"));
-    assert!(!text.contains("\"note\""));
-    let untyped_state = json!({"values": [42], "note": "g3-secret"});
+fn module_projection_rejects_stale_host_owner() {
+    let (mut connection, authority) = storage_setup();
+    let module = storage_module_id();
+    let mut store = SqliteCoreStore::new(&mut connection).unwrap();
+    let original_scope = store.admit_module(&authority, &module).unwrap();
+    let original_projection = store
+        .issue_module_state_projection(&authority, &module)
+        .unwrap();
 
+    let config = json!({
+        "execution_timeout_ms": 120000,
+        "lease_grace_ms": 30000,
+        "fencing_grace_ms": 5000,
+        "extension_connection_id": "g3-backup-extension-rotated",
+        "worker_epoch": "0198ab31-6c44-7e8a-b2bb-000000000110",
+        "worker_epoch_fence": 17
+    });
+    let transition = store
+        .transact(
+            &CoreCommand::InstallConfig(InstallConfigCommand {
+                command_id: "g3-backup-config-rotation".into(),
+                revision: 2,
+                digest: digest(&config),
+                effective_config: config,
+            }),
+            &storage_input(),
+        )
+        .unwrap();
+    assert_eq!(transition.outcome, TransitionOutcome::Committed);
+    let rotated = store.rotate_host_connection(&authority).unwrap();
+    assert_ne!(rotated, authority);
+
+    assert_eq!(
+        store.issue_module_state_projection(&authority, &module),
+        Err(dolly_storage::StorageError::IdempotencyConflict)
+    );
+    assert_eq!(
+        store.issue_module_state_projection(&rotated, &module),
+        Err(dolly_storage::StorageError::IdempotencyConflict)
+    );
+
+    assert_eq!(
+        store.admit_module(&rotated, &module).unwrap(),
+        original_scope
+    );
+    let current = store
+        .issue_module_state_projection(&rotated, &module)
+        .unwrap();
+    assert_eq!(current.storage_scope_id(), &original_scope);
+    assert!(current.revision() > original_projection.revision());
+}
+
+#[test]
+fn module_backup_public_api_rejects_untyped_secret_and_truncation() {
+    let (_connection, _authority, projection) = storage_projection();
+    let backup = ModuleBackup::capture(&projection).unwrap();
+
+    let untyped_state = json!({
+        "durable_commit_seq": 1,
+        "note": "g3-secret"
+    });
     let untyped_document = json!({
         "schema": "dolly.module-backup/v1",
         "module_id": "memory-main",

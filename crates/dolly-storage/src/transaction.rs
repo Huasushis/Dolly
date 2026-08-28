@@ -1371,6 +1371,7 @@ impl<'connection> SqliteCoreStore<'connection> {
     /// Create a store over a verified writable Runtime connection.
     pub fn new(connection: &'connection mut Connection) -> StorageResult<Self> {
         initialize_core_engine_schema(connection)?;
+        crate::module_state::initialize_module_storage_schema(connection)?;
         Ok(Self { connection })
     }
 
@@ -1543,6 +1544,90 @@ impl<'connection> SqliteCoreStore<'connection> {
     /// connection identity, WorkerEpoch, or fence.
     pub fn authenticated_host_connection(&self) -> StorageResult<HostConnectionAuthority> {
         host_connection_authority_from_snapshot(&self.snapshot()?)
+    }
+
+    /// Admit one currently configured Module to its durable storage owner.
+    ///
+    /// The storage scope is generated here and persisted; callers cannot
+    /// choose a scope, revision, or state payload. Re-admission after a Host
+    /// rotation refreshes only the current Host incarnation binding.
+    pub fn admit_module(
+        &mut self,
+        authority: &HostConnectionAuthority,
+        module_id: &dolly_core_domain::ModuleId,
+    ) -> StorageResult<dolly_core_domain::ModuleStorageScopeId> {
+        let transaction =
+            Transaction::new_unchecked(self.connection, TransactionBehavior::Immediate)
+                .map_err(map_sqlite_error)?;
+        let (snapshot, _, _) = load_snapshot(&transaction)?;
+        if host_connection_authority_from_snapshot(&snapshot)? != *authority {
+            return Err(StorageError::IdempotencyConflict);
+        }
+        let Some(admitted_module_id) =
+            crate::module_state::admitted_module_id(&snapshot, module_id)
+        else {
+            return Err(StorageError::IdempotencyConflict);
+        };
+        if let Some((storage_scope_id, _)) =
+            crate::module_state::load_owner(&transaction, &admitted_module_id)?
+        {
+            crate::module_state::update_owner_incarnation(
+                &transaction,
+                &admitted_module_id,
+                authority.incarnation_revision(),
+            )?;
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(storage_scope_id);
+        }
+        let storage_scope_id = crate::module_state::mint_storage_scope_id()?;
+        crate::module_state::insert_owner(
+            &transaction,
+            &admitted_module_id,
+            &storage_scope_id,
+            authority.incarnation_revision(),
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(storage_scope_id)
+    }
+
+    /// Issue a sealed projection from the current durable state of one
+    /// previously admitted Module.
+    ///
+    /// The module identifier is only a lookup key. Scope, revision, and safe
+    /// state come from the verified owner row and Core snapshot.
+    pub fn issue_module_state_projection(
+        &mut self,
+        authority: &HostConnectionAuthority,
+        module_id: &dolly_core_domain::ModuleId,
+    ) -> StorageResult<crate::module_state::ModuleStateProjection> {
+        let transaction =
+            Transaction::new_unchecked(self.connection, TransactionBehavior::Immediate)
+                .map_err(map_sqlite_error)?;
+        let (snapshot, state_revision, _) = load_snapshot(&transaction)?;
+        if host_connection_authority_from_snapshot(&snapshot)? != *authority {
+            return Err(StorageError::IdempotencyConflict);
+        }
+        let Some(admitted_module_id) =
+            crate::module_state::admitted_module_id(&snapshot, module_id)
+        else {
+            return Err(StorageError::IdempotencyConflict);
+        };
+        let Some((storage_scope_id, owner_incarnation_revision)) =
+            crate::module_state::load_owner(&transaction, &admitted_module_id)?
+        else {
+            return Err(StorageError::IdempotencyConflict);
+        };
+        if owner_incarnation_revision != authority.incarnation_revision() {
+            return Err(StorageError::IdempotencyConflict);
+        }
+        let projection = crate::module_state::module_projection(
+            &snapshot,
+            &admitted_module_id,
+            storage_scope_id,
+            state_revision,
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(projection)
     }
 
     /// Install or replace the current Host-owned capability grant.

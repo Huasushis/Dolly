@@ -1,8 +1,9 @@
-use crate::security::{UnsafeData, validate_closed_data};
+use crate::security::{validate_closed_data, UnsafeData};
 use dolly_canonical_json::{
-    CanonicalBytes, ParseLimits, Sha256Digest, canonicalize, deserialize_core_json,
+    canonicalize, deserialize_core_json, CanonicalBytes, ParseLimits, Sha256Digest,
 };
 use dolly_core_domain::{ModuleId, ModuleStorageScopeId};
+use dolly_storage::ModuleStateProjection;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 const MODULE_BACKUP_SCHEMA: &str = "dolly.module-backup/v1";
@@ -57,94 +58,16 @@ impl ModuleRestoreRequest {
         &self.backup_digest
     }
 }
-/// Typed, closed data held by one Module's durable state projection.
-///
-/// The projection contains only numeric values. It cannot represent arbitrary
-/// JSON objects, caller-defined schemas, raw bytes, callbacks, authority
-/// material, or another Module's state.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ModuleState {
-    values: Vec<u64>,
-}
-
-impl ModuleState {
-    pub fn new(values: Vec<u64>) -> Self {
-        Self { values }
-    }
-
-    pub fn values(&self) -> &[u64] {
-        &self.values
-    }
-}
-
-/// A Host-admitted identity, revision, and typed state for exactly one Module.
-///
-/// The identity and revision are stored inside this projection and are the
-/// only source used by [`ModuleBackup::capture`]. Callers cannot relabel a
-/// projection at backup time or add state from another Module.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ModuleStateProjection {
-    module_id: ModuleId,
-    storage_scope_id: ModuleStorageScopeId,
-    revision: u64,
-    state: ModuleState,
-}
-
-impl ModuleStateProjection {
-    /// Build the projection after Host admission of one Module's state.
-    ///
-    /// The identity, storage scope, and revision must be the exact values from
-    /// that admitted state; backup capture derives all three from this value.
-    pub fn new(
-        module_id: ModuleId,
-        storage_scope_id: ModuleStorageScopeId,
-        revision: u64,
-        state: ModuleState,
-    ) -> Result<Self, BackupError> {
-        validate_revision(revision)?;
-        Ok(Self {
-            module_id,
-            storage_scope_id,
-            revision,
-            state,
-        })
-    }
-
-    pub fn module_id(&self) -> &ModuleId {
-        &self.module_id
-    }
-
-    pub fn storage_scope_id(&self) -> &ModuleStorageScopeId {
-        &self.storage_scope_id
-    }
-
-    pub const fn revision(&self) -> u64 {
-        self.revision
-    }
-
-    pub fn state(&self) -> &ModuleState {
-        &self.state
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ModuleStateDocument {
-    values: Vec<u64>,
+    durable_commit_seq: u64,
 }
 
-impl From<&ModuleState> for ModuleStateDocument {
-    fn from(state: &ModuleState) -> Self {
+impl From<&ModuleStateProjection> for ModuleStateDocument {
+    fn from(projection: &ModuleStateProjection) -> Self {
         Self {
-            values: state.values.clone(),
-        }
-    }
-}
-
-impl From<ModuleStateDocument> for ModuleState {
-    fn from(document: ModuleStateDocument) -> Self {
-        Self {
-            values: document.values,
+            durable_commit_seq: projection.durable_commit_seq(),
         }
     }
 }
@@ -177,7 +100,7 @@ pub struct RestoredModuleState {
     module_id: ModuleId,
     storage_scope_id: ModuleStorageScopeId,
     revision: u64,
-    state: ModuleState,
+    state: ModuleStateDocument,
     state_bytes: CanonicalBytes,
     state_digest: Sha256Digest,
     backup_digest: Sha256Digest,
@@ -196,8 +119,8 @@ impl RestoredModuleState {
         self.revision
     }
 
-    pub fn state(&self) -> &ModuleState {
-        &self.state
+    pub const fn durable_commit_seq(&self) -> u64 {
+        self.state.durable_commit_seq
     }
 
     pub fn state_bytes(&self) -> &[u8] {
@@ -222,19 +145,19 @@ impl RestoredModuleState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModuleBackup {
     document: ModuleBackupDocument,
-    state: ModuleState,
+    state: ModuleStateDocument,
     canonical_state: CanonicalBytes,
 }
 
 impl ModuleBackup {
-    /// Capture the exact identity, revision, and typed state in one Host
-    /// projection. No caller-supplied identity or state value is accepted.
+    /// Capture only a projection issued by verified Host storage.
     pub fn capture(projection: &ModuleStateProjection) -> Result<Self, BackupError> {
+        let state = ModuleStateDocument::from(projection);
         Self::from_parts(
-            projection.module_id.clone(),
-            projection.storage_scope_id.clone(),
-            projection.revision,
-            &projection.state,
+            projection.module_id().clone(),
+            projection.storage_scope_id().clone(),
+            projection.revision(),
+            state,
         )
     }
 
@@ -242,18 +165,17 @@ impl ModuleBackup {
         module_id: ModuleId,
         storage_scope_id: ModuleStorageScopeId,
         revision: u64,
-        state: &ModuleState,
+        state: ModuleStateDocument,
     ) -> Result<Self, BackupError> {
         validate_revision(revision)?;
-        let state_document = ModuleStateDocument::from(state);
-        let canonical_state = canonical_state(&state_document)?;
+        let canonical_state = canonical_state(&state)?;
         let state_digest = Sha256Digest::compute(canonical_state.as_bytes());
         let unsigned = ModuleBackupUnsignedDocument {
             schema: MODULE_BACKUP_SCHEMA.to_owned(),
             module_id,
             storage_scope_id,
             revision,
-            state: state_document,
+            state: state.clone(),
             state_digest,
         };
         let backup_digest = digest_unsigned(&unsigned)?;
@@ -287,8 +209,8 @@ impl ModuleBackup {
         self.document.revision
     }
 
-    pub fn state(&self) -> &ModuleState {
-        &self.state
+    pub const fn durable_commit_seq(&self) -> u64 {
+        self.state.durable_commit_seq
     }
 
     pub fn state_bytes(&self) -> &[u8] {
@@ -379,7 +301,7 @@ impl ModuleBackup {
         }
         validate_document(&document)?;
         let canonical_state = canonical_state(&document.state)?;
-        let state = ModuleState::from(document.state.clone());
+        let state = document.state.clone();
         Ok(Self {
             document,
             state,
