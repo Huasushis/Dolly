@@ -106,7 +106,6 @@ fn install_config(store: &mut SqliteCoreStore<'_>) {
         "lease_grace_ms": 30000,
         "fencing_grace_ms": 5000,
         "extension_connection_id": "g1-extension-connection",
-        "request_id": "rpc-g1-activation-001",
         "worker_epoch": "0198ab31-6c44-7e8a-b2bb-000000000110",
         "worker_epoch_fence": 17
     });
@@ -156,7 +155,6 @@ fn manifest(
             "lease_grace_ms": 30000,
             "fencing_grace_ms": 5000,
             "extension_connection_id": "g1-extension-connection",
-            "request_id": "rpc-g1-activation-001",
             "worker_epoch": "0198ab31-6c44-7e8a-b2bb-000000000110",
             "worker_epoch_fence": 17
         },
@@ -219,8 +217,9 @@ fn issue_command(
     )
 }
 
-fn expected_module_activate(case: &Value, manifest: Value) -> Value {
+fn expected_module_activate(case: &Value, manifest: Value, request_id: &str) -> Value {
     let mut expected = case["expected_request"].clone();
+    expected["id"] = json!(request_id);
     expected["params"]["manifest"] = manifest;
     expected
 }
@@ -271,13 +270,14 @@ fn g1_exec_001_valid_durable_activation_emits_exact_module_activate_premise_befo
         "g1-exec-lease-id-001",
         &token_digest,
     );
+    let reservation = engine
+        .allocate_request(&issue, &graph_input())
+        .expect("allocated Host request reservation");
     let premise = engine
-        .prepare_execution(&issue, &graph_input())
+        .prepare_execution(&issue, &reservation, &graph_input())
         .expect("accepted lease transaction");
-    assert_eq!(
-        premise.fence().request_id(),
-        case["rpc_id"].as_str().unwrap()
-    );
+    assert!(!premise.fence().request_id().is_empty());
+    assert!(premise.fence().request_id().len() <= 128);
     let leased = engine.snapshot().expect("durable lease snapshot");
     assert_eq!(
         leased.activations[activation_id].state,
@@ -306,7 +306,7 @@ fn g1_exec_001_valid_durable_activation_emits_exact_module_activate_premise_befo
         "started"
     );
 
-    let expected = expected_module_activate(&case, manifest);
+    let expected = expected_module_activate(&case, manifest, premise.fence().request_id());
     let observed: Value =
         serde_json::from_slice(dispatched.frame_bytes()).expect("canonical frame JSON");
     assert_eq!(observed, expected);
@@ -318,11 +318,15 @@ fn g1_exec_001_valid_durable_activation_emits_exact_module_activate_premise_befo
     );
     assert_eq!(
         started.state.leases["g1-exec-lease-id-001"]["request_id"],
-        case["rpc_id"]
+        premise.fence().request_id()
     );
     assert_eq!(
         started.state.leases["g1-exec-lease-id-001"]["extension_connection_id"],
         "g1-extension-connection"
+    );
+    assert_eq!(
+        started.state.leases["g1-exec-lease-id-001"]["reservation_id"],
+        premise.fence().reservation_id()
     );
     assert_eq!(dispatched.frame_digest(), canonical_digest(&expected));
     assert_eq!(
@@ -358,7 +362,7 @@ fn g1_exec_001_valid_durable_activation_emits_exact_module_activate_premise_befo
     );
     assert_eq!(
         journal_event.details.as_ref().unwrap()["request_id"],
-        case["rpc_id"]
+        premise.fence().request_id()
     );
     assert_eq!(
         journal_event.details.as_ref().unwrap()["extension_connection_id"],

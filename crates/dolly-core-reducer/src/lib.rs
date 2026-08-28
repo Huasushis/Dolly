@@ -1,4 +1,4 @@
-//! Deterministic pure Core reference reducer for the closed 21-command model.
+//! Deterministic pure Core reference reducer for the closed 22-command model.
 //! All authority, clock, crash, and storage observations arrive in the explicit
 //! input tape; the reducer performs no input/output.
 
@@ -11,7 +11,7 @@ mod reducer;
 mod types;
 
 pub use command::{
-    ApplyResultCommand, BeginFenceCommand, BuildManifestCommand, CancelActivationCommand,
+    ApplyResultCommand, AllocateRequestCommand, BeginFenceCommand, BuildManifestCommand,
     CompleteQuarantineFenceCommand, CoreCommand, DeadLetterRangeCommand, DispatchLeaseCommand,
     DispatchState, FenceCompleteCommand, GrantStorageWriterCommand, IngressCommand,
     InstallConfigCommand, InstallGraphCommand, IssueLeaseCommand, LossyEvictCommand,

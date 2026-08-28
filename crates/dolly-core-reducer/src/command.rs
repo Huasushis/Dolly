@@ -35,6 +35,7 @@ pub enum CoreCommand {
     ReleaseStorageWriter(ReleaseStorageWriterCommand),
     BuildManifest(BuildManifestCommand),
     IssueLease(IssueLeaseCommand),
+    AllocateRequest(AllocateRequestCommand),
     DispatchLease(DispatchLeaseCommand),
     ReceiveResult(ReceiveResultCommand),
     BeginFence(BeginFenceCommand),
@@ -60,6 +61,7 @@ impl CoreCommand {
             Self::ReleaseStorageWriter(c) => &c.command_id,
             Self::BuildManifest(c) => &c.command_id,
             Self::IssueLease(c) => &c.command_id,
+            Self::AllocateRequest(c) => &c.command_id,
             Self::DispatchLease(c) => &c.command_id,
             Self::ReceiveResult(c) => &c.command_id,
             Self::BeginFence(c) => &c.command_id,
@@ -132,10 +134,21 @@ pub struct BuildManifestCommand {
     pub expected_descriptor_revision: Option<i64>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllocateRequestCommand {
+    pub command_id: String,
+    pub activation_id: String,
+    pub lease_id: String,
+    pub extension_connection_id: String,
+    pub worker_epoch_id: String,
+    pub worker_epoch: i64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssueLeaseCommand {
     pub command_id: String,
     pub activation_id: String,
     pub lease_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reservation_id: Option<String>,
     pub token_digest: String,
     pub extension_connection_id: String,
     pub worker_epoch: i64,
@@ -152,6 +165,8 @@ pub struct DispatchLeaseCommand {
     pub activation_id: String,
     pub lease_id: String,
     pub dispatch_state: DispatchState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reservation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

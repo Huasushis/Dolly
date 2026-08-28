@@ -11,8 +11,9 @@ mod validation;
 use dolly_canonical_json::{canonicalize, Sha256Digest};
 use dolly_core_domain::{LeaseToken, WorkerEpoch};
 use dolly_core_reducer::{
-    ActivationState, BuildManifestCommand, CoreCommand, DispatchLeaseCommand, DispatchState,
-    EnvironmentInput, IssueLeaseCommand, Transition, TransitionOutcome,
+    ActivationState, AllocateRequestCommand, BuildManifestCommand, CoreCommand,
+    DispatchLeaseCommand, DispatchState, EnvironmentInput, IssueLeaseCommand, Transition,
+    TransitionOutcome,
 };
 use dolly_storage::{SqliteCoreStore, StorageError};
 use rusqlite::Connection;
@@ -122,15 +123,28 @@ impl LeaseRequest {
         }
     }
 }
-
-/// Typed Host connection identity retained in the verified Core configuration.
+/// An opaque reservation allocated by the authenticated Host connection.
 ///
-/// This state is the source for lease and frame binding; it is never accepted
-/// as a dispatch argument.
+/// The request identity and its connection binding are private. Only the
+/// Runtime can create a reservation, and Core retains its state durably.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestReservation {
+    reservation_id: String,
+    request_id: String,
+    activation_id: String,
+    lease_id: String,
+    extension_connection_id: String,
+    worker_epoch: WorkerEpoch,
+    worker_epoch_fence: i64,
+}
+
+/// Typed Host connection identity retained in verified durable Core state.
+///
+/// This state is the source for lease and request reservation binding; it is
+/// never accepted as a dispatch argument.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HostConnectionState {
     extension_connection_id: String,
-    request_id: String,
     worker_epoch: WorkerEpoch,
     worker_epoch_fence: i64,
 }
@@ -154,6 +168,38 @@ impl<'connection> RuntimeTransactionEngine<'connection> {
     /// Read the verified durable Core snapshot.
     pub fn snapshot(&self) -> RuntimeResult<dolly_core_reducer::CoreSnapshot> {
         Ok(self.store.snapshot()?)
+    }
+    /// Allocate one request identity from the current authenticated Host
+    /// connection and durably bind it to the requested Activation and lease.
+    pub fn allocate_request(
+        &mut self,
+        request: &LeaseRequest,
+        input: &EnvironmentInput,
+    ) -> RuntimeResult<RequestReservation> {
+        let snapshot = self.store.snapshot()?;
+        let connection = host_connection_state(&snapshot)?;
+        let command = CoreCommand::AllocateRequest(AllocateRequestCommand {
+            command_id: format!(
+                "runtime-host-request-allocation-{}",
+                snapshot.next_commit_seq
+            ),
+            activation_id: request.activation_id.clone(),
+            lease_id: request.lease_id.clone(),
+            extension_connection_id: connection.extension_connection_id,
+            worker_epoch_id: connection.worker_epoch.to_string(),
+            worker_epoch: connection.worker_epoch_fence,
+        });
+        let transition = self.store.transact(&command, input)?;
+        require_committed(&transition)?;
+        let reservation_id = transition
+            .reply
+            .as_ref()
+            .and_then(|reply| reply.get("reservation_id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| RuntimeError::PremiseUnavailable {
+                detail: "request allocation returned no reservation".into(),
+            })?;
+        request_reservation_from_state(&transition.state, reservation_id)
     }
 
     /// Accept one immutable Activation Manifest through the WP-004 transaction.
@@ -216,19 +262,22 @@ impl<'connection> RuntimeTransactionEngine<'connection> {
     pub fn prepare_execution(
         &mut self,
         request: &LeaseRequest,
+        reservation: &RequestReservation,
         input: &EnvironmentInput,
     ) -> RuntimeResult<ExecutionPremise> {
         let snapshot = self.store.snapshot()?;
         let connection = host_connection_state(&snapshot)?;
+        validate_request_reservation(&snapshot, &connection, request, reservation)?;
         let command = IssueLeaseCommand {
             command_id: request.command_id.clone(),
             activation_id: request.activation_id.clone(),
             lease_id: request.lease_id.clone(),
             token_digest: request.token_digest.clone(),
-            extension_connection_id: connection.extension_connection_id.clone(),
-            request_id: Some(connection.request_id.clone()),
-            worker_epoch: connection.worker_epoch_fence,
-            worker_epoch_id: Some(connection.worker_epoch.to_string()),
+            extension_connection_id: reservation.extension_connection_id.clone(),
+            reservation_id: Some(reservation.reservation_id.clone()),
+            request_id: Some(reservation.request_id.clone()),
+            worker_epoch: reservation.worker_epoch_fence,
+            worker_epoch_id: Some(reservation.worker_epoch.to_string()),
             extension_generation: request.extension_generation,
         };
         validate_lease_request(&command)?;
@@ -347,6 +396,7 @@ impl<'connection> RuntimeTransactionEngine<'connection> {
                 activation_id: premise.identity().activation_id().into(),
                 lease_id: premise.fence().lease_id().into(),
                 dispatch_state: DispatchState::Started,
+                reservation_id: Some(premise.fence().reservation_id().into()),
                 request_id: Some(premise.fence().request_id().into()),
                 extension_connection_id: Some(premise.fence().extension_connection_id().into()),
                 frame_digest: Some(frame_digest.clone()),
@@ -364,6 +414,9 @@ impl<'connection> RuntimeTransactionEngine<'connection> {
         let committed_digest = committed_lease
             .get("frame_digest")
             .and_then(Value::as_str);
+        let committed_reservation_id = committed_lease
+            .get("reservation_id")
+            .and_then(Value::as_str);
         let committed_request_id = committed_lease
             .get("request_id")
             .and_then(Value::as_str);
@@ -379,6 +432,7 @@ impl<'connection> RuntimeTransactionEngine<'connection> {
             || committed_digest != Some(frame_digest.as_str())
             || committed_request_id != Some(premise.fence().request_id())
             || committed_connection_id != Some(premise.fence().extension_connection_id())
+            || committed_reservation_id != Some(premise.fence().reservation_id())
         {
             return Err(RuntimeError::PremiseUnavailable {
                 detail: "committed dispatch does not retain the exact request binding".into(),
@@ -407,14 +461,6 @@ fn host_connection_state(
             detail: "verified Host connection id is absent".into(),
         })?
         .to_owned();
-    let request_id = config
-        .get("request_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| RuntimeError::DispatchInvalid {
-            detail: "verified Host request identity is absent".into(),
-        })?;
-    validate_request_id(request_id)?;
-    let request_id = request_id.to_owned();
     let worker_epoch = config
         .get("worker_epoch")
         .and_then(Value::as_str)
@@ -434,7 +480,6 @@ fn host_connection_state(
         })?;
     Ok(HostConnectionState {
         extension_connection_id,
-        request_id,
         worker_epoch,
         worker_epoch_fence,
     })
@@ -444,6 +489,102 @@ fn validate_request_id(value: &str) -> RuntimeResult<()> {
         return Err(RuntimeError::DispatchInvalid {
             detail: "request identity must be non-empty valid UTF-8 and at most 128 bytes"
                 .into(),
+        });
+    }
+    Ok(())
+}
+fn request_reservation_from_state(
+    snapshot: &dolly_core_reducer::CoreSnapshot,
+    reservation_id: &str,
+) -> RuntimeResult<RequestReservation> {
+    let record = snapshot
+        .host_request_reservations
+        .get(reservation_id)
+        .ok_or_else(|| RuntimeError::PremiseUnavailable {
+            detail: "request reservation is absent from durable Host state".into(),
+        })?;
+    if record.get("state").and_then(Value::as_str) != Some("bound") {
+        return Err(RuntimeError::PremiseUnavailable {
+            detail: "request reservation is not outstanding".into(),
+        });
+    }
+    let request_id = record
+        .get("request_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RuntimeError::PremiseUnavailable {
+            detail: "request reservation has no request identity".into(),
+        })?;
+    validate_request_id(request_id)?;
+    let activation_id = record
+        .get("activation_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RuntimeError::PremiseUnavailable {
+            detail: "request reservation has no Activation binding".into(),
+        })?;
+    let lease_id = record
+        .get("lease_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RuntimeError::PremiseUnavailable {
+            detail: "request reservation has no lease binding".into(),
+        })?;
+    let extension_connection_id = record
+        .get("extension_connection_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RuntimeError::PremiseUnavailable {
+            detail: "request reservation has no connection binding".into(),
+        })?;
+    let worker_epoch_id = record
+        .get("worker_epoch_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RuntimeError::PremiseUnavailable {
+            detail: "request reservation has no typed WorkerEpoch".into(),
+        })?;
+    let worker_epoch = worker_epoch_id
+        .parse::<WorkerEpoch>()
+        .map_err(|error| RuntimeError::PremiseUnavailable {
+            detail: format!("request reservation WorkerEpoch is invalid: {error}"),
+        })?;
+    let worker_epoch_fence = record
+        .get("worker_epoch")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| RuntimeError::PremiseUnavailable {
+            detail: "request reservation WorkerEpoch fence is invalid".into(),
+        })?;
+    Ok(RequestReservation {
+        reservation_id: reservation_id.into(),
+        request_id: request_id.into(),
+        activation_id: activation_id.into(),
+        lease_id: lease_id.into(),
+        extension_connection_id: extension_connection_id.into(),
+        worker_epoch,
+        worker_epoch_fence,
+    })
+}
+fn validate_request_reservation(
+    snapshot: &dolly_core_reducer::CoreSnapshot,
+    connection: &HostConnectionState,
+    request: &LeaseRequest,
+    reservation: &RequestReservation,
+) -> RuntimeResult<()> {
+    if reservation.activation_id != request.activation_id || reservation.lease_id != request.lease_id
+    {
+        return Err(RuntimeError::ReplayConflict {
+            detail: "request reservation is bound to a different lease".into(),
+        });
+    }
+    if reservation.extension_connection_id != connection.extension_connection_id
+        || reservation.worker_epoch != connection.worker_epoch
+        || reservation.worker_epoch_fence != connection.worker_epoch_fence
+    {
+        return Err(RuntimeError::PremiseUnavailable {
+            detail: "current Host connection no longer owns the request reservation".into(),
+        });
+    }
+    let durable = request_reservation_from_state(snapshot, &reservation.reservation_id)?;
+    if durable != *reservation {
+        return Err(RuntimeError::ReplayConflict {
+            detail: "request reservation differs from durable Host state".into(),
         });
     }
     Ok(())
@@ -491,6 +632,18 @@ fn retained_manifest_for_dispatch(
         .ok_or_else(|| RuntimeError::PremiseUnavailable {
             detail: "dispatch lease is absent from durable state".into(),
         })?;
+    let reservation =
+        request_reservation_from_state(snapshot, premise.fence().reservation_id())?;
+    if reservation.activation_id != premise.identity().activation_id()
+        || reservation.lease_id != premise.fence().lease_id()
+        || reservation.request_id != premise.fence().request_id()
+        || reservation.extension_connection_id
+            != premise.fence().extension_connection_id()
+    {
+        return Err(RuntimeError::PremiseUnavailable {
+            detail: "dispatch reservation binding differs from the premise".into(),
+        });
+    }
     let token_digest = Sha256Digest::compute(lease_token.expose_bytes()).to_canonical_string();
     if lease.get("activation_id").and_then(Value::as_str)
         != Some(premise.identity().activation_id())
@@ -499,6 +652,8 @@ fn retained_manifest_for_dispatch(
             != Some(premise.fence().worker_epoch_fence())
         || lease.get("worker_epoch_id").and_then(Value::as_str)
             != Some(premise.fence().worker_epoch().to_string().as_str())
+        || lease.get("reservation_id").and_then(Value::as_str)
+            != Some(premise.fence().reservation_id())
         || lease.get("request_id").and_then(Value::as_str) != Some(premise.fence().request_id())
         || lease.get("extension_generation").and_then(Value::as_i64)
             != Some(premise.fence().extension_generation())
@@ -568,6 +723,13 @@ fn validate_lease_request(command: &IssueLeaseCommand) -> RuntimeResult<()> {
             detail: "worker_epoch fence must be positive".into(),
         });
     }
+    let _reservation_id = command
+        .reservation_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| RuntimeError::DispatchInvalid {
+            detail: "Host request reservation is required for a Runtime lease".into(),
+        })?;
     let request_id = command
         .request_id
         .as_deref()
@@ -647,6 +809,8 @@ fn validate_existing_lease_or_state(
                 == command.worker_epoch_id.as_deref()
             && existing.get("request_id").and_then(Value::as_str)
                 == command.request_id.as_deref()
+            && existing.get("reservation_id").and_then(Value::as_str)
+                == command.reservation_id.as_deref()
             && existing.get("requested_extension_generation")
                 == Some(&json!(command.extension_generation));
         if exact {
@@ -699,6 +863,13 @@ fn build_premise(
             detail: "committed lease does not bind the retained Manifest and prepared state".into(),
         });
     }
+    let reservation_id = lease
+        .get("reservation_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RuntimeError::PremiseUnavailable {
+            detail: "committed lease has no request reservation".into(),
+        })?
+        .to_owned();
     let request_id = lease
         .get("request_id")
         .and_then(Value::as_str)
@@ -740,6 +911,7 @@ fn build_premise(
         || command.worker_epoch_id.as_deref() != Some(worker_epoch.to_string().as_str())
         || extension_generation != command.extension_generation.unwrap_or_default()
         || command.request_id.as_deref() != Some(request_id.as_str())
+        || command.reservation_id.as_deref() != Some(reservation_id.as_str())
     {
         return Err(RuntimeError::GenerationInvalid {
             detail: "committed lease fence disagrees with the request".into(),
@@ -758,6 +930,7 @@ fn build_premise(
         ),
         ExecutionFence::new(
             command.lease_id.clone(),
+            reservation_id,
             request_id,
             worker_epoch,
             worker_epoch_fence,

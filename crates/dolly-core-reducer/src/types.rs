@@ -121,6 +121,8 @@ pub struct CoreSnapshot {
     pub manifests: BTreeMap<String, Value>,
     pub activations: BTreeMap<String, ActivationRecord>,
     pub leases: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub host_request_reservations: BTreeMap<String, Value>,
     pub quarantines: BTreeMap<String, Value>,
     pub generations: Vec<Value>,
     pub current_generation: Option<i64>,
@@ -246,6 +248,7 @@ pub fn empty_core_snapshot() -> CoreSnapshot {
         manifests: BTreeMap::new(),
         activations: BTreeMap::new(),
         leases: BTreeMap::new(),
+        host_request_reservations: BTreeMap::new(),
         quarantines: BTreeMap::new(),
         generations: Vec::new(),
         current_generation: None,

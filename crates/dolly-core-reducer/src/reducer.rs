@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use dolly_canonical_json::canonicalize;
+use dolly_core_domain::WorkerEpoch;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -172,13 +173,80 @@ fn object_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 fn valid_request_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && !value.contains('\0')
 }
-/// A request identity remains reserved from lease preparation through transport
-/// start. Existing fence completion changes the dispatch state to `fenced`.
-fn request_identity_outstanding(value: &Value) -> bool {
-    matches!(
-        object_str(value, "dispatch_state"),
-        Some("prepared" | "started" | "transport_started")
-    ) && object_str(value, "request_id").is_some()
+fn valid_worker_epoch_id(value: &str) -> bool {
+    value.parse::<WorkerEpoch>().is_ok()
+}
+fn request_reservation_is_bound(value: &Value) -> bool {
+    object_str(value, "state") == Some("bound")
+}
+fn request_reservation_identity_matches(
+    value: &Value,
+    activation_id: &str,
+    lease_id: &str,
+    extension_connection_id: &str,
+    worker_epoch_id: &str,
+    worker_epoch: i64,
+) -> bool {
+    object_str(value, "activation_id") == Some(activation_id)
+        && object_str(value, "lease_id") == Some(lease_id)
+        && object_str(value, "extension_connection_id") == Some(extension_connection_id)
+        && object_str(value, "worker_epoch_id") == Some(worker_epoch_id)
+        && object_i64(value, "worker_epoch") == Some(worker_epoch)
+        && object_str(value, "request_id").is_some_and(valid_request_id)
+}
+fn request_reservation_matches(
+    value: &Value,
+    activation_id: &str,
+    lease_id: &str,
+    extension_connection_id: &str,
+    worker_epoch_id: &str,
+    worker_epoch: i64,
+) -> bool {
+    request_reservation_is_bound(value)
+        && request_reservation_identity_matches(
+            value,
+            activation_id,
+            lease_id,
+            extension_connection_id,
+            worker_epoch_id,
+            worker_epoch,
+        )
+}
+fn release_request_reservation(
+    state: &mut CoreSnapshot,
+    lease_id: &str,
+) -> Result<Option<Value>, &'static str> {
+    let Some(lease) = state.leases.get(lease_id).cloned() else {
+        return Err("REQUEST_RESERVATION_INVALID");
+    };
+    let Some(reservation_id) = object_str(&lease, "reservation_id").map(str::to_owned) else {
+        return Ok(None);
+    };
+    let Some(reservation) = state.host_request_reservations.get_mut(&reservation_id) else {
+        return Err("REQUEST_RESERVATION_INVALID");
+    };
+    if !request_reservation_is_bound(reservation)
+        || object_str(reservation, "activation_id")
+            != object_str(&lease, "activation_id")
+        || object_str(reservation, "lease_id") != Some(lease_id)
+        || object_str(reservation, "request_id") != object_str(&lease, "request_id")
+        || object_str(reservation, "extension_connection_id")
+            != object_str(&lease, "extension_connection_id")
+        || object_str(reservation, "worker_epoch_id")
+            != object_str(&lease, "worker_epoch_id")
+        || object_i64(reservation, "worker_epoch") != object_i64(&lease, "worker_epoch")
+    {
+        return Err("REQUEST_RESERVATION_INVALID");
+    }
+    reservation["state"] = json!("released");
+    Ok(Some(json!({
+        "reservation_id": reservation_id,
+        "request_id": reservation.get("request_id").cloned().unwrap_or(Value::Null),
+        "extension_connection_id": reservation
+            .get("extension_connection_id")
+            .cloned()
+            .unwrap_or(Value::Null),
+    })))
 }
 fn same_value(left: Option<&Value>, right: Option<&Value>) -> bool {
     match (left, right) {
@@ -768,6 +836,13 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
             if !verified_digest(&c.effective_config, &c.digest) {
                 return failure(state, "CONFIG_DIGEST_MISMATCH", false, None);
             }
+            if c
+                .effective_config
+                .get("request_id")
+                .is_some()
+            {
+                return failure(state, "CONFIG_REQUEST_ID_FORBIDDEN", false, None);
+            }
             if next
                 .config
                 .get("revision")
@@ -1060,31 +1135,140 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
             );
             success(next, events, None, None)
         }
+        CoreCommand::AllocateRequest(c) => {
+            if c.command_id.is_empty()
+                || c.activation_id.is_empty()
+                || c.lease_id.is_empty()
+                || c.extension_connection_id.is_empty()
+                || c.worker_epoch <= 0
+                || !valid_worker_epoch_id(&c.worker_epoch_id)
+            {
+                return failure(state, "REQUEST_ALLOCATION_INVALID", false, None);
+            }
+            if let Some((reservation_id, record)) = next
+                .host_request_reservations
+                .iter()
+                .find(|(_, record)| {
+                    object_str(record, "allocation_command_id") == Some(c.command_id.as_str())
+                })
+            {
+                if request_reservation_identity_matches(
+                    record,
+                    &c.activation_id,
+                    &c.lease_id,
+                    &c.extension_connection_id,
+                    &c.worker_epoch_id,
+                    c.worker_epoch,
+                ) {
+                    return success(
+                        state.clone(),
+                        Vec::new(),
+                        Some(json!({
+                            "reservation_id": reservation_id,
+                            "request_id": record.get("request_id").cloned().unwrap_or(Value::Null),
+                        })),
+                        None,
+                    );
+                }
+                return failure(
+                    state,
+                    "REQUEST_ALLOCATION_REPLAY_CONFLICT",
+                    false,
+                    Some(json!({"command_id": c.command_id})),
+                );
+            }
+            let Some(item) = next.activations.get(&c.activation_id) else {
+                return failure(state, "ACTIVATION_NOT_LEASABLE", false, None);
+            };
+            if item.state != ActivationState::Ready || item.manifest.is_none() {
+                return failure(state, "ACTIVATION_NOT_LEASABLE", false, None);
+            }
+            if next.leases.contains_key(&c.lease_id)
+                || next.host_request_reservations.values().any(|record| {
+                    request_reservation_is_bound(record)
+                        && object_str(record, "activation_id") == Some(c.activation_id.as_str())
+                })
+            {
+                return failure(state, "REQUEST_RESERVATION_CONFLICT", false, None);
+            }
+            let sequence = next.next_commit_seq;
+            let request_id = format!("rpc-{sequence}");
+            let reservation_id = format!("host-request-{sequence}");
+            if !valid_request_id(&request_id)
+                || next.host_request_reservations.contains_key(&reservation_id)
+                || next.host_request_reservations.values().any(|record| {
+                    request_reservation_is_bound(record)
+                        && object_str(record, "request_id") == Some(request_id.as_str())
+                        && object_str(record, "extension_connection_id")
+                            == Some(c.extension_connection_id.as_str())
+                })
+            {
+                return failure(state, "REQUEST_ALLOCATION_INVALID", false, None);
+            }
+            let record = json!({
+                "state": "bound",
+                "allocation_command_id": c.command_id,
+                "activation_id": c.activation_id,
+                "lease_id": c.lease_id,
+                "request_id": request_id,
+                "extension_connection_id": c.extension_connection_id,
+                "worker_epoch_id": c.worker_epoch_id,
+                "worker_epoch": c.worker_epoch,
+            });
+            next.host_request_reservations
+                .insert(reservation_id.clone(), record);
+            let event = append_event(
+                &mut next,
+                &c.command_id,
+                "HostRequestAllocated",
+                Some(json!({
+                    "reservation_id": reservation_id,
+                    "request_id": request_id,
+                    "extension_connection_id": c.extension_connection_id,
+                    "worker_epoch_id": c.worker_epoch_id,
+                })),
+            );
+            success(
+                next,
+                vec![event],
+                Some(json!({
+                    "reservation_id": reservation_id,
+                    "request_id": request_id,
+                })),
+                None,
+            )
+        }
         CoreCommand::IssueLease(c) => {
             let Some(item) = next.activations.get(&c.activation_id) else {
                 return failure(state, "ACTIVATION_NOT_LEASABLE", false, None);
             };
-            if let Some(request_id) = c.request_id.as_deref() {
-                if !valid_request_id(request_id) || c.extension_connection_id.is_empty() {
-                    return failure(state, "DISPATCH_REQUEST_ID_INVALID", false, None);
+            match (&c.reservation_id, &c.request_id) {
+                (None, None) => {}
+                (Some(reservation_id), Some(request_id)) => {
+                    let Some(worker_epoch_id) = c.worker_epoch_id.as_deref() else {
+                        return failure(state, "REQUEST_RESERVATION_INVALID", false, None);
+                    };
+                    if !valid_request_id(request_id)
+                        || c.extension_connection_id.is_empty()
+                        || !valid_worker_epoch_id(worker_epoch_id)
+                        || !next
+                            .host_request_reservations
+                            .get(reservation_id)
+                            .is_some_and(|record| {
+                                request_reservation_matches(
+                                    record,
+                                    &c.activation_id,
+                                    &c.lease_id,
+                                    &c.extension_connection_id,
+                                    worker_epoch_id,
+                                    c.worker_epoch,
+                                ) && object_str(record, "request_id") == Some(request_id)
+                            })
+                    {
+                        return failure(state, "REQUEST_RESERVATION_INVALID", false, None);
+                    }
                 }
-                if next.leases.iter().any(|(lease_id, lease)| {
-                    lease_id != &c.lease_id
-                        && request_identity_outstanding(lease)
-                        && object_str(lease, "request_id") == Some(request_id)
-                        && object_str(lease, "extension_connection_id")
-                            == Some(c.extension_connection_id.as_str())
-                }) {
-                    return failure(
-                        state,
-                        "DISPATCH_REQUEST_ID_CONFLICT",
-                        false,
-                        Some(json!({
-                            "request_id": request_id,
-                            "extension_connection_id": c.extension_connection_id,
-                        })),
-                    );
-                }
+                _ => return failure(state, "REQUEST_RESERVATION_INVALID", false, None),
             }
             if let Some(existing) = next.leases.get(&c.lease_id) {
                 let exact = object_str(existing, "activation_id") == Some(c.activation_id.as_str())
@@ -1094,6 +1278,10 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                     && object_i64(existing, "worker_epoch") == Some(c.worker_epoch)
                     && existing.get("worker_epoch_id").and_then(Value::as_str)
                         == c.worker_epoch_id.as_deref()
+                    && existing.get("reservation_id").and_then(Value::as_str)
+                        == c.reservation_id.as_deref()
+                    && existing.get("request_id").and_then(Value::as_str)
+                        == c.request_id.as_deref()
                     && object_i64(existing, "attempt") == Some(item.attempt)
                     && existing
                         .get("requested_extension_generation")
@@ -1176,6 +1364,9 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                 json!(c.extension_connection_id),
             );
             lease.insert("worker_epoch".into(), json!(c.worker_epoch));
+            if let Some(reservation_id) = c.reservation_id.as_deref() {
+                lease.insert("reservation_id".into(), json!(reservation_id));
+            }
             if let Some(request_id) = c.request_id.as_deref() {
                 lease.insert("request_id".into(), json!(request_id));
             }
@@ -1208,6 +1399,9 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                 }
             }
             let mut details = json!({"activation_id":c.activation_id,"lease_id":c.lease_id});
+            if let Some(reservation_id) = c.reservation_id.as_deref() {
+                details["reservation_id"] = json!(reservation_id);
+            }
             if let Some(worker_epoch_id) = c.worker_epoch_id.as_deref() {
                 details["worker_epoch_id"] = json!(worker_epoch_id);
             }
@@ -1260,40 +1454,65 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                 DispatchState::Started => "started",
                 DispatchState::TransportStarted => "transport_started",
             };
-            let request_identity = match (&c.request_id, &c.extension_connection_id) {
-                (None, None) => None,
-                (Some(request_id), Some(connection_id)) => {
-                    if !valid_request_id(request_id) || connection_id.is_empty() {
-                        return failure(state, "DISPATCH_REQUEST_ID_INVALID", false, None);
+            let request_identity =
+                match (&c.reservation_id, &c.request_id, &c.extension_connection_id) {
+                    (None, None, None) => None,
+                    (Some(reservation_id), Some(request_id), Some(connection_id)) => {
+                        let Some(worker_epoch_id) =
+                            object_str(lease, "worker_epoch_id")
+                        else {
+                            return failure(state, "REQUEST_RESERVATION_INVALID", false, None);
+                        };
+                        let valid = valid_request_id(request_id)
+                            && !connection_id.is_empty()
+                            && object_str(lease, "reservation_id")
+                                == Some(reservation_id.as_str())
+                            && object_str(lease, "request_id")
+                                == Some(request_id.as_str())
+                            && object_str(lease, "extension_connection_id")
+                                == Some(connection_id.as_str())
+                            && next
+                                .host_request_reservations
+                                .get(reservation_id)
+                                .is_some_and(|record| {
+                                    request_reservation_matches(
+                                        record,
+                                        &c.activation_id,
+                                        &c.lease_id,
+                                        connection_id,
+                                        worker_epoch_id,
+                                        object_i64(lease, "worker_epoch").unwrap_or_default(),
+                                    ) && object_str(record, "request_id") == Some(request_id)
+                                });
+                        if !valid {
+                            return failure(state, "REQUEST_RESERVATION_INVALID", false, None);
+                        }
+                        if next
+                            .host_request_reservations
+                            .iter()
+                            .any(|(candidate_id, candidate)| {
+                                candidate_id != reservation_id
+                                    && request_reservation_is_bound(candidate)
+                                    && object_str(candidate, "request_id")
+                                        == Some(request_id.as_str())
+                                    && object_str(candidate, "extension_connection_id")
+                                        == Some(connection_id.as_str())
+                            })
+                        {
+                            return failure(
+                                state,
+                                "REQUEST_RESERVATION_CONFLICT",
+                                false,
+                                Some(json!({
+                                    "request_id": request_id,
+                                    "extension_connection_id": connection_id,
+                                })),
+                            );
+                        }
+                        Some((reservation_id.as_str(), request_id.as_str(), connection_id.as_str()))
                     }
-                    if object_str(lease, "request_id") != Some(request_id.as_str())
-                        || object_str(lease, "extension_connection_id")
-                            != Some(connection_id.as_str())
-                    {
-                        return failure(state, "DISPATCH_REQUEST_ID_CONFLICT", false, None);
-                    }
-                    Some((request_id.as_str(), connection_id.as_str()))
-                }
-                _ => return failure(state, "DISPATCH_REQUEST_ID_INVALID", false, None),
-            };
-            if let Some((request_id, connection_id)) = request_identity {
-                if next.leases.iter().any(|(lease_id, candidate)| {
-                    lease_id != &c.lease_id
-                        && request_identity_outstanding(candidate)
-                        && object_str(candidate, "request_id") == Some(request_id)
-                        && object_str(candidate, "extension_connection_id") == Some(connection_id)
-                }) {
-                    return failure(
-                        state,
-                        "DISPATCH_REQUEST_ID_CONFLICT",
-                        false,
-                        Some(json!({
-                            "request_id": request_id,
-                            "extension_connection_id": connection_id,
-                        })),
-                    );
-                }
-            }
+                    _ => return failure(state, "REQUEST_RESERVATION_INVALID", false, None),
+                };
             if rank(dispatch) < rank(object_str(lease, "dispatch_state").unwrap_or("prepared")) {
                 return failure(state, "DISPATCH_EVIDENCE_REGRESSION", false, None);
             }
@@ -1321,10 +1540,9 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
             if let Some(frame_digest) = c.frame_digest.as_deref() {
                 lease.insert("frame_digest".into(), json!(frame_digest));
             }
-            if let Some(request_id) = c.request_id.as_deref() {
+            if let Some((reservation_id, request_id, connection_id)) = request_identity.as_ref() {
+                lease.insert("reservation_id".into(), json!(reservation_id));
                 lease.insert("request_id".into(), json!(request_id));
-            }
-            if let Some(connection_id) = c.extension_connection_id.as_deref() {
                 lease.insert("extension_connection_id".into(), json!(connection_id));
             }
             if c.dispatch_state != DispatchState::Prepared {
@@ -1335,10 +1553,9 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
             if let Some(frame_digest) = c.frame_digest.as_deref() {
                 details["frame_digest"] = json!(frame_digest);
             }
-            if let Some(request_id) = c.request_id.as_deref() {
+            if let Some((reservation_id, request_id, connection_id)) = request_identity.as_ref() {
+                details["reservation_id"] = json!(reservation_id);
                 details["request_id"] = json!(request_id);
-            }
-            if let Some(connection_id) = c.extension_connection_id.as_deref() {
                 details["extension_connection_id"] = json!(connection_id);
             }
             events.push(append_event(
@@ -1665,6 +1882,30 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                     false,
                     "ModuleQuarantined",
                 ))
+            }
+            let released = match release_request_reservation(&mut next, &lease_id) {
+                Ok(released) => released,
+                Err(code) => return failure(state, code, false, None),
+            };
+            if let Some(released) = released {
+                let Some(event) = events.last_mut() else {
+                    return failure(state, "REQUEST_RESERVATION_INVALID", false, None);
+                };
+                let Some(details) = event.details.as_mut().and_then(Value::as_object_mut) else {
+                    return failure(state, "REQUEST_RESERVATION_INVALID", false, None);
+                };
+                details.insert("request_reservation_released".into(), released.clone());
+                let Some(journal_event) = next.journal.last_mut() else {
+                    return failure(state, "REQUEST_RESERVATION_INVALID", false, None);
+                };
+                let Some(journal_details) = journal_event
+                    .details
+                    .as_mut()
+                    .and_then(Value::as_object_mut)
+                else {
+                    return failure(state, "REQUEST_RESERVATION_INVALID", false, None);
+                };
+                journal_details.insert("request_reservation_released".into(), released);
             }
             success(next, events, None, None)
         }

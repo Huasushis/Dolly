@@ -115,6 +115,7 @@ fn issue_lease_command(value: &Value, activation_id: &str) -> IssueLeaseCommand 
         command_id: value["command_id"].as_str().unwrap().into(),
         activation_id: activation_id.into(),
         lease_id: value["lease_id"].as_str().unwrap().into(),
+        reservation_id: None,
         token_digest: value["token_digest"].as_str().unwrap().into(),
         extension_connection_id: value["extension_connection_id"].as_str().unwrap().into(),
         worker_epoch: value["worker_epoch"].as_i64().unwrap(),

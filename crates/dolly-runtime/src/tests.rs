@@ -1,8 +1,9 @@
 use super::*;
 use dolly_canonical_json::{Sha256Digest, canonicalize};
 use dolly_core_reducer::{
-    BuildManifestCommand, CoreCommand, EnvironmentInput, FrozenDescriptor, InstallConfigCommand,
-    InstallGraphCommand, NeighborGraph, TransitionOutcome, build_neighbor_descriptors,
+    BeginFenceCommand, BuildManifestCommand, CoreCommand, EnvironmentInput, FenceCompleteCommand,
+    FrozenDescriptor, HostFenceVerification, InstallConfigCommand, InstallGraphCommand,
+    NeighborGraph, TransitionOutcome, build_neighbor_descriptors,
 };
 use dolly_core_domain::LeaseToken;
 use dolly_storage::SqliteCoreStore;
@@ -12,16 +13,14 @@ use serde_json::{Value, json};
 const SHA_ZERO: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 const ACTIVATION_ID: &str = "0198ab31-6c44-7e8a-b2bb-000000000004";
 const SECOND_ACTIVATION_ID: &str = "0198ab31-6c44-7e8a-b2bb-000000000005";
-const REQUEST_ID: &str = "rpc-runtime-001";
 
 fn digest(value: &Value) -> String {
     canonicalize(value).unwrap().1.to_canonical_string()
 }
-fn runtime_config(request_id: &str) -> Value {
+fn runtime_config() -> Value {
     json!({
         "model":"test",
         "extension_connection_id":"connection-1",
-        "request_id":request_id,
         "worker_epoch":"0198ab31-6c44-7e8a-b2bb-000000000010",
         "worker_epoch_fence":1
     })
@@ -155,7 +154,7 @@ fn environment() -> EnvironmentInput {
 fn setup() -> (Connection, Value) {
     let mut connection = Connection::open_in_memory().unwrap();
     let graph_value = graph();
-    let config = runtime_config(REQUEST_ID);
+    let config = runtime_config();
     let input = environment();
     {
         let mut store = SqliteCoreStore::new(&mut connection).unwrap();
@@ -222,7 +221,8 @@ fn accepted_transaction_mints_one_premise_and_stops_before_effects() {
     );
 
     let lease = lease_command("lease-1", "lease-1", SHA_ZERO);
-    let premise = engine.prepare_execution(&lease, &input).unwrap();
+    let reservation = engine.allocate_request(&lease, &input).unwrap();
+    let premise = engine.prepare_execution(&lease, &reservation, &input).unwrap();
     assert_eq!(premise.identity().activation_id(), ACTIVATION_ID);
     assert_eq!(premise.identity().module_id(), "receiver");
     assert_eq!(premise.fence().extension_generation(), 7);
@@ -270,9 +270,10 @@ fn exact_lease_replay_returns_same_premise_and_changed_fence_is_rejected() {
         )
         .unwrap();
     let lease = lease_command("lease-replay", "lease-replay", SHA_ZERO);
-    let first = engine.prepare_execution(&lease, &input).unwrap();
+    let reservation = engine.allocate_request(&lease, &input).unwrap();
+    let first = engine.prepare_execution(&lease, &reservation, &input).unwrap();
     let before = engine.snapshot().unwrap();
-    let replay = engine.prepare_execution(&lease, &input).unwrap();
+    let replay = engine.prepare_execution(&lease, &reservation, &input).unwrap();
     assert_eq!(first, replay);
     assert_eq!(before, engine.snapshot().unwrap());
 
@@ -281,7 +282,7 @@ fn exact_lease_replay_returns_same_premise_and_changed_fence_is_rejected() {
         "lease-replay",
         "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
     );
-    let result = engine.prepare_execution(&changed, &input);
+    let result = engine.prepare_execution(&changed, &reservation, &input);
     assert!(matches!(result, Err(RuntimeError::ReplayConflict { .. })));
     assert_eq!(before, engine.snapshot().unwrap());
 }
@@ -289,11 +290,7 @@ fn exact_lease_replay_returns_same_premise_and_changed_fence_is_rejected() {
 #[test]
 fn duplicate_request_identity_is_rejected_before_dispatch() {
     let (mut connection, first_manifest) = setup();
-    let second_manifest = manifest(
-        "receiver",
-        &runtime_config(REQUEST_ID),
-        SECOND_ACTIVATION_ID,
-    );
+    let second_manifest = manifest("receiver", &runtime_config(), SECOND_ACTIVATION_ID);
     let input = environment();
     let mut engine = RuntimeTransactionEngine::new(&mut connection).unwrap();
     engine
@@ -309,27 +306,20 @@ fn duplicate_request_identity_is_rejected_before_dispatch() {
         )
         .unwrap();
 
-    engine
-        .prepare_execution(
-            &lease_command("lease-duplicate-first", "lease-duplicate-first", SHA_ZERO),
-            &input,
-        )
+    let first_lease = lease_command("lease-duplicate-first", "lease-duplicate-first", SHA_ZERO);
+    let reservation = engine.allocate_request(&first_lease, &input).unwrap();
+    let premise = engine
+        .prepare_execution(&first_lease, &reservation, &input)
         .unwrap();
-    let result = engine.prepare_execution(
-        &lease_command_for(
-            SECOND_ACTIVATION_ID,
-            "lease-duplicate-second",
-            "lease-duplicate-second",
-            SHA_ZERO,
-        ),
-        &input,
+    let second_lease = lease_command_for(
+        SECOND_ACTIVATION_ID,
+        "lease-duplicate-second",
+        "lease-duplicate-second",
+        SHA_ZERO,
     );
+    let result = engine.prepare_execution(&second_lease, &reservation, &input);
 
-    assert!(matches!(
-        result,
-        Err(RuntimeError::TransactionRejected { code })
-            if code == "DISPATCH_REQUEST_ID_CONFLICT"
-    ));
+    assert!(matches!(result, Err(RuntimeError::ReplayConflict { .. })));
     let state = engine.snapshot().unwrap();
     assert_eq!(state.activations[ACTIVATION_ID].state, ActivationState::Leased);
     assert_eq!(
@@ -339,54 +329,84 @@ fn duplicate_request_identity_is_rejected_before_dispatch() {
     assert_eq!(state.leases.len(), 1);
     assert_eq!(
         state.leases["lease-duplicate-first"]["request_id"],
-        REQUEST_ID
+        premise.fence().request_id()
     );
     assert_eq!(
         state.leases["lease-duplicate-first"]["dispatch_state"],
         "prepared"
     );
+    assert!(state.outputs.is_empty());
 }
 
 #[test]
-fn overlength_request_identity_is_rejected_before_lease() {
-    let (mut connection, manifest) = setup();
+fn config_request_id_cannot_override_host_allocator() {
+    let (mut connection, mut manifest) = setup();
+    manifest["required_frame_bytes"] = json!(2048);
+    manifest["required_frame_nesting_depth"] = json!(10);
+    manifest.as_object_mut().unwrap().remove("manifest_digest");
+    manifest["manifest_digest"] = Value::String(digest(&manifest));
     let input = environment();
     {
         let mut engine = RuntimeTransactionEngine::new(&mut connection).unwrap();
         engine
             .accept_manifest(
-                &build_command(manifest, ACTIVATION_ID, "build-overlength"),
+                &build_command(manifest, ACTIVATION_ID, "build-config-injection"),
                 &input,
             )
             .unwrap();
     }
 
-    let request_id = "x".repeat(129);
-    let overlength_config = runtime_config(&request_id);
+    let injected_request_id = "x".repeat(129);
+    let mut injected_config = runtime_config();
+    injected_config["request_id"] = json!(injected_request_id);
     {
         let mut store = SqliteCoreStore::new(&mut connection).unwrap();
         let command = CoreCommand::InstallConfig(InstallConfigCommand {
-            command_id: "install-config-overlength".into(),
+            command_id: "install-config-injection".into(),
             revision: 2,
-            digest: digest(&overlength_config),
-            effective_config: overlength_config,
+            digest: digest(&injected_config),
+            effective_config: injected_config,
         });
+        let transition = store.transact(&command, &input).unwrap();
+        assert_eq!(transition.outcome, TransitionOutcome::RolledBack);
         assert_eq!(
-            store.transact(&command, &input).unwrap().outcome,
-            TransitionOutcome::Committed
+            transition.error.as_ref().unwrap().code,
+            "CONFIG_REQUEST_ID_FORBIDDEN"
         );
     }
 
+    let lease_token: LeaseToken =
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".parse().unwrap();
+    let token_digest =
+        Sha256Digest::compute(lease_token.expose_bytes()).to_canonical_string();
+    let lease = lease_command("lease-config-injection", "lease-config-injection", &token_digest);
     let mut engine = RuntimeTransactionEngine::new(&mut connection).unwrap();
-    let result = engine.prepare_execution(
-        &lease_command("lease-overlength", "lease-overlength", SHA_ZERO),
-        &input,
+    assert!(engine.snapshot().unwrap().config["effective_config"]
+        .get("request_id")
+        .is_none());
+    let reservation = engine.allocate_request(&lease, &input).unwrap();
+    let premise = engine
+        .prepare_execution(&lease, &reservation, &input)
+        .unwrap();
+    assert_ne!(premise.fence().request_id(), injected_request_id);
+    assert!(premise.fence().request_id().len() <= 128);
+    let dispatched = engine
+        .dispatch_execution(
+            &premise,
+            "dispatch-config-injection",
+            &lease_token,
+            &input,
+        )
+        .unwrap();
+    let frame: Value = serde_json::from_slice(dispatched.frame_bytes()).unwrap();
+    assert_ne!(frame["id"], injected_request_id);
+    assert_eq!(
+        engine.snapshot().unwrap().activations[ACTIVATION_ID].state,
+        ActivationState::Dispatched
     );
-    assert!(matches!(result, Err(RuntimeError::DispatchInvalid { .. })));
-    let state = engine.snapshot().unwrap();
-    assert_eq!(state.activations[ACTIVATION_ID].state, ActivationState::Ready);
-    assert!(state.leases.is_empty());
+    assert!(engine.snapshot().unwrap().outputs.is_empty());
 }
+
 
 #[test]
 fn mismatched_worker_epoch_cannot_authorize_frame() {
@@ -409,12 +429,12 @@ fn mismatched_worker_epoch_cannot_authorize_frame() {
     let token_digest =
         Sha256Digest::compute(lease_token.expose_bytes()).to_canonical_string();
     let lease = lease_command("lease-mismatch", "lease-mismatch", &token_digest);
-    let premise = engine.prepare_execution(&lease, &input).unwrap();
+    let reservation = engine.allocate_request(&lease, &input).unwrap();
+    let premise = engine.prepare_execution(&lease, &reservation, &input).unwrap();
     drop(engine);
     let mismatched_config = json!({
         "model":"test",
         "extension_connection_id":"connection-1",
-        "request_id":REQUEST_ID,
         "worker_epoch":"0198ab31-6c44-7e8a-b2bb-000000000099",
         "worker_epoch_fence":1
     });
@@ -446,5 +466,68 @@ fn mismatched_worker_epoch_cannot_authorize_frame() {
     assert_eq!(
         engine.snapshot().unwrap().activations[ACTIVATION_ID].state,
         ActivationState::Leased
+    );
+}
+
+#[test]
+fn fence_complete_releases_bound_request_reservation() {
+    let (mut connection, mut manifest) = setup();
+    manifest["required_frame_bytes"] = json!(2048);
+    manifest["required_frame_nesting_depth"] = json!(10);
+    manifest.as_object_mut().unwrap().remove("manifest_digest");
+    manifest["manifest_digest"] = Value::String(digest(&manifest));
+    let input = environment();
+    let mut engine = RuntimeTransactionEngine::new(&mut connection).unwrap();
+    engine
+        .accept_manifest(
+            &build_command(manifest, ACTIVATION_ID, "build-release"),
+            &input,
+        )
+        .unwrap();
+    let lease_token: LeaseToken =
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".parse().unwrap();
+    let token_digest =
+        Sha256Digest::compute(lease_token.expose_bytes()).to_canonical_string();
+    let lease = lease_command("lease-release", "lease-release", &token_digest);
+    let reservation = engine.allocate_request(&lease, &input).unwrap();
+    let premise = engine
+        .prepare_execution(&lease, &reservation, &input)
+        .unwrap();
+    engine
+        .dispatch_execution(&premise, "dispatch-release", &lease_token, &input)
+        .unwrap();
+    let reservation_id = premise.fence().reservation_id().to_owned();
+    let begin = CoreCommand::BeginFence(BeginFenceCommand {
+        command_id: "begin-release".into(),
+        activation_id: ACTIVATION_ID.into(),
+    });
+    assert_eq!(
+        engine.store.transact(&begin, &input).unwrap().outcome,
+        TransitionOutcome::Committed
+    );
+    let mut fence_input = input.clone();
+    fence_input.host_fence_verification = Some(HostFenceVerification {
+        verified: true,
+        activation_id: ACTIVATION_ID.into(),
+        source_attempt: premise.fence().attempt(),
+        execution_slot_empty: true,
+        proof_digest: SHA_ZERO.into(),
+    });
+    let complete = CoreCommand::FenceComplete(FenceCompleteCommand {
+        command_id: "complete-release".into(),
+        activation_id: ACTIVATION_ID.into(),
+        retry_delay: 1,
+    });
+    let completed = engine.store.transact(&complete, &fence_input).unwrap();
+    assert_eq!(completed.outcome, TransitionOutcome::Committed);
+    let state = engine.snapshot().unwrap();
+    assert_eq!(
+        state.host_request_reservations[&reservation_id]["state"],
+        "released"
+    );
+    assert_eq!(
+        state.journal.last().unwrap().details.as_ref().unwrap()
+            ["request_reservation_released"]["request_id"],
+        premise.fence().request_id()
     );
 }

@@ -706,6 +706,7 @@ mod tests {
             command_id: "rollback-issue".into(),
             activation_id: "activation-later".into(),
             lease_id: "lease-1".into(),
+            reservation_id: None,
             token_digest: "sha256:token".into(),
             extension_connection_id: "connection-1".into(),
             worker_epoch: 1,

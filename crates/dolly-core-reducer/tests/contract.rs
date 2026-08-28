@@ -372,6 +372,7 @@ fn safe_retry_authorization_is_bound_and_consumed_once() {
             command_id: "lease".into(),
             activation_id: "a".into(),
             lease_id: "l2".into(),
+            reservation_id: None,
             token_digest: "token2".into(),
             extension_connection_id: "connection-2".into(),
             worker_epoch: 2,
@@ -393,6 +394,7 @@ fn safe_retry_authorization_is_bound_and_consumed_once() {
             command_id: "again".into(),
             activation_id: "a".into(),
             lease_id: "l3".into(),
+            reservation_id: None,
             token_digest: "token3".into(),
             extension_connection_id: "connection-3".into(),
             worker_epoch: 3,
@@ -541,7 +543,7 @@ fn canonical_integrity_digests_are_required() {
 }
 
 #[test]
-fn all_twenty_one_wire_variants_deserialize_and_reach_the_reducer() {
+fn all_twenty_two_wire_variants_deserialize_and_reach_the_reducer() {
     let values = vec![
         json!({"type":"InstallConfig","command_id":"1","revision":1,"effective_config":{},"digest":digest(&json!({}))}),
         json!({"type":"InstallGraph","command_id":"2","revision":1,"graph":{},"digest":digest(&json!({}))}),
@@ -550,6 +552,7 @@ fn all_twenty_one_wire_variants_deserialize_and_reach_the_reducer() {
         json!({"type":"GrantStorageWriter","command_id":"5","owner":"w"}),
         json!({"type":"ReleaseStorageWriter","command_id":"6","owner":"w"}),
         json!({"type":"BuildManifest","command_id":"7","activation_id":"a","manifest":{}}),
+        json!({"type":"AllocateRequest","command_id":"8a","activation_id":"a","lease_id":"l","extension_connection_id":"connection-1","worker_epoch_id":"0198ab31-6c44-7e8a-b2bb-000000000010","worker_epoch":1}),
         json!({"type":"IssueLease","command_id":"8","activation_id":"a","lease_id":"l","token_digest":"t","extension_connection_id":"connection-1","worker_epoch":1}),
         json!({"type":"DispatchLease","command_id":"9","activation_id":"a","lease_id":"l","dispatch_state":"started"}),
         json!({"type":"ReceiveResult","command_id":"10","activation_id":"a","lease_id":"l","result_digest":A,"status":"success"}),
@@ -565,7 +568,7 @@ fn all_twenty_one_wire_variants_deserialize_and_reach_the_reducer() {
         json!({"type":"LossyEvict","command_id":"20","page_id":"p","start":1,"end_exclusive":2,"reason":"x"}),
         json!({"type":"Recover","command_id":"21","persisted_next_page_seq":2}),
     ];
-    assert_eq!(values.len(), 21);
+    assert_eq!(values.len(), 22);
     for value in values {
         let command: CoreCommand = serde_json::from_value(value).unwrap();
         let transition = reduce(&empty_core_snapshot(), &command, &input());
@@ -665,6 +668,7 @@ fn current_lease_controls_each_retry_attempt() {
             command_id: "l1".into(),
             activation_id: "a".into(),
             lease_id: "l1".into(),
+            reservation_id: None,
             token_digest: "t1".into(),
             extension_connection_id: "connection-1".into(),
             worker_epoch: 1,
@@ -696,6 +700,7 @@ fn current_lease_controls_each_retry_attempt() {
         &CoreCommand::IssueLease(IssueLeaseCommand {
             command_id: "l2".into(),
             activation_id: "a".into(),
+            reservation_id: None,
             lease_id: "l2".into(),
             token_digest: "t2".into(),
             extension_connection_id: "connection-2".into(),
@@ -755,6 +760,7 @@ fn lease_replay_preserves_requested_generation_presence() {
         CoreCommand::IssueLease(IssueLeaseCommand {
             command_id: command_id.into(),
             activation_id: "a".into(),
+            reservation_id: None,
             lease_id: "l".into(),
             token_digest: "token".into(),
             extension_connection_id: "connection-1".into(),
@@ -1191,6 +1197,7 @@ fn lease_ids_are_immutable_across_activations_and_replay_exactly() {
         command_id: "lease-a".into(),
         activation_id: "a".into(),
         lease_id: "lease-1".into(),
+        reservation_id: None,
         token_digest: "token-a".into(),
         extension_connection_id: "connection-a".into(),
         worker_epoch: 1,
@@ -1208,6 +1215,7 @@ fn lease_ids_are_immutable_across_activations_and_replay_exactly() {
             command_id: "lease-b".into(),
             activation_id: "b".into(),
             lease_id: "lease-1".into(),
+            reservation_id: None,
             token_digest: "token-b".into(),
             extension_connection_id: "connection-b".into(),
             worker_epoch: 2,
@@ -1360,6 +1368,7 @@ fn durable_counter_exhaustion_fails_closed_without_panicking() {
         command_id: "lease".into(),
         activation_id: "a".into(),
         lease_id: "lease".into(),
+        reservation_id: None,
         token_digest: "token".into(),
         extension_connection_id: "connection".into(),
         worker_epoch: 1,
