@@ -501,9 +501,12 @@ impl HostIngress for SqliteHostIngressStore<'_> {
         }
 
         // 3. Only now allocate fresh RFC-9562 UUIDv7 identities and bind the
-        //    reducer command to this transaction.
+        //    reducer command to this transaction. The minted ingress id is
+        //    carried through the Core ingress command identity so the
+        //    committed mapping is verifiably linked end-to-end.
         let ingress_id = mint_identity::<IngressId>().map_err(map_mint)?;
         let block_id = mint_identity::<BlockId>().map_err(map_mint)?;
+        let identity = identity.with_ingress_id(ingress_id.to_string());
         let runtime_source = format!(
             "{}#{}#{}",
             facts.extension_id, facts.module_id, facts.instance_id
@@ -848,11 +851,29 @@ fn verify_graph_direction(
             "installed graph has no descriptors",
         ));
     };
-    if !descriptors.contains_key(&facts.module_id) {
+    let Some(admitted) = descriptors.get(&facts.module_id) else {
         return Err(HostIngressError::new(
             HostIngressErrorCode::TargetNotAuthorized,
             format!(
                 "module {} is not admitted in the grant-pinned graph",
+                facts.module_id
+            ),
+        ));
+    };
+    // Grant-to-descriptor binding: the activating grant pins one descriptor
+    // digest, and the pinned graph admits its own descriptor source digest.
+    // A live grant under any other Extension pins a different descriptor and
+    // cannot reuse this Module's authorized output Pages.
+    let source_descriptor_digest = admitted
+        .get("source_descriptor_digest")
+        .and_then(Value::as_str);
+    if source_descriptor_digest != Some(grant.descriptor_digest()) {
+        return Err(HostIngressError::new(
+            HostIngressErrorCode::NotAuthorized,
+            format!(
+                "the grant-pinned descriptor {:?} is not the graph-admitted descriptor {:?} for module {}",
+                grant.descriptor_digest(),
+                source_descriptor_digest,
                 facts.module_id
             ),
         ));
@@ -954,17 +975,18 @@ fn verify_mapping(
     external_event_id: &str,
 ) -> StorageResult<Option<HostIngressMapping>> {
     verify_recovery_index_columns(connection)?;
-    let command_id = format!("host-ingress-{key}");
+    let command_id_prefix = format!("host-ingress-{key}-");
     let ingress_record_key = ingress_record_key(facts, key);
 
     let Some(mapping) = load_mapping_row(connection, key.as_str())? else {
         // Absence cross-check: if any effect for this key remains (Core
         // operation or reducer ingress record), a deleted mapping must not
-        // read as absent.
+        // read as absent. The minted id inside the command id is unknown
+        // without the mapping, so the prefix binds the key's operations.
         let operation: Option<String> = connection
             .query_row(
-                "SELECT command_id FROM core_operations WHERE command_id = ?1",
-                [&command_id],
+                "SELECT command_id FROM core_operations WHERE command_id LIKE ?1 || '%'",
+                [&command_id_prefix],
                 |row| row.get(0),
             )
             .optional()
@@ -980,23 +1002,34 @@ fn verify_mapping(
         return Ok(None);
     };
 
+    // The mapping identity must be verifiably linked end-to-end: the stored
+    // command id carries the minted ingress id, so the mapping binding and
+    // the Core operation binding must agree on it.
+    let expected_command_id = format!("host-ingress-{key}-{}", mapping.ingress_id);
+    if mapping.command_id != expected_command_id {
+        return Err(StorageError::Corrupt);
+    }
+
     // Core operation link: request digest, transition digest, and transition
-    // bytes.
+    // bytes. The stored command id must match the mapping's command id.
     let input = seam_input();
     let command = command_for_mapping(&mapping);
     let expected_request_digest = request_identity_digest(&command, &input)?;
-    let operation: Option<(String, String, Vec<u8>)> = connection
+    let operation: Option<(String, String, String, Vec<u8>)> = connection
         .query_row(
-            "SELECT request_digest, transition_digest, transition_jcs
+            "SELECT command_id, request_digest, transition_digest, transition_jcs
              FROM core_operations WHERE command_id = ?1",
             [&mapping.command_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(map_sqlite_error)?;
-    let Some((stored_request_digest, stored_transition_digest, transition_jcs)) = operation else {
+    let Some((operation_command_id, stored_request_digest, stored_transition_digest, transition_jcs)) = operation else {
         return Err(StorageError::Corrupt);
     };
+    if operation_command_id != expected_command_id {
+        return Err(StorageError::Corrupt);
+    }
     if stored_request_digest != expected_request_digest {
         return Err(StorageError::Corrupt);
     }
@@ -1004,13 +1037,19 @@ fn verify_mapping(
     let (_, computed_transition_digest) = canonical_digest(&transition)?;
     if computed_transition_digest != stored_transition_digest
         || transition.outcome != TransitionOutcome::Committed
+        || !transition
+            .events
+            .iter()
+            .any(|event| event.command_id == expected_command_id)
     {
         return Err(StorageError::Corrupt);
     }
 
     // Effect link, cross-checked against BOTH the stored transition state and
     // the current snapshot: the reducer ingress record, the Block content,
-    // and the per-Page deliveries.
+    // and the per-Page deliveries. A substituted (but self-consistent)
+    // transition or identity is rejected because the current snapshot is
+    // digest-protected and must agree with the stored transition.
     let snapshot = load_core_snapshot(connection)?;
     verify_effect_links(&transition.state, &snapshot, facts, key, &mapping)?;
     Ok(Some(mapping))
@@ -1018,8 +1057,12 @@ fn verify_mapping(
 
 /// Verify the ingress record, Block content, and deliveries for one mapping
 /// in a given reducer state, and that the current snapshot agrees.
+/// Verify the immutable operation -> stored transition -> actual Core ingress
+/// effect chain. Both states MUST agree with the committed mapping (the
+/// current snapshot is digest-protected, so a substituted transition that is
+/// inconsistent with it is rejected).
 fn verify_effect_links(
-    _transition_state: &CoreSnapshot,
+    transition_state: &CoreSnapshot,
     snapshot: &CoreSnapshot,
     facts: &PrincipalFacts,
     key: &HostIngressKey,
@@ -1028,7 +1071,8 @@ fn verify_effect_links(
     let ingress_record_key = ingress_record_key(facts, key);
     let expected_block = serde_json::to_value(&mapping.payload).map_err(|_| StorageError::Corrupt)?;
 
-    for state in [snapshot] {
+    let mut observed: Option<Value> = None;
+    for state in [transition_state, snapshot] {
         let record = state.ingress.get(&ingress_record_key).ok_or(StorageError::Corrupt)?;
         if record.operation_digest != mapping.operation_digest
             || record.block_id != mapping.block_id
@@ -1048,6 +1092,15 @@ fn verify_effect_links(
         if deliveries != mapping.deliveries {
             return Err(StorageError::Corrupt);
         }
+        // The stored transition state and the current snapshot must expose
+        // the exact same ingress record: the chain is immutable.
+        let record_json = serde_json::to_value(record).map_err(|_| StorageError::Corrupt)?;
+        if let Some(previous) = &observed {
+            if previous != &record_json {
+                return Err(StorageError::Corrupt);
+            }
+        }
+        observed = Some(record_json);
     }
     Ok(())
 }

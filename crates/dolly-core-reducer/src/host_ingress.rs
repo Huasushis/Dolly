@@ -95,6 +95,10 @@ pub struct IngressIdentity {
     pub canonical_target_page_ids: Vec<String>,
     /// SHA-256 of the canonical content payload bytes.
     pub payload_digest: String,
+    /// The freshly allocated Core ingress identity, embedded in the Core
+    /// ingress command identity so a committed mapping is verifiably linked
+    /// end-to-end to its Core operation.
+    pub ingress_id: String,
 }
 
 /// Collapse duplicate target Pages preserving first-occurrence order. Two
@@ -193,7 +197,19 @@ pub fn derive_ingress_identity(
         operation_digest,
         canonical_target_page_ids: canonical_target_page_ids(&request.target_page_ids),
         payload_digest: payload_digest.to_canonical_string(),
+        ingress_id: String::new(),
     })
+}
+
+impl IngressIdentity {
+    /// Attach the freshly allocated Core ingress identity minted by the
+    /// storage transaction after reconcile (never before it). The id flows
+    /// into the Core ingress command identity for end-to-end link
+    /// verification.
+    pub fn with_ingress_id(mut self, ingress_id: String) -> Self {
+        self.ingress_id = ingress_id;
+        self
+    }
 }
 
 /// Derive the ingress key of one external event identity under the given
@@ -305,8 +321,9 @@ pub fn build_ingress_command(
 ) -> CoreCommand {
     let block = serde_json::to_value(&request.payload)
         .expect("a canonical payload always serializes to a JSON value");
+    let command_id = format!("host-ingress-{}-{}", identity.key, identity.ingress_id);
     CoreCommand::Ingress(IngressCommand {
-        command_id: format!("host-ingress-{}", identity.key),
+        command_id,
         runtime_source: runtime_source.to_owned(),
         ingress_key: identity.key.to_string(),
         operation_digest: identity.operation_digest.clone(),
