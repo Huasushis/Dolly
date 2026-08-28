@@ -4,6 +4,7 @@
 //! replay scope only. It does not contain a Block draft, an effect operation,
 //! a capability, or a callable consumer. Those remain outside this gate.
 
+use dolly_core_domain::WorkerEpoch;
 use std::fmt;
 
 /// The identity of the one Activation and Module being prepared.
@@ -36,7 +37,8 @@ impl ExecutionIdentity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionFence {
     lease_id: String,
-    worker_epoch: i64,
+    worker_epoch: WorkerEpoch,
+    worker_epoch_fence: i64,
     extension_generation: i64,
     lease_generation: i64,
     extension_connection_id: String,
@@ -45,7 +47,8 @@ pub struct ExecutionFence {
 impl ExecutionFence {
     pub(crate) fn new(
         lease_id: String,
-        worker_epoch: i64,
+        worker_epoch: WorkerEpoch,
+        worker_epoch_fence: i64,
         extension_generation: i64,
         lease_generation: i64,
         extension_connection_id: String,
@@ -53,6 +56,7 @@ impl ExecutionFence {
         Self {
             lease_id,
             worker_epoch,
+            worker_epoch_fence,
             extension_generation,
             lease_generation,
             extension_connection_id,
@@ -64,9 +68,14 @@ impl ExecutionFence {
         &self.lease_id
     }
 
-    /// The Worker incarnation bound to this attempt.
-    pub fn worker_epoch(&self) -> i64 {
-        self.worker_epoch
+    /// The canonical typed Worker incarnation bound to this attempt.
+    pub fn worker_epoch(&self) -> &WorkerEpoch {
+        &self.worker_epoch
+    }
+
+    /// The legacy numeric fence retained by the accepted Core contract.
+    pub fn worker_epoch_fence(&self) -> i64 {
+        self.worker_epoch_fence
     }
 
     /// The Extension process generation bound to this attempt.

@@ -157,6 +157,7 @@ fn main() {
             token_digest: TOKEN_DIGEST.into(),
             extension_connection_id: "connection-1".into(),
             worker_epoch: 1,
+            worker_epoch_id: None,
             extension_generation: None,
         }),
         input(),

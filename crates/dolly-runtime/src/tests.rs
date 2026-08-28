@@ -1,10 +1,10 @@
 use super::*;
-use dolly_canonical_json::canonicalize;
+use dolly_canonical_json::{Sha256Digest, canonicalize};
 use dolly_core_reducer::{
     BuildManifestCommand, CoreCommand, EnvironmentInput, FrozenDescriptor, InstallConfigCommand,
-    InstallGraphCommand, IssueLeaseCommand, NeighborGraph, TransitionOutcome,
-    build_neighbor_descriptors,
+    InstallGraphCommand, NeighborGraph, TransitionOutcome, build_neighbor_descriptors,
 };
+use dolly_core_domain::LeaseToken;
 use dolly_storage::SqliteCoreStore;
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -144,7 +144,12 @@ fn environment() -> EnvironmentInput {
 fn setup() -> (Connection, Value) {
     let mut connection = Connection::open_in_memory().unwrap();
     let graph_value = graph();
-    let config = json!({"model":"test"});
+    let config = json!({
+        "model":"test",
+        "extension_connection_id":"connection-1",
+        "worker_epoch":"0198ab31-6c44-7e8a-b2bb-000000000010",
+        "worker_epoch_fence":1
+    });
     let input = environment();
     {
         let mut store = SqliteCoreStore::new(&mut connection).unwrap();
@@ -152,7 +157,7 @@ fn setup() -> (Connection, Value) {
             command_id: "install-config".into(),
             revision: 1,
             digest: digest(&config),
-            effective_config: config,
+            effective_config: config.clone(),
         });
         let graph_command = CoreCommand::InstallGraph(InstallGraphCommand {
             command_id: "install-graph".into(),
@@ -171,7 +176,7 @@ fn setup() -> (Connection, Value) {
     }
     (
         connection,
-        manifest("receiver", &json!({"model":"test"}), ACTIVATION_ID),
+        manifest("receiver", &config, ACTIVATION_ID),
     )
 }
 
@@ -185,16 +190,14 @@ fn build_command(manifest: Value, activation_id: &str, command_id: &str) -> Buil
     }
 }
 
-fn lease_command(command_id: &str, lease_id: &str, token_digest: &str) -> IssueLeaseCommand {
-    IssueLeaseCommand {
-        command_id: command_id.into(),
-        activation_id: ACTIVATION_ID.into(),
-        lease_id: lease_id.into(),
-        token_digest: token_digest.into(),
-        extension_connection_id: "connection-1".into(),
-        worker_epoch: 1,
-        extension_generation: Some(7),
-    }
+fn lease_command(command_id: &str, lease_id: &str, token_digest: &str) -> LeaseRequest {
+    LeaseRequest::new(
+        command_id,
+        ACTIVATION_ID,
+        lease_id,
+        token_digest,
+        Some(7),
+    )
 }
 
 #[test]
@@ -272,4 +275,65 @@ fn exact_lease_replay_returns_same_premise_and_changed_fence_is_rejected() {
     let result = engine.prepare_execution(&changed, &input);
     assert!(matches!(result, Err(RuntimeError::ReplayConflict { .. })));
     assert_eq!(before, engine.snapshot().unwrap());
+}
+
+#[test]
+fn mismatched_worker_epoch_cannot_authorize_frame() {
+    let (mut connection, mut manifest) = setup();
+    manifest["required_frame_bytes"] = json!(2048);
+    manifest["required_frame_nesting_depth"] = json!(10);
+    manifest.as_object_mut().unwrap().remove("manifest_digest");
+    manifest["manifest_digest"] = Value::String(digest(&manifest));
+    let input = environment();
+    let mut engine = RuntimeTransactionEngine::new(&mut connection).unwrap();
+    engine
+        .accept_manifest(
+            &build_command(manifest, ACTIVATION_ID, "build-mismatch"),
+            &input,
+        )
+        .unwrap();
+
+    let lease_token: LeaseToken =
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".parse().unwrap();
+    let token_digest =
+        Sha256Digest::compute(lease_token.expose_bytes()).to_canonical_string();
+    let lease = lease_command("lease-mismatch", "lease-mismatch", &token_digest);
+    let premise = engine.prepare_execution(&lease, &input).unwrap();
+    drop(engine);
+    let mismatched_config = json!({
+        "model":"test",
+        "extension_connection_id":"connection-1",
+        "worker_epoch":"0198ab31-6c44-7e8a-b2bb-000000000099",
+        "worker_epoch_fence":1
+    });
+    {
+        let mut store = SqliteCoreStore::new(&mut connection).unwrap();
+        let changed = CoreCommand::InstallConfig(InstallConfigCommand {
+            command_id: "install-config-mismatch".into(),
+            revision: 2,
+            digest: digest(&mismatched_config),
+            effective_config: mismatched_config,
+        });
+        assert_eq!(
+            store.transact(&changed, &input).unwrap().outcome,
+            TransitionOutcome::Committed
+        );
+    }
+    let mut engine = RuntimeTransactionEngine::new(&mut connection).unwrap();
+    let result = engine.dispatch_execution(
+        &premise,
+        "dispatch-mismatch",
+        &lease_token,
+        "rpc-mismatch",
+        &input,
+    );
+
+    assert!(
+        result.is_err(),
+        "a mismatched caller epoch authorized a frame"
+    );
+    assert_eq!(
+        engine.snapshot().unwrap().activations[ACTIVATION_ID].state,
+        ActivationState::Leased
+    );
 }

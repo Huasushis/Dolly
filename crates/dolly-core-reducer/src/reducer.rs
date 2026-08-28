@@ -1059,6 +1059,8 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                     && object_str(existing, "extension_connection_id")
                         == Some(c.extension_connection_id.as_str())
                     && object_i64(existing, "worker_epoch") == Some(c.worker_epoch)
+                    && existing.get("worker_epoch_id").and_then(Value::as_str)
+                        == c.worker_epoch_id.as_deref()
                     && object_i64(existing, "attempt") == Some(item.attempt)
                     && existing
                         .get("requested_extension_generation")
@@ -1141,6 +1143,9 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                 json!(c.extension_connection_id),
             );
             lease.insert("worker_epoch".into(), json!(c.worker_epoch));
+            if let Some(worker_epoch_id) = c.worker_epoch_id.as_deref() {
+                lease.insert("worker_epoch_id".into(), json!(worker_epoch_id));
+            }
             if let Some(value) = generation {
                 lease.insert("extension_generation".into(), json!(value));
             }
@@ -1166,11 +1171,15 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                     ))
                 }
             }
+            let mut details = json!({"activation_id":c.activation_id,"lease_id":c.lease_id});
+            if let Some(worker_epoch_id) = c.worker_epoch_id.as_deref() {
+                details["worker_epoch_id"] = json!(worker_epoch_id);
+            }
             events.push(append_event(
                 &mut next,
                 &c.command_id,
                 "LeaseIssued",
-                Some(json!({"activation_id":c.activation_id,"lease_id":c.lease_id})),
+                Some(details),
             ));
             let mut reply = Map::new();
             reply.insert("lease_id".into(), json!(c.lease_id));

@@ -118,6 +118,7 @@ fn issue_lease_command(value: &Value, activation_id: &str) -> IssueLeaseCommand 
         token_digest: value["token_digest"].as_str().unwrap().into(),
         extension_connection_id: value["extension_connection_id"].as_str().unwrap().into(),
         worker_epoch: value["worker_epoch"].as_i64().unwrap(),
+        worker_epoch_id: None,
         extension_generation: value["extension_generation"].as_i64(),
     }
 }

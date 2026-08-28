@@ -91,6 +91,48 @@ impl DispatchResult {
     }
 }
 
+/// The caller-owned lease identity and token hash request.
+///
+/// Worker epoch and connection identity are intentionally absent. The
+/// Runtime obtains both from the verified durable Host connection state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseRequest {
+    command_id: String,
+    activation_id: String,
+    lease_id: String,
+    token_digest: String,
+    extension_generation: Option<i64>,
+}
+
+impl LeaseRequest {
+    pub fn new(
+        command_id: impl Into<String>,
+        activation_id: impl Into<String>,
+        lease_id: impl Into<String>,
+        token_digest: impl Into<String>,
+        extension_generation: Option<i64>,
+    ) -> Self {
+        Self {
+            command_id: command_id.into(),
+            activation_id: activation_id.into(),
+            lease_id: lease_id.into(),
+            token_digest: token_digest.into(),
+            extension_generation,
+        }
+    }
+}
+
+/// Typed Host connection identity retained in the verified Core configuration.
+///
+/// This state is the source for lease and frame binding; it is never accepted
+/// as a dispatch argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostConnectionState {
+    extension_connection_id: String,
+    worker_epoch: WorkerEpoch,
+    worker_epoch_fence: i64,
+}
+
 /// The production G1 transaction façade over one Core writer connection.
 ///
 /// `SqliteCoreStore` remains the only authority that changes durable Core
@@ -171,11 +213,22 @@ impl<'connection> RuntimeTransactionEngine<'connection> {
     /// admitted. An exact replay returns the premise from the retained lease.
     pub fn prepare_execution(
         &mut self,
-        command: &IssueLeaseCommand,
+        request: &LeaseRequest,
         input: &EnvironmentInput,
     ) -> RuntimeResult<ExecutionPremise> {
-        validate_lease_request(command)?;
         let snapshot = self.store.snapshot()?;
+        let connection = host_connection_state(&snapshot)?;
+        let command = IssueLeaseCommand {
+            command_id: request.command_id.clone(),
+            activation_id: request.activation_id.clone(),
+            lease_id: request.lease_id.clone(),
+            token_digest: request.token_digest.clone(),
+            extension_connection_id: connection.extension_connection_id.clone(),
+            worker_epoch: connection.worker_epoch_fence,
+            worker_epoch_id: Some(connection.worker_epoch.to_string()),
+            extension_generation: request.extension_generation,
+        };
+        validate_lease_request(&command)?;
         let activation = snapshot
             .activations
             .get(&command.activation_id)
@@ -203,27 +256,27 @@ impl<'connection> RuntimeTransactionEngine<'connection> {
             Some(manifest.descriptor_revision.value() as i64),
         )?;
         validate_generation(&snapshot, command.extension_generation)?;
-        validate_existing_lease_or_state(&snapshot, command, activation.state)?;
+        validate_existing_lease_or_state(&snapshot, &command, activation.state)?;
 
         let transition = self
             .store
             .transact(&CoreCommand::IssueLease(command.clone()), input)?;
         require_committed(&transition)?;
-        build_premise(&transition.state, command, validated)
+        build_premise(&transition.state, &command, validated)
     }
 
     /// Build the exact canonical `module.activate` frame and durably mark it
     /// `started`. The frame is returned only after the marker commits.
     ///
-    /// `premise` must be the result of `prepare_execution`. `worker_epoch` and
-    /// `lease_token` are Runtime-owned values; `request_id` is allocated by the
-    /// Host sender. This method never writes transport bytes or invokes
-    /// Extension code.
+    /// `premise` must be the result of `prepare_execution`. The typed
+    /// WorkerEpoch and connection identity come from the verified current
+    /// Host state and are rechecked against the retained lease. The request ID
+    /// is allocated by the Host sender. This method never writes transport
+    /// bytes or invokes Extension code.
     pub fn dispatch_execution(
         &mut self,
         premise: &ExecutionPremise,
         dispatch_command_id: &str,
-        worker_epoch: &WorkerEpoch,
         lease_token: &LeaseToken,
         request_id: &str,
         input: &EnvironmentInput,
@@ -235,14 +288,24 @@ impl<'connection> RuntimeTransactionEngine<'connection> {
         }
 
         let snapshot = self.store.snapshot()?;
-        let manifest_value = retained_manifest_for_dispatch(&snapshot, premise, lease_token)?;
+        let connection = host_connection_state(&snapshot)?;
+        if connection.extension_connection_id != premise.fence().extension_connection_id()
+            || connection.worker_epoch != *premise.fence().worker_epoch()
+            || connection.worker_epoch_fence != premise.fence().worker_epoch_fence()
+        {
+            return Err(RuntimeError::PremiseUnavailable {
+                detail: "current Host connection no longer owns the prepared WorkerEpoch".into(),
+            });
+        }
+        let manifest_value =
+            retained_manifest_for_dispatch(&snapshot, premise, &connection.worker_epoch, lease_token)?;
         let (manifest, _) = validation::validate_manifest_for_replay(&manifest_value)?;
         let frame = json!({
             "jsonrpc": "2.0",
             "id": request_id,
             "method": "module.activate",
             "params": {
-                "worker_epoch": worker_epoch,
+                "worker_epoch": premise.fence().worker_epoch(),
                 "extension_generation": premise.fence().extension_generation(),
                 "lease_generation": premise.fence().lease_generation(),
                 "lease_token": lease_token.expose_base64url(),
@@ -312,10 +375,51 @@ impl<'connection> RuntimeTransactionEngine<'connection> {
             transition,
         })
     }
+
 }
+fn host_connection_state(
+    snapshot: &dolly_core_reducer::CoreSnapshot,
+) -> RuntimeResult<HostConnectionState> {
+    let config = snapshot
+        .config
+        .get("effective_config")
+        .unwrap_or(&snapshot.config);
+    let extension_connection_id = config
+        .get("extension_connection_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| RuntimeError::GenerationInvalid {
+            detail: "verified Host connection id is absent".into(),
+        })?
+        .to_owned();
+    let worker_epoch = config
+        .get("worker_epoch")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RuntimeError::GenerationInvalid {
+            detail: "verified Host WorkerEpoch is absent".into(),
+        })?
+        .parse::<WorkerEpoch>()
+        .map_err(|error| RuntimeError::GenerationInvalid {
+            detail: format!("verified Host WorkerEpoch is invalid: {error}"),
+        })?;
+    let worker_epoch_fence = config
+        .get("worker_epoch_fence")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| RuntimeError::GenerationInvalid {
+            detail: "verified Host WorkerEpoch fence is absent or invalid".into(),
+        })?;
+    Ok(HostConnectionState {
+        extension_connection_id,
+        worker_epoch,
+        worker_epoch_fence,
+    })
+}
+
 fn retained_manifest_for_dispatch(
     snapshot: &dolly_core_reducer::CoreSnapshot,
     premise: &ExecutionPremise,
+    worker_epoch: &WorkerEpoch,
     lease_token: &LeaseToken,
 ) -> RuntimeResult<Value> {
     let activation = snapshot
@@ -353,10 +457,13 @@ fn retained_manifest_for_dispatch(
             detail: "dispatch lease is absent from durable state".into(),
         })?;
     let token_digest = Sha256Digest::compute(lease_token.expose_bytes()).to_canonical_string();
+    let worker_epoch_id = worker_epoch.to_string();
     if lease.get("activation_id").and_then(Value::as_str)
         != Some(premise.identity().activation_id())
         || lease.get("attempt").and_then(Value::as_i64) != Some(premise.fence().attempt())
-        || lease.get("worker_epoch").and_then(Value::as_i64) != Some(premise.fence().worker_epoch())
+        || lease.get("worker_epoch").and_then(Value::as_i64)
+            != Some(premise.fence().worker_epoch_fence())
+        || lease.get("worker_epoch_id").and_then(Value::as_str) != Some(worker_epoch_id.as_str())
         || lease.get("extension_generation").and_then(Value::as_i64)
             != Some(premise.fence().extension_generation())
         || lease.get("extension_connection_id").and_then(Value::as_str)
@@ -419,9 +526,20 @@ fn validate_lease_request(command: &IssueLeaseCommand) -> RuntimeResult<()> {
     }
     if command.worker_epoch <= 0 {
         return Err(RuntimeError::GenerationInvalid {
-            detail: "worker_epoch must be positive".into(),
+            detail: "worker_epoch fence must be positive".into(),
         });
     }
+    let worker_epoch_id = command
+        .worker_epoch_id
+        .as_deref()
+        .ok_or_else(|| RuntimeError::GenerationInvalid {
+            detail: "typed WorkerEpoch is required for a Runtime lease".into(),
+        })?;
+    worker_epoch_id
+        .parse::<WorkerEpoch>()
+        .map_err(|error| RuntimeError::GenerationInvalid {
+            detail: format!("typed WorkerEpoch is invalid: {error}"),
+        })?;
     let generation =
         command
             .extension_generation
@@ -479,6 +597,8 @@ fn validate_existing_lease_or_state(
                 .and_then(Value::as_str)
                 == Some(command.extension_connection_id.as_str())
             && existing.get("worker_epoch").and_then(Value::as_i64) == Some(command.worker_epoch)
+            && existing.get("worker_epoch_id").and_then(Value::as_str)
+                == command.worker_epoch_id.as_deref()
             && existing.get("requested_extension_generation")
                 == Some(&json!(command.extension_generation));
         if exact {
@@ -521,19 +641,31 @@ fn build_premise(
                 detail: "committed lease is absent".into(),
             })?;
     let manifest_digest = validated.manifest.manifest_digest.to_string();
-    if lease.get("activation_id").and_then(Value::as_str) != Some(command.activation_id.as_str())
+    if lease.get("activation_id").and_then(Value::as_str)
+        != Some(command.activation_id.as_str())
         || lease.get("dispatch_state").and_then(Value::as_str) != Some("prepared")
-        || lease.get("manifest_digest").and_then(Value::as_str) != Some(manifest_digest.as_str())
+        || lease.get("manifest_digest").and_then(Value::as_str)
+            != Some(manifest_digest.as_str())
     {
         return Err(RuntimeError::PremiseUnavailable {
             detail: "committed lease does not bind the retained Manifest and prepared state".into(),
         });
     }
-    let worker_epoch = lease
+    let worker_epoch_fence = lease
         .get("worker_epoch")
         .and_then(Value::as_i64)
         .ok_or_else(|| RuntimeError::PremiseUnavailable {
-            detail: "committed lease has no Worker epoch".into(),
+            detail: "committed lease has no Worker epoch fence".into(),
+        })?;
+    let worker_epoch = lease
+        .get("worker_epoch_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RuntimeError::PremiseUnavailable {
+            detail: "committed lease has no typed WorkerEpoch".into(),
+        })?
+        .parse::<WorkerEpoch>()
+        .map_err(|error| RuntimeError::GenerationInvalid {
+            detail: format!("committed lease WorkerEpoch is invalid: {error}"),
         })?;
     let extension_generation = lease
         .get("extension_generation")
@@ -548,7 +680,8 @@ fn build_premise(
             detail: "committed lease has no attempt fence".into(),
         })?;
     if attempt <= 0
-        || worker_epoch != command.worker_epoch
+        || worker_epoch_fence != command.worker_epoch
+        || command.worker_epoch_id.as_deref() != Some(worker_epoch.to_string().as_str())
         || extension_generation != command.extension_generation.unwrap_or_default()
     {
         return Err(RuntimeError::GenerationInvalid {
@@ -569,6 +702,7 @@ fn build_premise(
         ExecutionFence::new(
             command.lease_id.clone(),
             worker_epoch,
+            worker_epoch_fence,
             extension_generation,
             attempt,
             extension_connection_id.to_owned(),

@@ -140,6 +140,8 @@ pub struct IssueLeaseCommand {
     pub extension_connection_id: String,
     pub worker_epoch: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_epoch_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub extension_generation: Option<i64>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -375,6 +375,7 @@ fn safe_retry_authorization_is_bound_and_consumed_once() {
             token_digest: "token2".into(),
             extension_connection_id: "connection-2".into(),
             worker_epoch: 2,
+            worker_epoch_id: None,
             extension_generation: None,
         }),
         &input(),
@@ -394,6 +395,7 @@ fn safe_retry_authorization_is_bound_and_consumed_once() {
             token_digest: "token3".into(),
             extension_connection_id: "connection-3".into(),
             worker_epoch: 3,
+            worker_epoch_id: None,
             extension_generation: None,
         }),
         &input(),
@@ -664,6 +666,7 @@ fn current_lease_controls_each_retry_attempt() {
             token_digest: "t1".into(),
             extension_connection_id: "connection-1".into(),
             worker_epoch: 1,
+            worker_epoch_id: None,
             extension_generation: None,
         }),
         &input(),
@@ -694,6 +697,7 @@ fn current_lease_controls_each_retry_attempt() {
             token_digest: "t2".into(),
             extension_connection_id: "connection-2".into(),
             worker_epoch: 2,
+            worker_epoch_id: None,
             extension_generation: None,
         }),
         &input(),
@@ -751,6 +755,7 @@ fn lease_replay_preserves_requested_generation_presence() {
             token_digest: "token".into(),
             extension_connection_id: "connection-1".into(),
             worker_epoch: 1,
+            worker_epoch_id: None,
             extension_generation,
         })
     };
@@ -1184,6 +1189,7 @@ fn lease_ids_are_immutable_across_activations_and_replay_exactly() {
         token_digest: "token-a".into(),
         extension_connection_id: "connection-a".into(),
         worker_epoch: 1,
+        worker_epoch_id: None,
         extension_generation: None,
     });
     let first = reduce(&state, &command, &input());
@@ -1199,6 +1205,7 @@ fn lease_ids_are_immutable_across_activations_and_replay_exactly() {
             token_digest: "token-b".into(),
             extension_connection_id: "connection-b".into(),
             worker_epoch: 2,
+            worker_epoch_id: None,
             extension_generation: None,
         }),
         &input(),
@@ -1349,6 +1356,7 @@ fn durable_counter_exhaustion_fails_closed_without_panicking() {
         token_digest: "token".into(),
         extension_connection_id: "connection".into(),
         worker_epoch: 1,
+        worker_epoch_id: None,
         extension_generation: None,
     });
     let result = reduce(&exhausted_attempt, &issue, &input());
