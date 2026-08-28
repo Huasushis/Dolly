@@ -12,6 +12,8 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use serde_json::{Value, json};
 use thiserror::Error;
 
+use crate::transaction::{HostCapabilityGrant, HostConnectionAuthority};
+
 /// Maximum configuration revision accepted by the safe integer contract.
 pub const MAX_CONFIGURATION_REVISION: u64 = 9_007_199_254_740_991;
 /// Logical schema version for the configuration transaction ledger.
@@ -142,7 +144,7 @@ pub enum ConfigurationChange {
 /// OperationalPremise. Its private fields cover the exact Extension, Module,
 /// Host connection and incarnation, WorkerEpoch and fence, daemon and
 /// Extension generations, base configuration, graph, and control channel.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ConfigurationTransactionAuthority {
     extension_id: String,
     module_id: String,
@@ -162,8 +164,87 @@ pub struct ConfigurationTransactionAuthority {
 }
 
 impl ConfigurationTransactionAuthority {
+    /// Build authority from the current authenticated Host connection and
+    /// capability grant after the caller has checked its live lifecycle.
+    pub(crate) fn from_authenticated_host(
+        host: &HostConnectionAuthority,
+        grant: &HostCapabilityGrant,
+        base: &ConfigurationSnapshot,
+    ) -> Result<Self, ConfigurationError> {
+        let worker_epoch: WorkerEpoch = grant
+            .worker_epoch()
+            .parse()
+            .map_err(|_| ConfigurationError::InvalidAuthority)?;
+        let graph_revision = u64::try_from(grant.graph_revision())
+            .map_err(|_| ConfigurationError::InvalidAuthority)?;
+        let extension_generation = grant.extension_generation();
+        let daemon_generation = u64::try_from(extension_generation)
+            .map_err(|_| ConfigurationError::InvalidAuthority)?;
+        if grant.extension_connection_id() != host.extension_connection_id()
+            || worker_epoch != *host.worker_epoch()
+            || grant.worker_epoch_fence() != host.worker_epoch_fence()
+            || grant.incarnation_revision() != host.incarnation_revision()
+            || extension_generation <= 0
+        {
+            return Err(ConfigurationError::InvalidAuthority);
+        }
+        let graph_digest: Sha256Digest = grant
+            .graph_digest()
+            .parse()
+            .map_err(|_| ConfigurationError::InvalidAuthority)?;
+        Self::from_parts(
+            grant.extension_id(),
+            grant.module_id(),
+            host.extension_connection_id(),
+            host.incarnation_revision(),
+            worker_epoch,
+            host.worker_epoch_fence(),
+            daemon_generation,
+            extension_generation,
+            base.revision(),
+            base.digest().clone(),
+            graph_revision,
+            graph_digest,
+            host.extension_connection_id(),
+        )
+    }
+
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    fn from_test_parts(
+        extension_id: impl Into<String>,
+        module_id: impl Into<String>,
+        extension_connection_id: impl Into<String>,
+        host_incarnation_revision: i64,
+        worker_epoch: WorkerEpoch,
+        worker_epoch_fence: i64,
+        daemon_generation: u64,
+        extension_generation: i64,
+        base_config_revision: u64,
+        base_config_digest: Sha256Digest,
+        graph_revision: u64,
+        graph_digest: Sha256Digest,
+        control_channel_id: impl Into<String>,
+    ) -> Result<Self, ConfigurationError> {
+        Self::from_parts(
+            extension_id,
+            module_id,
+            extension_connection_id,
+            host_incarnation_revision,
+            worker_epoch,
+            worker_epoch_fence,
+            daemon_generation,
+            extension_generation,
+            base_config_revision,
+            base_config_digest,
+            graph_revision,
+            graph_digest,
+            control_channel_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_parts(
         extension_id: impl Into<String>,
         module_id: impl Into<String>,
         extension_connection_id: impl Into<String>,
@@ -186,6 +267,7 @@ impl ConfigurationTransactionAuthority {
             || !valid_authority_identifier(&module_id)
             || !valid_authority_identifier(&extension_connection_id)
             || !valid_authority_identifier(&control_channel_id)
+            || extension_connection_id != control_channel_id
             || host_incarnation_revision <= 0
             || host_incarnation_revision > MAX_CONFIGURATION_REVISION as i64
             || worker_epoch_fence <= 0
@@ -236,6 +318,26 @@ impl ConfigurationTransactionAuthority {
         })
     }
 
+    pub(crate) fn matches_capability_grant(&self, grant: &HostCapabilityGrant) -> bool {
+        let worker_epoch: WorkerEpoch = match grant.worker_epoch().parse() {
+            Ok(epoch) => epoch,
+            Err(_) => return false,
+        };
+        let graph_digest: Sha256Digest = match grant.graph_digest().parse() {
+            Ok(digest) => digest,
+            Err(_) => return false,
+        };
+        self.extension_id == grant.extension_id()
+            && self.module_id == grant.module_id()
+            && self.extension_connection_id == grant.extension_connection_id()
+            && self.worker_epoch == worker_epoch
+            && self.worker_epoch_fence == grant.worker_epoch_fence()
+            && self.host_incarnation_revision == grant.incarnation_revision()
+            && self.extension_generation == grant.extension_generation()
+            && self.graph_revision == grant.graph_revision() as u64
+            && self.graph_digest == graph_digest
+    }
+
     pub fn authority_digest(&self) -> &Sha256Digest {
         &self.authority_digest
     }
@@ -259,6 +361,146 @@ impl ConfigurationTransactionAuthority {
 
 fn valid_authority_identifier(value: &str) -> bool {
     !value.is_empty() && value.len() <= 255 && !value.chars().any(char::is_whitespace)
+}
+
+fn verify_current_host_authority(
+    connection: &Connection,
+    host: &HostConnectionAuthority,
+    authority: &ConfigurationTransactionAuthority,
+) -> Result<(), ConfigurationError> {
+    let row: Option<(String, Vec<u8>)> = connection
+        .query_row(
+            "SELECT state_hash, state_jcs FROM core_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(ConfigurationError::Storage)?;
+    let Some((state_hash, state_jcs)) = row else {
+        return Err(ConfigurationError::AuthorityUnavailable);
+    };
+    let state: Value =
+        serde_json::from_slice(&state_jcs).map_err(|_| ConfigurationError::Corrupt)?;
+    let (canonical_state, state_digest) =
+        canonicalize(&state).map_err(|_| ConfigurationError::Corrupt)?;
+    let stored_digest: Sha256Digest = state_hash.parse().map_err(|_| ConfigurationError::Corrupt)?;
+    if canonical_state.as_ref() != state_jcs.as_slice()
+        || stored_digest.to_canonical_string() != state_hash
+        || stored_digest != state_digest
+    {
+        return Err(ConfigurationError::Corrupt);
+    }
+    let host_connection = state
+        .get("host_connection")
+        .and_then(Value::as_object)
+        .ok_or(ConfigurationError::AuthorityUnavailable)?;
+    let identity = host_connection
+        .get("identity")
+        .and_then(Value::as_object)
+        .ok_or(ConfigurationError::AuthorityUnavailable)?;
+    let current_connection = identity
+        .get("extension_connection_id")
+        .and_then(Value::as_str)
+        .ok_or(ConfigurationError::Corrupt)?;
+    let current_epoch: WorkerEpoch = identity
+        .get("worker_epoch_id")
+        .and_then(Value::as_str)
+        .ok_or(ConfigurationError::Corrupt)?
+        .parse()
+        .map_err(|_| ConfigurationError::Corrupt)?;
+    let current_fence = identity
+        .get("worker_epoch_fence")
+        .and_then(Value::as_i64)
+        .ok_or(ConfigurationError::Corrupt)?;
+    let current_incarnation = host_connection
+        .get("incarnation_revision")
+        .and_then(Value::as_i64)
+        .ok_or(ConfigurationError::Corrupt)?;
+    if current_connection != host.extension_connection_id()
+        || current_epoch != *host.worker_epoch()
+        || current_fence != host.worker_epoch_fence()
+        || current_incarnation != host.incarnation_revision()
+        || authority.extension_connection_id != host.extension_connection_id()
+        || authority.worker_epoch != *host.worker_epoch()
+        || authority.worker_epoch_fence != host.worker_epoch_fence()
+        || authority.host_incarnation_revision != host.incarnation_revision()
+        || authority.control_channel_id != host.extension_connection_id()
+    {
+        return Err(ConfigurationError::AuthorityConflict);
+    }
+    let grant: Option<(String, String, String, String, i64, i64, i64, i64, String, i64)> =
+        connection
+            .query_row(
+                "SELECT extension_id, module_id, extension_connection_id, worker_epoch,
+                        worker_epoch_fence, incarnation_revision, extension_generation,
+                        graph_revision, graph_digest, revoked
+                 FROM host_capability_grants WHERE extension_id = ?1 AND module_id = ?2",
+                params![&authority.extension_id, &authority.module_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(ConfigurationError::Storage)?;
+    let Some((
+        grant_extension_id,
+        grant_module_id,
+        grant_connection_id,
+        grant_worker_epoch,
+        grant_fence,
+        grant_incarnation,
+        grant_generation,
+        grant_graph_revision,
+        grant_graph_digest,
+        revoked,
+    )) = grant
+    else {
+        return Err(ConfigurationError::AuthorityUnavailable);
+    };
+    let grant_worker_epoch: WorkerEpoch = grant_worker_epoch
+        .parse()
+        .map_err(|_| ConfigurationError::Corrupt)?;
+    let grant_graph_digest: Sha256Digest = grant_graph_digest
+        .parse()
+        .map_err(|_| ConfigurationError::Corrupt)?;
+    if revoked != 0
+        || grant_extension_id != authority.extension_id
+        || grant_module_id != authority.module_id
+        || grant_connection_id != authority.extension_connection_id
+        || grant_worker_epoch != authority.worker_epoch
+        || grant_fence != authority.worker_epoch_fence
+        || grant_incarnation != authority.host_incarnation_revision
+        || grant_generation != authority.extension_generation
+        || grant_graph_revision != authority.graph_revision as i64
+        || grant_graph_digest != authority.graph_digest
+    {
+        return Err(ConfigurationError::AuthorityConflict);
+    }
+    Ok(())
+}
+
+fn verify_current_configuration_base(
+    transaction: &Transaction<'_>,
+    authority: &ConfigurationTransactionAuthority,
+) -> Result<(), ConfigurationError> {
+    let current = load_state(transaction)?;
+    if current.revision != authority.base_config_revision
+        || current.digest != authority.base_config_digest
+    {
+        return Err(ConfigurationError::AuthorityConflict);
+    }
+    Ok(())
 }
 
 /// Immutable configuration bytes and their canonical revision digest.
@@ -472,14 +714,17 @@ impl<'connection> ConfigurationStore<'connection> {
     }
 
     /// Establish the first sealed authority for this configuration ledger.
-    pub fn bind_authority(
+    pub(crate) fn bind_authority(
         &mut self,
+        host: &HostConnectionAuthority,
         authority: &ConfigurationTransactionAuthority,
     ) -> Result<(), ConfigurationError> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(ConfigurationError::Storage)?;
+        verify_current_host_authority(&transaction, host, authority)?;
+        verify_current_configuration_base(&transaction, authority)?;
         if let Some(current) = load_authority_digest(&transaction)? {
             if current != *authority.authority_digest() {
                 return Err(ConfigurationError::AuthorityConflict);
@@ -493,8 +738,9 @@ impl<'connection> ConfigurationStore<'connection> {
     }
 
     /// Replace the current authority only with the exact next generation.
-    pub fn rotate_authority(
+    pub(crate) fn rotate_authority(
         &mut self,
+        host: &HostConnectionAuthority,
         previous: &ConfigurationTransactionAuthority,
         next: &ConfigurationTransactionAuthority,
     ) -> Result<(), ConfigurationError> {
@@ -505,6 +751,8 @@ impl<'connection> ConfigurationStore<'connection> {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(ConfigurationError::Storage)?;
+        verify_current_host_authority(&transaction, host, next)?;
+        verify_current_configuration_base(&transaction, next)?;
         let current = load_authority_digest(&transaction)?
             .ok_or(ConfigurationError::AuthorityUnavailable)?;
         if current != *previous.authority_digest() {
@@ -514,7 +762,6 @@ impl<'connection> ConfigurationStore<'connection> {
         transaction.commit().map_err(ConfigurationError::Storage)?;
         Ok(())
     }
-
     /// Atomically apply a replacement or rollback under the exact authority.
     pub fn apply(
         &mut self,
@@ -1126,7 +1373,53 @@ fn valid_secret_ref(reference: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dolly_core_reducer::{
+        CoreCommand, EnvironmentInput, InstallConfigCommand, TransitionOutcome,
+    };
     use rusqlite::{Connection, types::Value as SqlValue};
+
+    use crate::transaction::SqliteCoreStore;
+
+    fn host_authority(connection: &mut Connection) -> HostConnectionAuthority {
+        let mut core = SqliteCoreStore::new(connection).expect("core schema");
+        let configuration = json!({
+            "extension_connection_id": "connection-one",
+            "worker_epoch": "018f0f00-0000-7000-8000-000000000001",
+            "worker_epoch_fence": 1
+        });
+        let (_, digest) = canonicalize(&configuration).expect("configuration digest");
+        let command = CoreCommand::InstallConfig(InstallConfigCommand {
+            command_id: "config-authority-test".into(),
+            revision: 1,
+            effective_config: configuration,
+            digest: digest.to_canonical_string(),
+        });
+        assert_eq!(
+            core.transact(&command, &EnvironmentInput::default())
+                .expect("configuration")
+                .outcome,
+            TransitionOutcome::Committed
+        );
+        let host = core.bootstrap_host_connection().expect("Host authority");
+        let descriptor_digest = Sha256Digest::compute(b"descriptor").to_canonical_string();
+        let manifest_digest = Sha256Digest::compute(b"manifest").to_canonical_string();
+        let graph_digest = Sha256Digest::compute(b"graph-v1").to_canonical_string();
+        core.install_host_capability_grant(
+            &host,
+            "org.example.extension",
+            "module-one",
+            1,
+            1,
+            &descriptor_digest,
+            1,
+            &manifest_digest,
+            1,
+            &graph_digest,
+            &["host.block.get"],
+        )
+        .expect("Host capability grant");
+        host
+    }
 
     fn new_store<'connection>(
         connection: &'connection mut Connection,
@@ -1142,7 +1435,7 @@ mod tests {
         graph_revision: u64,
         graph_digest: Sha256Digest,
     ) -> ConfigurationTransactionAuthority {
-        ConfigurationTransactionAuthority::new(
+        ConfigurationTransactionAuthority::from_test_parts(
             "org.example.extension",
             "module-one",
             "connection-one",
@@ -1210,9 +1503,12 @@ mod tests {
     #[test]
     fn replacement_is_atomic_and_exact_replay_is_idempotent() {
         let mut connection = Connection::open_in_memory().expect("database");
+        let host = host_authority(&mut connection);
         let mut store = new_store(&mut connection);
         let authority = authority_for(&store, 1, 1);
-        store.bind_authority(&authority).expect("bind");
+        host
+            .bind_configuration_authority(&mut store, &authority)
+            .expect("bind");
         let request = ConfigurationTransaction::new(
             "tx-1",
             Some(0),
@@ -1235,9 +1531,12 @@ mod tests {
     #[test]
     fn stale_revision_and_plaintext_secret_are_rejected_without_writes() {
         let mut connection = Connection::open_in_memory().expect("database");
+        let host = host_authority(&mut connection);
         let mut store = new_store(&mut connection);
         let authority = authority_for(&store, 1, 1);
-        store.bind_authority(&authority).expect("bind");
+        host
+            .bind_configuration_authority(&mut store, &authority)
+            .expect("bind");
         let first =
             ConfigurationTransaction::new("tx-1", Some(0), json!({"value": 1})).expect("request");
         store.apply(&authority, &first).expect("first");
@@ -1259,9 +1558,12 @@ mod tests {
     #[test]
     fn rollback_creates_new_revision_and_restores_historical_value() {
         let mut connection = Connection::open_in_memory().expect("database");
+        let host = host_authority(&mut connection);
         let mut store = new_store(&mut connection);
         let authority = authority_for(&store, 1, 1);
-        store.bind_authority(&authority).expect("bind");
+        host
+            .bind_configuration_authority(&mut store, &authority)
+            .expect("bind");
         store
             .apply(
                 &authority,
@@ -1284,9 +1586,12 @@ mod tests {
     #[test]
     fn rotation_rejects_stale_and_incompatible_requests_without_database_changes() {
         let mut connection = Connection::open_in_memory().expect("database");
+        let host = host_authority(&mut connection);
         let mut store = new_store(&mut connection);
         let old_authority = authority_for(&store, 1, 1);
-        store.bind_authority(&old_authority).expect("bind");
+        host
+            .bind_configuration_authority(&mut store, &old_authority)
+            .expect("bind");
         store
             .apply(
                 &old_authority,
@@ -1295,9 +1600,30 @@ mod tests {
             )
             .expect("baseline");
 
+        drop(store);
+        let mut core = SqliteCoreStore::new(&mut connection).expect("core schema");
+        let descriptor_digest = Sha256Digest::compute(b"descriptor").to_canonical_string();
+        let manifest_digest = Sha256Digest::compute(b"manifest").to_canonical_string();
+        let graph_digest = Sha256Digest::compute(b"graph-v1").to_canonical_string();
+        core.install_host_capability_grant(
+            &host,
+            "org.example.extension",
+            "module-one",
+            2,
+            1,
+            &descriptor_digest,
+            1,
+            &manifest_digest,
+            1,
+            &graph_digest,
+            &["host.block.get"],
+        )
+        .expect("fresh Host capability grant");
+        drop(core);
+        let mut store = new_store(&mut connection);
         let fresh_authority = authority_for(&store, 2, 2);
-        store
-            .rotate_authority(&old_authority, &fresh_authority)
+        host
+            .rotate_configuration_authority(&mut store, &old_authority, &fresh_authority)
             .expect("rotate");
         let proposed = ConfigurationTransaction::new(
             "proposal-n",

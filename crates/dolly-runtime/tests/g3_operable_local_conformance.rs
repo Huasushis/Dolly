@@ -683,28 +683,46 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
     assert_eq!(before_core.pages, after_core.pages);
     assert_eq!(before_core.blocks, after_core.blocks);
     assert_operational_fences(&dispatch, &operational);
-    let (old_config_authority, baseline_receipt) = {
+    let base_configuration = {
+        let configuration =
+            ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
+        configuration.current().expect("initial configuration")
+    };
+    let old_config_authority = {
+        let host_store =
+            SqliteCoreStore::new(&mut dispatch.connection).expect("current Host state");
+        operational
+            .configuration_transaction_authority(&base_configuration, &host_store)
+            .expect("live Host configuration authority")
+    };
+    let old_host_authority = {
+        let host_store =
+            SqliteCoreStore::new(&mut dispatch.connection).expect("current Host state");
+        host_store
+            .authenticated_host_connection()
+            .expect("current Host authority")
+    };
+    let baseline_receipt = {
         let mut configuration =
             ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
-        let base = configuration.current().expect("initial configuration");
-        let authority = operational
-            .configuration_transaction_authority(&base)
-            .expect("live Host configuration authority");
-        configuration
-            .bind_authority(&authority)
+        old_host_authority
+            .bind_configuration_authority(&mut configuration, &old_config_authority)
             .expect("initial configuration authority");
         let baseline = ConfigurationTransaction::new(
             "g3-config-baseline",
-            Some(base.revision()),
+            Some(base_configuration.revision()),
             json!({"mode": "base"}),
         )
         .expect("baseline configuration request");
         let receipt = configuration
-            .apply(&authority, &baseline)
+            .apply(&old_config_authority, &baseline)
             .expect("baseline configuration commit");
         assert_eq!(receipt.disposition(), ConfigurationDisposition::Committed);
-        assert_eq!(receipt.authority_digest(), authority.authority_digest());
-        (authority, receipt)
+        assert_eq!(
+            receipt.authority_digest(),
+            old_config_authority.authority_digest()
+        );
+        receipt
     };
     let fence = dispatch.premise.fence();
     let connection_id = fence.extension_connection_id();
@@ -890,6 +908,19 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
         Err(dolly_extension_host::ExternalIoError::Stopped)
             | Err(dolly_extension_host::ExternalIoError::StaleGeneration)
     ));
+    let stopped_config_base = {
+        let configuration =
+            ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
+        configuration.current().expect("configuration after stop")
+    };
+    let stopped_host_store =
+        SqliteCoreStore::new(&mut dispatch.connection).expect("Host state after stop");
+    assert!(
+        operational
+            .configuration_transaction_authority(&stopped_config_base, &stopped_host_store)
+            .is_err(),
+        "stopped lifecycle cannot issue configuration authority"
+    );
 
     let effect_executions = std::cell::Cell::new(0);
     let stopped_result = stopped_permit.execute(|_| {
@@ -972,23 +1003,91 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
         .expect("fresh G2 owner must bind")
     };
     assert_operational_fences(&fresh_dispatch, &fresh_operational);
-    let fresh_config_authority = {
-        let mut configuration =
+    let fresh_base_configuration = {
+        let configuration =
             ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
-        let base = configuration.current().expect("current configuration");
+        configuration.current().expect("current configuration")
+    };
+    let fresh_config_authority = {
+        let host_store =
+            SqliteCoreStore::new(&mut fresh_dispatch.connection).expect("fresh Host state");
         let authority = fresh_operational
-            .configuration_transaction_authority(&base)
+            .configuration_transaction_authority(&fresh_base_configuration, &host_store)
             .expect("fresh Host configuration authority");
         assert_ne!(
             authority.authority_digest(),
             old_config_authority.authority_digest(),
             "restart must rotate configuration authority"
         );
-        configuration
-            .rotate_authority(&old_config_authority, &authority)
-            .expect("fresh lifecycle must rotate configuration authority");
         authority
     };
+    {
+        let mut host_store =
+            SqliteCoreStore::new(&mut dispatch.connection).expect("current Host state");
+        let module_id = fresh_dispatch.premise.identity().module_id();
+        host_store
+            .install_host_capability_grant(
+                &old_host_authority,
+                "org.example.extension",
+                module_id,
+                fresh_dispatch.premise.fence().extension_generation(),
+                fresh_dispatch.manifest["descriptor_revision"]
+                    .as_i64()
+                    .expect("descriptor revision"),
+                &canonical_digest(&descriptor(module_id)),
+                fresh_dispatch.manifest["config_revision"]
+                    .as_i64()
+                    .expect("manifest revision"),
+                fresh_dispatch.manifest["manifest_digest"]
+                    .as_str()
+                    .expect("manifest digest"),
+                fresh_dispatch.manifest["graph_revision"]
+                    .as_i64()
+                    .expect("graph revision"),
+                &canonical_digest(&graph_snapshot(module_id)),
+                &["host.block.get"],
+            )
+            .expect("fresh Host capability grant");
+    }
+    let current_host_authority = {
+        let host_store =
+            SqliteCoreStore::new(&mut dispatch.connection).expect("current Host state");
+        host_store
+            .authenticated_host_connection()
+            .expect("current Host authority")
+    };
+    {
+        let mut configuration =
+            ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
+        current_host_authority
+            .rotate_configuration_authority(
+                &mut configuration,
+                &old_config_authority,
+                &fresh_config_authority,
+            )
+            .expect("fresh lifecycle must rotate configuration authority");
+    }
+    let mut fresh_configuration_connection =
+        Connection::open_in_memory().expect("fresh configuration database");
+    let mut fresh_configuration =
+        ConfigurationStore::new(&mut fresh_configuration_connection)
+            .expect("fresh configuration schema");
+    assert!(
+        current_host_authority
+            .bind_configuration_authority(&mut fresh_configuration, &old_config_authority)
+            .is_err(),
+        "a public consumer cannot bootstrap an empty ledger without durable Host state"
+    );
+    assert!(
+        current_host_authority
+            .rotate_configuration_authority(
+                &mut fresh_configuration,
+                &old_config_authority,
+                &fresh_config_authority,
+            )
+            .is_err(),
+        "a public consumer cannot mint a rotation on a fresh ledger"
+    );
     let stale_configuration = ConfigurationTransaction::new(
         "g3-config-stale",
         Some(baseline_receipt.revision()),

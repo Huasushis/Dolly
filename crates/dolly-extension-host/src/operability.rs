@@ -12,7 +12,9 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use dolly_core_domain::ExtensionId;
-use dolly_storage::{ConfigurationSnapshot, ConfigurationTransactionAuthority};
+use dolly_storage::{
+    ConfigurationSnapshot, ConfigurationTransactionAuthority, SqliteCoreStore,
+};
 
 use dolly_worker::daemon::{DaemonError, DaemonLifecycleToken, InFlightWork};
 
@@ -91,6 +93,7 @@ impl OperationalPremise {
     pub fn configuration_transaction_authority(
         &self,
         base: &ConfigurationSnapshot,
+        store: &SqliteCoreStore<'_>,
     ) -> Result<ConfigurationTransactionAuthority, ExternalIoError> {
         let lifecycle = self
             .lifecycle
@@ -98,22 +101,26 @@ impl OperationalPremise {
             .ok_or(ExternalIoError::StaleGeneration)?;
         lifecycle.check().map_err(map_lifecycle_error)?;
         let extension_id = self.extension_id().ok_or(ExternalIoError::Unauthorized)?;
-        ConfigurationTransactionAuthority::new(
-            extension_id,
-            self.module_id(),
-            self.invocation.extension_connection_id(),
-            self.invocation.incarnation_revision(),
-            self.invocation.worker_epoch().clone(),
-            self.invocation.worker_epoch_fence(),
-            lifecycle.generation().value(),
-            self.extension_generation(),
-            base.revision(),
-            base.digest().clone(),
-            self.invocation.manifest().graph_revision.value(),
-            self.invocation.graph_digest().clone(),
-            self.invocation.extension_connection_id(),
-        )
-        .map_err(|_| ExternalIoError::StaleGeneration)
+        let policy = self
+            .invocation
+            .capability_policy
+            .as_ref()
+            .ok_or(ExternalIoError::Unauthorized)?;
+        let host = store
+            .authenticated_host_connection()
+            .map_err(|_| ExternalIoError::Unauthorized)?;
+        let grant = store
+            .verify_host_capability_grant(
+                &host,
+                extension_id,
+                self.module_id(),
+                policy.grant_revision,
+                &policy.grant_digest,
+            )
+            .map_err(|_| ExternalIoError::Unauthorized)?
+            .ok_or(ExternalIoError::Unauthorized)?;
+        host.issue_configuration_transaction_authority(store, &grant, base)
+            .map_err(|_| ExternalIoError::StaleGeneration)
     }
 }
 
