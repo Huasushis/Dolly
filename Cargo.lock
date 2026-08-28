@@ -186,6 +186,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "dolly-extension-host"
+version = "0.1.0"
+dependencies = [
+ "dolly-canonical-json",
+ "dolly-core-domain",
+ "dolly-core-reducer",
+ "dolly-protocol",
+ "dolly-runtime",
+ "dolly-schema",
+ "dolly-storage",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "dolly-protocol"
 version = "0.1.0"
 dependencies = [

@@ -8,6 +8,7 @@ members = [
     "crates/dolly-protocol",
     "crates/dolly-storage",
     "crates/dolly-runtime",
+    "crates/dolly-extension-host",
     "crates/dolly-tool-broker",
     "crates/dolly-tool-coordinator",
     "crates/dolly-worker",
