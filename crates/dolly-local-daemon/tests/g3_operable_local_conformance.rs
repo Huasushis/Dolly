@@ -603,6 +603,57 @@ fn g3_operable_local_001_uses_production_daemon_process_and_durable_g2_result() 
         &database_path,
     );
 
+    let mut cross_generation = control_request(&prepared, generation.value());
+    cross_generation.extension_generation = prepared.extension_generation + 1;
+    assert_rejected_without_mutation(
+        &endpoint_path,
+        &cross_generation,
+        &after_operation,
+        "request_fence_mismatch",
+        &database_path,
+    );
+
+    let mut wrong_revision = control_request(&prepared, generation.value());
+    wrong_revision.manifest["config_revision"] = json!(2);
+    assert_rejected_without_mutation(
+        &endpoint_path,
+        &wrong_revision,
+        &after_operation,
+        "request_fence_mismatch",
+        &database_path,
+    );
+
+    let mut wrong_digest = control_request(&prepared, generation.value());
+    wrong_digest.manifest["manifest_digest"] =
+        json!("sha256:9999999999999999999999999999999999999999999999999999999999999999");
+    assert_rejected_without_mutation(
+        &endpoint_path,
+        &wrong_digest,
+        &after_operation,
+        "request_fence_mismatch",
+        &database_path,
+    );
+
+    let mut post_controls =
+        Connection::open(&database_path).expect("durable SQLite after controls");
+    let post_store = SqliteCoreStore::new(&mut post_controls).expect("core schema after controls");
+    let post_snapshot = post_store
+        .snapshot()
+        .expect("durable snapshot after controls");
+    assert_eq!(
+        post_snapshot
+            .journal
+            .iter()
+            .filter(|event| event.command_id == "dolly-local-daemon-dispatch")
+            .count(),
+        1,
+        "valid dispatch must execute exactly once; rejected controls consume no dispatch"
+    );
+    assert_eq!(
+        post_snapshot.activations[&prepared.activation_id].state,
+        dolly_core_reducer::ActivationState::Dispatched
+    );
+
     supervisor.stop().expect("production daemon stop");
     assert!(!guard.is_usable());
     assert!(matches!(

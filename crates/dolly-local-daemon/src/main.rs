@@ -296,10 +296,78 @@ fn process_request(
     {
         return ControlResponse::rejected("request_fence_mismatch");
     }
+    if validate_request_against_grant(connection, launch, &request).is_err() {
+        return ControlResponse::rejected("request_fence_mismatch");
+    }
     match perform_activation(connection, launch, request) {
         Ok(response) => response,
         Err(_) => ControlResponse::rejected("activation_rejected"),
     }
+}
+
+/// Validate every request-controlled field that `admit_operational_activation`
+/// checks against the exact current durable Host grant and authenticated Host
+/// authority, before any Runtime or storage mutation commits. This guarantees
+/// that no later admission failure can follow tentative durable writes: the
+/// post-commit admission is deterministic over the same grant, authority,
+/// immutable graph, and the just-committed transitions, so its failure is
+/// unreachable once this pass succeeds.
+fn validate_request_against_grant(
+    connection: &mut Connection,
+    launch: &LaunchConfiguration,
+    request: &ControlRequest,
+) -> Result<(), ()> {
+    let (authority, grant, snapshot) = {
+        let store = SqliteCoreStore::new(connection).map_err(|_| ())?;
+        let authority = store.authenticated_host_connection().map_err(|_| ())?;
+        let grant = store
+            .current_host_capability_grant(&authority, &launch.extension_id, &request.module_id)
+            .map_err(|_| ())?
+            .ok_or(())?;
+        let snapshot = store.snapshot().map_err(|_| ())?;
+        (authority, grant, snapshot)
+    };
+    if request.extension_generation != grant.extension_generation()
+        || u64::try_from(request.extension_generation).ok() != Some(launch.generation)
+        || request.module_id != grant.module_id()
+        || launch.control_channel_id != grant.extension_connection_id()
+        || launch.worker_epoch != grant.worker_epoch()
+        || launch.worker_epoch_fence != grant.worker_epoch_fence()
+        || launch.incarnation_revision != grant.incarnation_revision()
+    {
+        return Err(());
+    }
+    if authority.extension_connection_id() != launch.control_channel_id
+        || authority.worker_epoch_fence() != launch.worker_epoch_fence
+        || authority.incarnation_revision() != launch.incarnation_revision
+    {
+        return Err(());
+    }
+    let manifest = &request.manifest;
+    if manifest.get("descriptor_revision").and_then(Value::as_i64)
+        != Some(grant.descriptor_revision())
+        || manifest.get("config_revision").and_then(Value::as_i64)
+            != Some(grant.manifest_revision())
+        || manifest.get("graph_revision").and_then(Value::as_i64) != Some(grant.graph_revision())
+        || manifest.get("manifest_digest").and_then(Value::as_str) != Some(grant.manifest_digest())
+    {
+        return Err(());
+    }
+    let graph_digest = snapshot.graph.get("digest").and_then(Value::as_str);
+    let descriptor_digest = snapshot
+        .graph
+        .get("graph")
+        .and_then(|graph| graph.get("descriptors"))
+        .and_then(Value::as_object)
+        .and_then(|descriptors| descriptors.get(&request.module_id))
+        .and_then(|entry| entry.get("source_descriptor_digest"))
+        .and_then(Value::as_str);
+    if graph_digest != Some(grant.graph_digest())
+        || descriptor_digest != Some(grant.descriptor_digest())
+    {
+        return Err(());
+    }
+    Ok(())
 }
 
 fn perform_activation(
