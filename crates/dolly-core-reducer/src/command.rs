@@ -140,6 +140,8 @@ pub struct IssueLeaseCommand {
     pub extension_connection_id: String,
     pub worker_epoch: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_epoch_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension_generation: Option<i64>,
@@ -150,6 +152,10 @@ pub struct DispatchLeaseCommand {
     pub activation_id: String,
     pub lease_id: String,
     pub dispatch_state: DispatchState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension_connection_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_digest: Option<String>,
 }

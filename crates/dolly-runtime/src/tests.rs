@@ -11,9 +11,20 @@ use serde_json::{Value, json};
 
 const SHA_ZERO: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 const ACTIVATION_ID: &str = "0198ab31-6c44-7e8a-b2bb-000000000004";
+const SECOND_ACTIVATION_ID: &str = "0198ab31-6c44-7e8a-b2bb-000000000005";
+const REQUEST_ID: &str = "rpc-runtime-001";
 
 fn digest(value: &Value) -> String {
     canonicalize(value).unwrap().1.to_canonical_string()
+}
+fn runtime_config(request_id: &str) -> Value {
+    json!({
+        "model":"test",
+        "extension_connection_id":"connection-1",
+        "request_id":request_id,
+        "worker_epoch":"0198ab31-6c44-7e8a-b2bb-000000000010",
+        "worker_epoch_fence":1
+    })
 }
 
 fn descriptor(module_id: &str, revision: i64) -> Value {
@@ -144,12 +155,7 @@ fn environment() -> EnvironmentInput {
 fn setup() -> (Connection, Value) {
     let mut connection = Connection::open_in_memory().unwrap();
     let graph_value = graph();
-    let config = json!({
-        "model":"test",
-        "extension_connection_id":"connection-1",
-        "worker_epoch":"0198ab31-6c44-7e8a-b2bb-000000000010",
-        "worker_epoch_fence":1
-    });
+    let config = runtime_config(REQUEST_ID);
     let input = environment();
     {
         let mut store = SqliteCoreStore::new(&mut connection).unwrap();
@@ -190,14 +196,17 @@ fn build_command(manifest: Value, activation_id: &str, command_id: &str) -> Buil
     }
 }
 
+fn lease_command_for(
+    activation_id: &str,
+    command_id: &str,
+    lease_id: &str,
+    token_digest: &str,
+) -> LeaseRequest {
+    LeaseRequest::new(command_id, activation_id, lease_id, token_digest, Some(7))
+}
+
 fn lease_command(command_id: &str, lease_id: &str, token_digest: &str) -> LeaseRequest {
-    LeaseRequest::new(
-        command_id,
-        ACTIVATION_ID,
-        lease_id,
-        token_digest,
-        Some(7),
-    )
+    lease_command_for(ACTIVATION_ID, command_id, lease_id, token_digest)
 }
 
 #[test]
@@ -278,6 +287,108 @@ fn exact_lease_replay_returns_same_premise_and_changed_fence_is_rejected() {
 }
 
 #[test]
+fn duplicate_request_identity_is_rejected_before_dispatch() {
+    let (mut connection, first_manifest) = setup();
+    let second_manifest = manifest(
+        "receiver",
+        &runtime_config(REQUEST_ID),
+        SECOND_ACTIVATION_ID,
+    );
+    let input = environment();
+    let mut engine = RuntimeTransactionEngine::new(&mut connection).unwrap();
+    engine
+        .accept_manifest(
+            &build_command(first_manifest, ACTIVATION_ID, "build-duplicate-first"),
+            &input,
+        )
+        .unwrap();
+    engine
+        .accept_manifest(
+            &build_command(second_manifest, SECOND_ACTIVATION_ID, "build-duplicate-second"),
+            &input,
+        )
+        .unwrap();
+
+    engine
+        .prepare_execution(
+            &lease_command("lease-duplicate-first", "lease-duplicate-first", SHA_ZERO),
+            &input,
+        )
+        .unwrap();
+    let result = engine.prepare_execution(
+        &lease_command_for(
+            SECOND_ACTIVATION_ID,
+            "lease-duplicate-second",
+            "lease-duplicate-second",
+            SHA_ZERO,
+        ),
+        &input,
+    );
+
+    assert!(matches!(
+        result,
+        Err(RuntimeError::TransactionRejected { code })
+            if code == "DISPATCH_REQUEST_ID_CONFLICT"
+    ));
+    let state = engine.snapshot().unwrap();
+    assert_eq!(state.activations[ACTIVATION_ID].state, ActivationState::Leased);
+    assert_eq!(
+        state.activations[SECOND_ACTIVATION_ID].state,
+        ActivationState::Ready
+    );
+    assert_eq!(state.leases.len(), 1);
+    assert_eq!(
+        state.leases["lease-duplicate-first"]["request_id"],
+        REQUEST_ID
+    );
+    assert_eq!(
+        state.leases["lease-duplicate-first"]["dispatch_state"],
+        "prepared"
+    );
+}
+
+#[test]
+fn overlength_request_identity_is_rejected_before_lease() {
+    let (mut connection, manifest) = setup();
+    let input = environment();
+    {
+        let mut engine = RuntimeTransactionEngine::new(&mut connection).unwrap();
+        engine
+            .accept_manifest(
+                &build_command(manifest, ACTIVATION_ID, "build-overlength"),
+                &input,
+            )
+            .unwrap();
+    }
+
+    let request_id = "x".repeat(129);
+    let overlength_config = runtime_config(&request_id);
+    {
+        let mut store = SqliteCoreStore::new(&mut connection).unwrap();
+        let command = CoreCommand::InstallConfig(InstallConfigCommand {
+            command_id: "install-config-overlength".into(),
+            revision: 2,
+            digest: digest(&overlength_config),
+            effective_config: overlength_config,
+        });
+        assert_eq!(
+            store.transact(&command, &input).unwrap().outcome,
+            TransitionOutcome::Committed
+        );
+    }
+
+    let mut engine = RuntimeTransactionEngine::new(&mut connection).unwrap();
+    let result = engine.prepare_execution(
+        &lease_command("lease-overlength", "lease-overlength", SHA_ZERO),
+        &input,
+    );
+    assert!(matches!(result, Err(RuntimeError::DispatchInvalid { .. })));
+    let state = engine.snapshot().unwrap();
+    assert_eq!(state.activations[ACTIVATION_ID].state, ActivationState::Ready);
+    assert!(state.leases.is_empty());
+}
+
+#[test]
 fn mismatched_worker_epoch_cannot_authorize_frame() {
     let (mut connection, mut manifest) = setup();
     manifest["required_frame_bytes"] = json!(2048);
@@ -303,6 +414,7 @@ fn mismatched_worker_epoch_cannot_authorize_frame() {
     let mismatched_config = json!({
         "model":"test",
         "extension_connection_id":"connection-1",
+        "request_id":REQUEST_ID,
         "worker_epoch":"0198ab31-6c44-7e8a-b2bb-000000000099",
         "worker_epoch_fence":1
     });
@@ -324,13 +436,12 @@ fn mismatched_worker_epoch_cannot_authorize_frame() {
         &premise,
         "dispatch-mismatch",
         &lease_token,
-        "rpc-mismatch",
         &input,
     );
 
     assert!(
         result.is_err(),
-        "a mismatched caller epoch authorized a frame"
+        "a mismatched current Host WorkerEpoch authorized a frame"
     );
     assert_eq!(
         engine.snapshot().unwrap().activations[ACTIVATION_ID].state,

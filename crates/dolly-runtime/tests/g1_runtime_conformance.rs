@@ -106,6 +106,7 @@ fn install_config(store: &mut SqliteCoreStore<'_>) {
         "lease_grace_ms": 30000,
         "fencing_grace_ms": 5000,
         "extension_connection_id": "g1-extension-connection",
+        "request_id": "rpc-g1-activation-001",
         "worker_epoch": "0198ab31-6c44-7e8a-b2bb-000000000110",
         "worker_epoch_fence": 17
     });
@@ -155,6 +156,7 @@ fn manifest(
             "lease_grace_ms": 30000,
             "fencing_grace_ms": 5000,
             "extension_connection_id": "g1-extension-connection",
+            "request_id": "rpc-g1-activation-001",
             "worker_epoch": "0198ab31-6c44-7e8a-b2bb-000000000110",
             "worker_epoch_fence": 17
         },
@@ -272,6 +274,10 @@ fn g1_exec_001_valid_durable_activation_emits_exact_module_activate_premise_befo
     let premise = engine
         .prepare_execution(&issue, &graph_input())
         .expect("accepted lease transaction");
+    assert_eq!(
+        premise.fence().request_id(),
+        case["rpc_id"].as_str().unwrap()
+    );
     let leased = engine.snapshot().expect("durable lease snapshot");
     assert_eq!(
         leased.activations[activation_id].state,
@@ -286,7 +292,6 @@ fn g1_exec_001_valid_durable_activation_emits_exact_module_activate_premise_befo
             &premise,
             "g1-exec-dispatch-001",
             &lease_token,
-            case["rpc_id"].as_str().unwrap(),
             &input(),
         )
         .expect("accepted durable dispatch marker");
@@ -311,12 +316,32 @@ fn g1_exec_001_valid_durable_activation_emits_exact_module_activate_premise_befo
         started.state.leases["g1-exec-lease-id-001"]["worker_epoch_id"],
         case["worker_epoch"]
     );
+    assert_eq!(
+        started.state.leases["g1-exec-lease-id-001"]["request_id"],
+        case["rpc_id"]
+    );
+    assert_eq!(
+        started.state.leases["g1-exec-lease-id-001"]["extension_connection_id"],
+        "g1-extension-connection"
+    );
     assert_eq!(dispatched.frame_digest(), canonical_digest(&expected));
     assert_eq!(
         started.state.leases["g1-exec-lease-id-001"]["frame_digest"],
         dispatched.frame_digest()
     );
     assert!(started.reply.is_none());
+    let replayed = engine
+        .dispatch_execution(
+            &premise,
+            "g1-exec-dispatch-replay-001",
+            &lease_token,
+            &input(),
+        )
+        .expect("same request reservation must replay");
+    assert_eq!(replayed.frame_bytes(), dispatched.frame_bytes());
+    assert_eq!(replayed.frame_digest(), dispatched.frame_digest());
+    assert_eq!(replayed.transition().state, started.state);
+    assert!(replayed.transition().events.is_empty());
     let durable = engine.snapshot().unwrap();
     assert_eq!(
         durable.leases["g1-exec-lease-id-001"]["frame_digest"],
@@ -330,6 +355,14 @@ fn g1_exec_001_valid_durable_activation_emits_exact_module_activate_premise_befo
     assert_eq!(
         journal_event.details.as_ref().unwrap()["frame_digest"],
         dispatched.frame_digest()
+    );
+    assert_eq!(
+        journal_event.details.as_ref().unwrap()["request_id"],
+        case["rpc_id"]
+    );
+    assert_eq!(
+        journal_event.details.as_ref().unwrap()["extension_connection_id"],
+        "g1-extension-connection"
     );
 
     // The effect boundary is deliberately not entered by this matrix.

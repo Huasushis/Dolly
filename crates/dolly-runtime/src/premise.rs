@@ -37,6 +37,7 @@ impl ExecutionIdentity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionFence {
     lease_id: String,
+    request_id: String,
     worker_epoch: WorkerEpoch,
     worker_epoch_fence: i64,
     extension_generation: i64,
@@ -47,6 +48,7 @@ pub struct ExecutionFence {
 impl ExecutionFence {
     pub(crate) fn new(
         lease_id: String,
+        request_id: String,
         worker_epoch: WorkerEpoch,
         worker_epoch_fence: i64,
         extension_generation: i64,
@@ -55,6 +57,7 @@ impl ExecutionFence {
     ) -> Self {
         Self {
             lease_id,
+            request_id,
             worker_epoch,
             worker_epoch_fence,
             extension_generation,
@@ -66,6 +69,10 @@ impl ExecutionFence {
     /// The unique durable lease identity.
     pub fn lease_id(&self) -> &str {
         &self.lease_id
+    }
+    /// The Host-allocated JSON-RPC request identity bound to this attempt.
+    pub fn request_id(&self) -> &str {
+        &self.request_id
     }
 
     /// The canonical typed Worker incarnation bound to this attempt.

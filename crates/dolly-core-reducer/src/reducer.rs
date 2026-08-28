@@ -169,6 +169,17 @@ fn object_i64(value: &Value, key: &str) -> Option<i64> {
 fn object_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
 }
+fn valid_request_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && !value.contains('\0')
+}
+/// A request identity remains reserved from lease preparation through transport
+/// start. Existing fence completion changes the dispatch state to `fenced`.
+fn request_identity_outstanding(value: &Value) -> bool {
+    matches!(
+        object_str(value, "dispatch_state"),
+        Some("prepared" | "started" | "transport_started")
+    ) && object_str(value, "request_id").is_some()
+}
 fn same_value(left: Option<&Value>, right: Option<&Value>) -> bool {
     match (left, right) {
         (None, None) => true,
@@ -1053,6 +1064,28 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
             let Some(item) = next.activations.get(&c.activation_id) else {
                 return failure(state, "ACTIVATION_NOT_LEASABLE", false, None);
             };
+            if let Some(request_id) = c.request_id.as_deref() {
+                if !valid_request_id(request_id) || c.extension_connection_id.is_empty() {
+                    return failure(state, "DISPATCH_REQUEST_ID_INVALID", false, None);
+                }
+                if next.leases.iter().any(|(lease_id, lease)| {
+                    lease_id != &c.lease_id
+                        && request_identity_outstanding(lease)
+                        && object_str(lease, "request_id") == Some(request_id)
+                        && object_str(lease, "extension_connection_id")
+                            == Some(c.extension_connection_id.as_str())
+                }) {
+                    return failure(
+                        state,
+                        "DISPATCH_REQUEST_ID_CONFLICT",
+                        false,
+                        Some(json!({
+                            "request_id": request_id,
+                            "extension_connection_id": c.extension_connection_id,
+                        })),
+                    );
+                }
+            }
             if let Some(existing) = next.leases.get(&c.lease_id) {
                 let exact = object_str(existing, "activation_id") == Some(c.activation_id.as_str())
                     && object_str(existing, "token_digest") == Some(c.token_digest.as_str())
@@ -1143,6 +1176,9 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                 json!(c.extension_connection_id),
             );
             lease.insert("worker_epoch".into(), json!(c.worker_epoch));
+            if let Some(request_id) = c.request_id.as_deref() {
+                lease.insert("request_id".into(), json!(request_id));
+            }
             if let Some(worker_epoch_id) = c.worker_epoch_id.as_deref() {
                 lease.insert("worker_epoch_id".into(), json!(worker_epoch_id));
             }
@@ -1174,6 +1210,9 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
             let mut details = json!({"activation_id":c.activation_id,"lease_id":c.lease_id});
             if let Some(worker_epoch_id) = c.worker_epoch_id.as_deref() {
                 details["worker_epoch_id"] = json!(worker_epoch_id);
+            }
+            if let Some(request_id) = c.request_id.as_deref() {
+                details["request_id"] = json!(request_id);
             }
             events.push(append_event(
                 &mut next,
@@ -1221,6 +1260,40 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                 DispatchState::Started => "started",
                 DispatchState::TransportStarted => "transport_started",
             };
+            let request_identity = match (&c.request_id, &c.extension_connection_id) {
+                (None, None) => None,
+                (Some(request_id), Some(connection_id)) => {
+                    if !valid_request_id(request_id) || connection_id.is_empty() {
+                        return failure(state, "DISPATCH_REQUEST_ID_INVALID", false, None);
+                    }
+                    if object_str(lease, "request_id") != Some(request_id.as_str())
+                        || object_str(lease, "extension_connection_id")
+                            != Some(connection_id.as_str())
+                    {
+                        return failure(state, "DISPATCH_REQUEST_ID_CONFLICT", false, None);
+                    }
+                    Some((request_id.as_str(), connection_id.as_str()))
+                }
+                _ => return failure(state, "DISPATCH_REQUEST_ID_INVALID", false, None),
+            };
+            if let Some((request_id, connection_id)) = request_identity {
+                if next.leases.iter().any(|(lease_id, candidate)| {
+                    lease_id != &c.lease_id
+                        && request_identity_outstanding(candidate)
+                        && object_str(candidate, "request_id") == Some(request_id)
+                        && object_str(candidate, "extension_connection_id") == Some(connection_id)
+                }) {
+                    return failure(
+                        state,
+                        "DISPATCH_REQUEST_ID_CONFLICT",
+                        false,
+                        Some(json!({
+                            "request_id": request_id,
+                            "extension_connection_id": connection_id,
+                        })),
+                    );
+                }
+            }
             if rank(dispatch) < rank(object_str(lease, "dispatch_state").unwrap_or("prepared")) {
                 return failure(state, "DISPATCH_EVIDENCE_REGRESSION", false, None);
             }
@@ -1237,10 +1310,22 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                     }
                 }
             }
+            if c.dispatch_state != DispatchState::Prepared
+                && object_str(lease, "dispatch_state") == Some(dispatch)
+                && c.frame_digest.as_deref() == object_str(lease, "frame_digest")
+            {
+                return success(state.clone(), Vec::new(), None, None);
+            }
             let lease = next.leases.get_mut(&c.lease_id).unwrap().as_object_mut().unwrap();
             lease.insert("dispatch_state".into(), json!(dispatch));
             if let Some(frame_digest) = c.frame_digest.as_deref() {
                 lease.insert("frame_digest".into(), json!(frame_digest));
+            }
+            if let Some(request_id) = c.request_id.as_deref() {
+                lease.insert("request_id".into(), json!(request_id));
+            }
+            if let Some(connection_id) = c.extension_connection_id.as_deref() {
+                lease.insert("extension_connection_id".into(), json!(connection_id));
             }
             if c.dispatch_state != DispatchState::Prepared {
                 next.activations.get_mut(&c.activation_id).unwrap().state =
@@ -1249,6 +1334,12 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
             let mut details = json!({"lease_id":c.lease_id,"dispatch_state":dispatch});
             if let Some(frame_digest) = c.frame_digest.as_deref() {
                 details["frame_digest"] = json!(frame_digest);
+            }
+            if let Some(request_id) = c.request_id.as_deref() {
+                details["request_id"] = json!(request_id);
+            }
+            if let Some(connection_id) = c.extension_connection_id.as_deref() {
+                details["extension_connection_id"] = json!(connection_id);
             }
             events.push(append_event(
                 &mut next,

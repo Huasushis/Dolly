@@ -93,8 +93,9 @@ impl DispatchResult {
 
 /// The caller-owned lease identity and token hash request.
 ///
-/// Worker epoch and connection identity are intentionally absent. The
-/// Runtime obtains both from the verified durable Host connection state.
+/// Worker epoch, connection identity, and request identity are intentionally
+/// absent. The Runtime obtains them from verified durable Host connection
+/// state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseRequest {
     command_id: String,
@@ -129,6 +130,7 @@ impl LeaseRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HostConnectionState {
     extension_connection_id: String,
+    request_id: String,
     worker_epoch: WorkerEpoch,
     worker_epoch_fence: i64,
 }
@@ -224,6 +226,7 @@ impl<'connection> RuntimeTransactionEngine<'connection> {
             lease_id: request.lease_id.clone(),
             token_digest: request.token_digest.clone(),
             extension_connection_id: connection.extension_connection_id.clone(),
+            request_id: Some(connection.request_id.clone()),
             worker_epoch: connection.worker_epoch_fence,
             worker_epoch_id: Some(connection.worker_epoch.to_string()),
             extension_generation: request.extension_generation,
@@ -269,21 +272,20 @@ impl<'connection> RuntimeTransactionEngine<'connection> {
     /// `started`. The frame is returned only after the marker commits.
     ///
     /// `premise` must be the result of `prepare_execution`. The typed
-    /// WorkerEpoch and connection identity come from the verified current
-    /// Host state and are rechecked against the retained lease. The request ID
-    /// is allocated by the Host sender. This method never writes transport
-    /// bytes or invokes Extension code.
+    /// WorkerEpoch, connection identity, and request identity come from the
+    /// verified current Host state and are rechecked against the retained
+    /// lease. This method never writes transport bytes or invokes Extension
+    /// code.
     pub fn dispatch_execution(
         &mut self,
         premise: &ExecutionPremise,
         dispatch_command_id: &str,
         lease_token: &LeaseToken,
-        request_id: &str,
         input: &EnvironmentInput,
     ) -> RuntimeResult<DispatchResult> {
-        if dispatch_command_id.is_empty() || request_id.is_empty() {
+        if dispatch_command_id.is_empty() {
             return Err(RuntimeError::DispatchInvalid {
-                detail: "dispatch command_id and request_id are required".into(),
+                detail: "dispatch command_id is required".into(),
             });
         }
 
@@ -297,12 +299,11 @@ impl<'connection> RuntimeTransactionEngine<'connection> {
                 detail: "current Host connection no longer owns the prepared WorkerEpoch".into(),
             });
         }
-        let manifest_value =
-            retained_manifest_for_dispatch(&snapshot, premise, &connection.worker_epoch, lease_token)?;
+        let manifest_value = retained_manifest_for_dispatch(&snapshot, premise, lease_token)?;
         let (manifest, _) = validation::validate_manifest_for_replay(&manifest_value)?;
         let frame = json!({
             "jsonrpc": "2.0",
-            "id": request_id,
+            "id": premise.fence().request_id(),
             "method": "module.activate",
             "params": {
                 "worker_epoch": premise.fence().worker_epoch(),
@@ -346,16 +347,28 @@ impl<'connection> RuntimeTransactionEngine<'connection> {
                 activation_id: premise.identity().activation_id().into(),
                 lease_id: premise.fence().lease_id().into(),
                 dispatch_state: DispatchState::Started,
+                request_id: Some(premise.fence().request_id().into()),
+                extension_connection_id: Some(premise.fence().extension_connection_id().into()),
                 frame_digest: Some(frame_digest.clone()),
             }),
             input,
         )?;
         require_committed(&transition)?;
-        let committed_digest = transition
+        let committed_lease = transition
             .state
             .leases
             .get(premise.fence().lease_id())
-            .and_then(|lease| lease.get("frame_digest"))
+            .ok_or_else(|| RuntimeError::PremiseUnavailable {
+                detail: "committed dispatch lease is absent".into(),
+            })?;
+        let committed_digest = committed_lease
+            .get("frame_digest")
+            .and_then(Value::as_str);
+        let committed_request_id = committed_lease
+            .get("request_id")
+            .and_then(Value::as_str);
+        let committed_connection_id = committed_lease
+            .get("extension_connection_id")
             .and_then(Value::as_str);
         let committed_state = transition
             .state
@@ -364,9 +377,11 @@ impl<'connection> RuntimeTransactionEngine<'connection> {
             .map(|activation| activation.state);
         if committed_state != Some(ActivationState::Dispatched)
             || committed_digest != Some(frame_digest.as_str())
+            || committed_request_id != Some(premise.fence().request_id())
+            || committed_connection_id != Some(premise.fence().extension_connection_id())
         {
             return Err(RuntimeError::PremiseUnavailable {
-                detail: "committed dispatch does not retain the exact frame digest".into(),
+                detail: "committed dispatch does not retain the exact request binding".into(),
             });
         }
         Ok(DispatchResult {
@@ -392,6 +407,14 @@ fn host_connection_state(
             detail: "verified Host connection id is absent".into(),
         })?
         .to_owned();
+    let request_id = config
+        .get("request_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RuntimeError::DispatchInvalid {
+            detail: "verified Host request identity is absent".into(),
+        })?;
+    validate_request_id(request_id)?;
+    let request_id = request_id.to_owned();
     let worker_epoch = config
         .get("worker_epoch")
         .and_then(Value::as_str)
@@ -411,15 +434,24 @@ fn host_connection_state(
         })?;
     Ok(HostConnectionState {
         extension_connection_id,
+        request_id,
         worker_epoch,
         worker_epoch_fence,
     })
+}
+fn validate_request_id(value: &str) -> RuntimeResult<()> {
+    if value.is_empty() || value.len() > 128 || value.contains('\0') {
+        return Err(RuntimeError::DispatchInvalid {
+            detail: "request identity must be non-empty valid UTF-8 and at most 128 bytes"
+                .into(),
+        });
+    }
+    Ok(())
 }
 
 fn retained_manifest_for_dispatch(
     snapshot: &dolly_core_reducer::CoreSnapshot,
     premise: &ExecutionPremise,
-    worker_epoch: &WorkerEpoch,
     lease_token: &LeaseToken,
 ) -> RuntimeResult<Value> {
     let activation = snapshot
@@ -428,9 +460,12 @@ fn retained_manifest_for_dispatch(
         .ok_or_else(|| RuntimeError::PremiseUnavailable {
             detail: "dispatch Activation is absent from durable state".into(),
         })?;
-    if activation.state != ActivationState::Leased {
+    if !matches!(
+        activation.state,
+        ActivationState::Leased | ActivationState::Dispatched
+    ) {
         return Err(RuntimeError::PremiseUnavailable {
-            detail: "dispatch Activation is no longer leased".into(),
+            detail: "dispatch Activation is no longer leased or dispatched".into(),
         });
     }
     let manifest = activation
@@ -457,19 +492,23 @@ fn retained_manifest_for_dispatch(
             detail: "dispatch lease is absent from durable state".into(),
         })?;
     let token_digest = Sha256Digest::compute(lease_token.expose_bytes()).to_canonical_string();
-    let worker_epoch_id = worker_epoch.to_string();
     if lease.get("activation_id").and_then(Value::as_str)
         != Some(premise.identity().activation_id())
         || lease.get("attempt").and_then(Value::as_i64) != Some(premise.fence().attempt())
         || lease.get("worker_epoch").and_then(Value::as_i64)
             != Some(premise.fence().worker_epoch_fence())
-        || lease.get("worker_epoch_id").and_then(Value::as_str) != Some(worker_epoch_id.as_str())
+        || lease.get("worker_epoch_id").and_then(Value::as_str)
+            != Some(premise.fence().worker_epoch().to_string().as_str())
+        || lease.get("request_id").and_then(Value::as_str) != Some(premise.fence().request_id())
         || lease.get("extension_generation").and_then(Value::as_i64)
             != Some(premise.fence().extension_generation())
         || lease.get("extension_connection_id").and_then(Value::as_str)
             != Some(premise.fence().extension_connection_id())
         || lease.get("token_digest").and_then(Value::as_str) != Some(token_digest.as_str())
-        || lease.get("dispatch_state").and_then(Value::as_str) != Some("prepared")
+        || !matches!(
+            lease.get("dispatch_state").and_then(Value::as_str),
+            Some("prepared" | "started")
+        )
     {
         return Err(RuntimeError::PremiseUnavailable {
             detail: "dispatch lease fences do not match the Runtime premise".into(),
@@ -529,6 +568,13 @@ fn validate_lease_request(command: &IssueLeaseCommand) -> RuntimeResult<()> {
             detail: "worker_epoch fence must be positive".into(),
         });
     }
+    let request_id = command
+        .request_id
+        .as_deref()
+        .ok_or_else(|| RuntimeError::DispatchInvalid {
+            detail: "Host request identity is required for a Runtime lease".into(),
+        })?;
+    validate_request_id(request_id)?;
     let worker_epoch_id = command
         .worker_epoch_id
         .as_deref()
@@ -599,6 +645,8 @@ fn validate_existing_lease_or_state(
             && existing.get("worker_epoch").and_then(Value::as_i64) == Some(command.worker_epoch)
             && existing.get("worker_epoch_id").and_then(Value::as_str)
                 == command.worker_epoch_id.as_deref()
+            && existing.get("request_id").and_then(Value::as_str)
+                == command.request_id.as_deref()
             && existing.get("requested_extension_generation")
                 == Some(&json!(command.extension_generation));
         if exact {
@@ -651,6 +699,14 @@ fn build_premise(
             detail: "committed lease does not bind the retained Manifest and prepared state".into(),
         });
     }
+    let request_id = lease
+        .get("request_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RuntimeError::PremiseUnavailable {
+            detail: "committed lease has no request identity".into(),
+        })?
+        .to_owned();
+    validate_request_id(&request_id)?;
     let worker_epoch_fence = lease
         .get("worker_epoch")
         .and_then(Value::as_i64)
@@ -683,6 +739,7 @@ fn build_premise(
         || worker_epoch_fence != command.worker_epoch
         || command.worker_epoch_id.as_deref() != Some(worker_epoch.to_string().as_str())
         || extension_generation != command.extension_generation.unwrap_or_default()
+        || command.request_id.as_deref() != Some(request_id.as_str())
     {
         return Err(RuntimeError::GenerationInvalid {
             detail: "committed lease fence disagrees with the request".into(),
@@ -701,6 +758,7 @@ fn build_premise(
         ),
         ExecutionFence::new(
             command.lease_id.clone(),
+            request_id,
             worker_epoch,
             worker_epoch_fence,
             extension_generation,
