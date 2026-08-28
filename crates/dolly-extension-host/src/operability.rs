@@ -10,7 +10,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::hash::Hash;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use dolly_canonical_json::{Sha256Digest, canonicalize};
 use dolly_core_domain::{ExtensionId, WorkerEpoch};
@@ -25,12 +25,67 @@ use dolly_worker::daemon::{DaemonError, DaemonLifecycleToken, InFlightWork};
 use crate::FencedInvocationPremise;
 use crate::SecretRef;
 
+#[derive(Debug)]
+struct ConfigurationRevisionState {
+    current_revision: RwLock<Option<u64>>,
+}
+
+impl ConfigurationRevisionState {
+    fn new() -> Self {
+        Self {
+            current_revision: RwLock::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_revision(revision: u64) -> Self {
+        Self {
+            current_revision: RwLock::new(Some(revision)),
+        }
+    }
+
+    fn read_current_revision(&self) -> Result<u64, ExternalIoError> {
+        let current = self
+            .current_revision
+            .read()
+            .map_err(|_| ExternalIoError::AuthorityUnavailable)?;
+        current
+            .as_ref()
+            .copied()
+            .ok_or(ExternalIoError::AuthorityUnavailable)
+    }
+
+    fn read_for(
+        &self,
+        expected_revision: u64,
+    ) -> Result<RwLockReadGuard<'_, Option<u64>>, ExternalIoError> {
+        let current = self
+            .current_revision
+            .read()
+            .map_err(|_| ExternalIoError::AuthorityUnavailable)?;
+        match *current {
+            Some(actual_revision) if actual_revision == expected_revision => Ok(current),
+            Some(_) => Err(ExternalIoError::StaleGeneration),
+            None => Err(ExternalIoError::AuthorityUnavailable),
+        }
+    }
+
+    fn write_current(
+        &self,
+    ) -> Result<RwLockWriteGuard<'_, Option<u64>>, ConfigurationError> {
+        self.current_revision
+            .write()
+            .map_err(|_| ConfigurationError::AuthorityUnavailable)
+    }
+}
+
 /// Opaque configuration authority issued only from a live operational premise.
 /// It retains the daemon lifecycle token so stop and restart invalidate it.
 pub struct ConfigurationTransactionAuthority {
     authority_digest: Sha256Digest,
     authority_jcs: Vec<u8>,
     lifecycle: Option<DaemonLifecycleToken>,
+    configuration_revision: Arc<ConfigurationRevisionState>,
 }
 
 impl ConfigurationTransactionAuthority {
@@ -41,6 +96,7 @@ impl ConfigurationTransactionAuthority {
         grant: &HostCapabilityGrant,
         base: &ConfigurationSnapshot,
         lifecycle: &DaemonLifecycleToken,
+        configuration_revision: Arc<ConfigurationRevisionState>,
     ) -> Result<Self, ExternalIoError> {
         lifecycle.check().map_err(map_lifecycle_error)?;
         let lifecycle_generation = lifecycle.generation().value();
@@ -90,6 +146,7 @@ impl ConfigurationTransactionAuthority {
             authority_digest,
             authority_jcs: authority_bytes.into_vec(),
             lifecycle: Some(lifecycle.clone()),
+            configuration_revision,
         })
     }
 
@@ -116,6 +173,11 @@ impl ConfigurationTransactionAuthority {
                 }
             }
         }
+    }
+    pub(crate) fn write_current_configuration_revision(
+        &self,
+    ) -> Result<RwLockWriteGuard<'_, Option<u64>>, ConfigurationError> {
+        self.configuration_revision.write_current()
     }
 
     #[cfg(test)]
@@ -156,6 +218,9 @@ impl ConfigurationTransactionAuthority {
             authority_digest,
             authority_jcs: authority_bytes.into_vec(),
             lifecycle: None,
+            configuration_revision: Arc::new(ConfigurationRevisionState::with_revision(
+                base_config_revision,
+            )),
         })
     }
 }
@@ -192,6 +257,7 @@ struct SecretOwner {
     extension_generation: i64,
     config_revision: u64,
     lifecycle: Option<DaemonLifecycleToken>,
+    configuration_revision: Arc<ConfigurationRevisionState>,
 }
 
 impl SecretOwner {
@@ -226,6 +292,7 @@ impl SecretOwner {
             extension_generation: premise.extension_generation(),
             config_revision: premise.config_revision(),
             lifecycle: Some(lifecycle.clone()),
+            configuration_revision: Arc::clone(&premise.configuration_revision),
         })
     }
 
@@ -249,6 +316,9 @@ impl SecretOwner {
             extension_generation,
             config_revision,
             lifecycle: None,
+            configuration_revision: Arc::new(ConfigurationRevisionState::with_revision(
+                config_revision,
+            )),
         }
     }
 
@@ -314,6 +384,7 @@ impl std::hash::Hash for SecretOwner {
 pub struct OperationalPremise {
     invocation: FencedInvocationPremise,
     lifecycle: Option<DaemonLifecycleToken>,
+    configuration_revision: Arc<ConfigurationRevisionState>,
 }
 
 impl OperationalPremise {
@@ -321,6 +392,7 @@ impl OperationalPremise {
         Self {
             invocation,
             lifecycle: None,
+            configuration_revision: Arc::new(ConfigurationRevisionState::new()),
         }
     }
     pub(crate) fn bind_lifecycle(
@@ -418,6 +490,7 @@ impl OperationalPremise {
             &grant,
             base,
             lifecycle,
+            Arc::clone(&self.configuration_revision),
         )
     }
 
@@ -881,6 +954,7 @@ pub struct HostExternalIoAuthority {
     owner: SecretOwner,
     policy: Arc<ExternalIoPolicy>,
     secrets: HostSecretAuthority,
+    configuration_revision: u64,
     gate: Arc<AuthorityGate>,
 }
 
@@ -907,11 +981,13 @@ impl HostExternalIoAuthority {
         {
             return Err(ExternalIoError::Unauthorized);
         }
+        let configuration_revision = owner.configuration_revision.read_current_revision()?;
         let generation = policy.extension_generation();
         Ok(Self {
             owner,
             policy: Arc::new(policy),
             secrets,
+            configuration_revision,
             gate: Arc::new(AuthorityGate::new(generation)),
         })
     }
@@ -948,6 +1024,10 @@ impl HostExternalIoAuthority {
         if owner != &self.owner {
             return Err(ExternalIoError::StaleGeneration);
         }
+        let _configuration_revision = self
+            .owner
+            .configuration_revision
+            .read_for(self.configuration_revision)?;
         self.owner
             .check_live()
             .map_err(|_| ExternalIoError::StaleGeneration)?;
@@ -1074,6 +1154,10 @@ impl HostExternalIoAuthority {
                 return Err(ExternalIoError::StaleGeneration);
             }
         }
+        let _configuration_revision = self
+            .owner
+            .configuration_revision
+            .read_for(self.configuration_revision)?;
         let gate = self
             .gate
             .state
@@ -1205,6 +1289,12 @@ impl ExternalIoPermit {
                 .check()
                 .map_err(|error| ExternalIoExecutionError::Denied(map_lifecycle_error(error)))?;
         }
+        let _configuration_revision = self
+            .authority
+            .owner
+            .configuration_revision
+            .read_for(self.authority.configuration_revision)
+            .map_err(ExternalIoExecutionError::Denied)?;
         let _authority_in_flight = self
             .authority
             .begin_in_flight(self.generation)
@@ -1307,6 +1397,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::{Arc, Barrier, Mutex, mpsc};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use std::time::Duration;
 
@@ -1314,6 +1405,7 @@ mod tests {
         entered: Arc<Barrier>,
         release: Arc<Barrier>,
         values: Mutex<HashMap<(SecretOwner, SecretRef), Vec<u8>>>,
+        resolve_calls: Arc<AtomicUsize>,
     }
 
     impl BlockingSecretProvider {
@@ -1322,6 +1414,7 @@ mod tests {
                 entered,
                 release,
                 values: Mutex::new(HashMap::new()),
+                resolve_calls: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -1330,6 +1423,16 @@ mod tests {
                 .lock()
                 .ok()
                 .and_then(|values| values.get(&(owner.clone(), reference.clone())).cloned())
+        }
+        fn insert(&self, owner: &SecretOwner, reference: SecretRef, bytes: &[u8]) {
+            self.values
+                .lock()
+                .expect("provider values")
+                .insert((owner.clone(), reference), bytes.to_vec());
+        }
+
+        fn resolve_count(&self) -> usize {
+            self.resolve_calls.load(Ordering::SeqCst)
         }
     }
 
@@ -1352,6 +1455,7 @@ mod tests {
             owner: &SecretOwner,
             reference: &SecretRef,
         ) -> Result<SecretMaterial, SecretError> {
+            self.resolve_calls.fetch_add(1, Ordering::SeqCst);
             let values = self.values.lock().map_err(|_| SecretError::Unavailable)?;
             values
                 .get(&(owner.clone(), reference.clone()))
@@ -1472,6 +1576,128 @@ mod tests {
         );
     }
 
+    #[test]
+    fn configuration_revision_write_waits_for_external_effect() {
+        let reference: SecretRef = "secret://vault/revision-race".parse().unwrap();
+        let owner = SecretOwner::for_test(
+            "org.example.extension",
+            "module-one",
+            "connection-one",
+            1,
+            4,
+        );
+        let provider = Arc::new(InMemorySecretProvider::default());
+        provider.insert(&owner, reference.clone(), b"revision-secret");
+        let target = ExternalTarget::new("https", "api.example.test", 443, "/v1/data").unwrap();
+        let mut policy = ExternalIoPolicy::new("org.example.extension", 1, 4).unwrap();
+        policy.allow_operation("read").unwrap();
+        policy.allow_target(target.clone());
+        let authority =
+            HostExternalIoAuthority::from_test(policy, HostSecretAuthority::new(provider));
+        let request =
+            ExternalIoRequest::new("org.example.extension", "read", target, Some(reference))
+                .unwrap();
+        let permit = authority
+            .authorize_claims(Some("org.example.extension"), 1, 4, request.clone())
+            .expect("current revision must authorize");
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let execute_entered = Arc::clone(&entered);
+        let execute_release = Arc::clone(&release);
+        let effect_calls = Arc::new(AtomicUsize::new(0));
+        let execute_calls = Arc::clone(&effect_calls);
+        let execute = thread::spawn(move || {
+            permit.execute(|_| {
+                execute_calls.fetch_add(1, Ordering::SeqCst);
+                execute_entered.wait();
+                execute_release.wait();
+                Ok::<_, ()>(())
+            })
+        });
+        entered.wait();
+
+        let revision_source = Arc::clone(&authority.owner.configuration_revision);
+        let (writer_started_sender, writer_started_receiver) = mpsc::channel();
+        let writer_source = Arc::clone(&revision_source);
+        let writer = thread::spawn(move || {
+            writer_started_sender.send(()).expect("configuration commit start");
+            let mut current = writer_source
+                .current_revision
+                .write()
+                .expect("configuration revision");
+            *current = Some(2);
+        });
+        writer_started_receiver
+            .recv()
+            .expect("configuration commit thread");
+        assert!(matches!(
+            revision_source.current_revision.try_write(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+
+        release.wait();
+        assert!(execute.join().expect("effect thread").is_ok());
+        writer.join().expect("configuration commit thread");
+        assert_eq!(effect_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            authority.authorize_claims(Some("org.example.extension"), 1, 4, request),
+            Err(ExternalIoError::StaleGeneration)
+        ));
+    }
+
+
+    #[test]
+    fn stale_configuration_denies_before_secret_resolution() {
+        let owner = SecretOwner::for_test(
+            "org.example.extension",
+            "module-one",
+            "connection-one",
+            1,
+            4,
+        );
+        let reference: SecretRef = "secret://vault/stale".parse().unwrap();
+        let provider = Arc::new(BlockingSecretProvider::new(
+            Arc::new(Barrier::new(1)),
+            Arc::new(Barrier::new(1)),
+        ));
+        provider.insert(&owner, reference.clone(), b"stale-secret");
+        let target = ExternalTarget::new("https", "api.example.test", 443, "/v1/data").unwrap();
+        let mut policy = ExternalIoPolicy::new("org.example.extension", 1, 4).unwrap();
+        policy.allow_operation("read").unwrap();
+        policy.allow_target(target.clone());
+        let authority =
+            HostExternalIoAuthority::from_test(policy, HostSecretAuthority::new(provider.clone()));
+        let request =
+            ExternalIoRequest::new("org.example.extension", "read", target, Some(reference))
+                .unwrap();
+        let permit = authority
+            .authorize_claims(Some("org.example.extension"), 1, 4, request.clone())
+            .expect("current configuration must authorize");
+        *authority
+            .owner
+            .configuration_revision
+            .current_revision
+            .write()
+            .expect("configuration revision") = Some(2);
+
+        assert!(matches!(
+            authority.authorize_claims(Some("org.example.extension"), 1, 4, request),
+            Err(ExternalIoError::StaleGeneration)
+        ));
+        let effect_calls = AtomicUsize::new(0);
+        let result = permit.execute(|_| {
+            effect_calls.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, ()>(())
+        });
+        assert!(matches!(
+            result,
+            Err(ExternalIoExecutionError::Denied(
+                ExternalIoError::StaleGeneration
+            ))
+        ));
+        assert_eq!(effect_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.resolve_count(), 0);
+    }
     #[test]
     fn stopped_authority_rejects_old_permit_without_effect() {
         let reference: SecretRef = "secret://vault/api".parse().unwrap();

@@ -923,6 +923,51 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
     let restarted_permit = authority
         .authorize(&operational, request.clone())
         .expect("live premise must authorize a second one-shot permit");
+    let revoked_permit = authority
+        .authorize(&operational, request.clone())
+        .expect("live premise must issue the revocation control permit");
+    let revocation_request = ConfigurationTransaction::new(
+        "g3-config-revocation",
+        Some(baseline_receipt.revision()),
+        json!({
+            "mode": "revoked",
+            "external_targets": [],
+            "credentials": []
+        }),
+    )
+    .expect("configuration revocation request");
+    let revocation_receipt = {
+        let mut configuration =
+            ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
+        configuration
+            .apply(&old_config_authority, &revocation_request)
+            .expect("configuration revocation must commit")
+    };
+    assert_eq!(
+        revocation_receipt.revision(),
+        baseline_receipt.revision() + 1
+    );
+    assert!(matches!(
+        authority.authorize(&operational, request.clone()),
+        Err(dolly_extension_host::ExternalIoError::StaleGeneration)
+    ));
+    assert!(matches!(
+        authority.provision_secret(&operational, secret_reference.clone(), b"revoked-secret"),
+        Err(dolly_extension_host::ExternalIoError::StaleGeneration)
+    ));
+    let revoked_effects = std::cell::Cell::new(0);
+    let revoked_result = revoked_permit.execute(|_| {
+        revoked_effects.set(revoked_effects.get() + 1);
+        Ok::<_, ()>(())
+    });
+    assert!(matches!(
+        revoked_result,
+        Err(dolly_extension_host::ExternalIoExecutionError::Denied(
+            dolly_extension_host::ExternalIoError::StaleGeneration
+        ))
+    ));
+    assert_eq!(revoked_effects.get(), 0);
+
     let escaped_premise = operational.clone();
 
     supervisor.stop().expect("stop authenticated child");
@@ -1197,7 +1242,7 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
     );
     let fresh_configuration = ConfigurationTransaction::new(
         "g3-config-fresh",
-        Some(baseline_receipt.revision()),
+        Some(fresh_base_configuration.revision()),
         json!({"mode": "fresh"}),
     )
     .expect("fresh configuration request");
@@ -1251,7 +1296,11 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
         "changed replay identity must not mutate durable state"
     );
     let incompatible_rollback =
-        ConfigurationTransaction::rollback("g3-config-incompatible-rollback", Some(2), 1)
+        ConfigurationTransaction::rollback(
+            "g3-config-incompatible-rollback",
+            Some(fresh_configuration_receipt.revision()),
+            1,
+        )
             .expect("incompatible rollback request");
     {
         let mut configuration =

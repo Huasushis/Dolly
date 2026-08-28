@@ -634,6 +634,7 @@ impl<'connection> ConfigurationStore<'connection> {
         authority: &ConfigurationTransactionAuthority,
     ) -> Result<(), ConfigurationError> {
         authority.check_live()?;
+        let mut current_revision = authority.write_current_configuration_revision()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -645,10 +646,12 @@ impl<'connection> ConfigurationStore<'connection> {
                 return Err(ConfigurationError::AuthorityConflict);
             }
             transaction.commit().map_err(ConfigurationError::Storage)?;
+            *current_revision = Some(authority_fields.base_config_revision);
             return Ok(());
         }
         write_authority(&transaction, authority, &authority_fields)?;
         transaction.commit().map_err(ConfigurationError::Storage)?;
+        *current_revision = Some(authority_fields.base_config_revision);
         Ok(())
     }
 
@@ -664,6 +667,7 @@ impl<'connection> ConfigurationStore<'connection> {
         if !next_generation(&previous_fields, &next_fields) {
             return Err(ConfigurationError::AuthorityConflict);
         }
+        let mut current_revision = next.write_current_configuration_revision()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -677,6 +681,7 @@ impl<'connection> ConfigurationStore<'connection> {
         }
         write_authority(&transaction, next, &current_next)?;
         transaction.commit().map_err(ConfigurationError::Storage)?;
+        *current_revision = Some(current_next.base_config_revision);
         Ok(())
     }
     /// Atomically apply a replacement or rollback under the exact authority.
@@ -689,6 +694,7 @@ impl<'connection> ConfigurationStore<'connection> {
         authority.check_live()?;
         let (request_jcs, request_digest_value) = request_identity(request, authority)?;
         let request_digest = request_digest_value.to_canonical_string();
+        let mut current_revision = authority.write_current_configuration_revision()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -701,6 +707,7 @@ impl<'connection> ConfigurationStore<'connection> {
             return Err(ConfigurationError::AuthorityConflict);
         }
 
+        let current = load_state(&transaction)?;
         if let Some(receipt) = load_transaction(&transaction, request.transaction_id())? {
             if receipt.request_digest != request_digest {
                 return Err(ConfigurationError::IdempotencyConflict);
@@ -710,6 +717,7 @@ impl<'connection> ConfigurationStore<'connection> {
                 .parse()
                 .map_err(|_| ConfigurationError::Corrupt)?;
             transaction.commit().map_err(ConfigurationError::Storage)?;
+            *current_revision = Some(current.revision);
             return Ok(ConfigurationReceipt {
                 transaction_id: request.transaction_id().to_owned(),
                 revision: receipt.revision,
@@ -720,7 +728,6 @@ impl<'connection> ConfigurationStore<'connection> {
             });
         }
 
-        let current = load_state(&transaction)?;
         if let Some(expected) = request.expected_revision() {
             if expected != current.revision {
                 return Err(ConfigurationError::RevisionConflict {
@@ -798,6 +805,7 @@ impl<'connection> ConfigurationStore<'connection> {
             )
             .map_err(ConfigurationError::Storage)?;
         transaction.commit().map_err(ConfigurationError::Storage)?;
+        *current_revision = Some(next_revision);
         Ok(ConfigurationReceipt {
             transaction_id: request.transaction_id().to_owned(),
             revision: next_revision,
