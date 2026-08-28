@@ -21,5 +21,6 @@ pub use logs::{
     StructuredLogEvent,
 };
 pub use replay::{
-    ReplayError, ReplayEvidence, ReplayLimits, ReplayMode, ReplayRecord, ReplayRecorder,
+    HostReplayEvent, ReplayError, ReplayEvidence, ReplayLimits, ReplayMode, ReplayRecord,
+    ReplayRecorder,
 };

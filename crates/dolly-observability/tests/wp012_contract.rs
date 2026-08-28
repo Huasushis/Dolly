@@ -4,23 +4,14 @@ use dolly_core_reducer::{
     CoreCommand, EnvironmentInput, InstallConfigCommand, InstallGraphCommand, TransitionOutcome,
 };
 use dolly_observability::{
-    BackupError, BoundedLogBuffer, HostLogContext, HostLogEvent, LogError, LogLevel, LogLimits,
-    LogPushOutcome, ModuleBackup, ModuleRestoreRequest, ModuleStateProjection, ReplayError,
-    ReplayLimits, ReplayMode, ReplayRecorder, StructuredLogEvent,
+    BackupError, BoundedLogBuffer, HostLogContext, HostLogEvent, HostReplayEvent, LogError,
+    LogLevel, LogLimits, LogPushOutcome, ModuleBackup, ModuleRestoreRequest, ModuleStateProjection,
+    ReplayError, ReplayLimits, ReplayMode, ReplayRecorder, StructuredLogEvent,
 };
 use dolly_storage::{HostConnectionAuthority, SqliteCoreStore};
 use rusqlite::Connection;
-use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use serde_json::{json, Value};
 use std::str::FromStr;
-
-fn module_id() -> ModuleId {
-    ModuleId::from_string("memory-main".to_owned()).unwrap()
-}
-
-fn scope_id() -> ModuleStorageScopeId {
-    ModuleStorageScopeId::from_uuid_v7("0198ab31-6c44-7e8a-b2bb-000000000154".parse().unwrap())
-}
 
 fn storage_module_id() -> ModuleId {
     ModuleId::from_string("timer".to_owned()).unwrap()
@@ -282,72 +273,191 @@ fn log_sequences_are_monotonic_per_host_context() {
     ));
 }
 
-fn replay_with_input(input: Value) -> (String, Vec<u8>) {
-    let mut recorder = ReplayRecorder::new(
-        module_id(),
-        scope_id(),
-        ReplayMode::Simulation,
-        ReplayLimits::default(),
-    )
-    .unwrap();
-    recorder.append(input, Some(json!({"answer": 42}))).unwrap();
+fn replay_with_event(
+    projection: &ModuleStateProjection,
+    event: HostReplayEvent,
+) -> (String, Vec<u8>) {
+    let mut recorder =
+        ReplayRecorder::new(projection, ReplayMode::Simulation, ReplayLimits::default()).unwrap();
+    recorder.append(event).unwrap();
     let evidence = recorder.finish().unwrap();
     let digest = evidence.digest().to_string();
     let bytes = evidence.canonical_bytes().unwrap().into_vec();
     (digest, bytes)
 }
 
-#[test]
-fn replay_digest_is_canonical_ordered_and_non_authoritative() {
-    let mut first = Map::new();
-    first.insert("b".to_owned(), json!(2));
-    first.insert("a".to_owned(), json!(1));
-    let mut second = Map::new();
-    second.insert("a".to_owned(), json!(1));
-    second.insert("b".to_owned(), json!(2));
+fn allowed_host_callback_replay_event() -> HostReplayEvent {
+    let actual_secret_bytes = b"g3-secret";
+    let actual_secret = std::str::from_utf8(actual_secret_bytes).unwrap();
+    assert_eq!(actual_secret, "g3-secret");
+    HostReplayEvent::InputAccepted {
+        input_digest: Sha256Digest::compute(b"safe-input"),
+    }
+}
 
-    let (first_digest, first_bytes) = replay_with_input(Value::Object(first));
-    let (second_digest, second_bytes) = replay_with_input(Value::Object(second));
-    assert_eq!(first_digest, second_digest);
-    assert_eq!(first_bytes, second_bytes);
-
-    let evidence = ReplayRecorder::simulation(module_id(), scope_id())
-        .finish()
-        .unwrap();
-    assert!(!evidence.is_authoritative());
-    let recovered = dolly_observability::ReplayEvidence::recover_from_bytes(&first_bytes).unwrap();
-    assert_eq!(recovered.digest().to_string(), first_digest);
-    assert_eq!(recovered.records()[0].sequence(), 1);
+fn assert_secret_free(bytes: &[u8]) {
+    assert!(!bytes
+        .windows(b"g3-secret".len())
+        .any(|window| window == b"g3-secret"));
 }
 
 #[test]
-fn replay_rejects_out_of_order_and_forbidden_data_without_partial_append() {
-    let limits = ReplayLimits::new(4, 4096, 4096).unwrap();
-    let mut recorder =
-        ReplayRecorder::new(module_id(), scope_id(), ReplayMode::Verification, limits).unwrap();
+fn replay_uses_fixed_host_events_and_exports_no_callback_secret() {
+    let (_connection, _authority, projection) = storage_projection();
+    let event = allowed_host_callback_replay_event();
+    let mut recorder = ReplayRecorder::simulation(&projection);
+    assert_eq!(recorder.append(event.clone()).unwrap(), 1);
+    let evidence = recorder.finish().unwrap();
+
+    assert_eq!(evidence.module_id(), projection.module_id());
+    assert_eq!(evidence.storage_scope_id(), projection.storage_scope_id());
+    assert_eq!(evidence.revision(), projection.revision());
     assert_eq!(
-        recorder.append_ordered(2, json!({"input": true}), None),
+        evidence.durable_commit_seq(),
+        projection.durable_commit_seq()
+    );
+    let bytes = evidence.canonical_bytes().unwrap().into_vec();
+    assert_secret_free(&bytes);
+    assert_secret_free(format!("{evidence:?}").as_bytes());
+
+    let recovered =
+        dolly_observability::ReplayEvidence::recover_from_bytes(&bytes, &projection).unwrap();
+    assert_eq!(recovered.records()[0].event(), &event);
+    assert_secret_free(&recovered.canonical_bytes().unwrap().into_vec());
+    assert_secret_free(format!("{recovered:?}").as_bytes());
+
+    let safe_digest = Sha256Digest::compute(b"safe").to_canonical_string();
+    let untyped_document = json!({
+        "schema": "dolly.replay-evidence/v1",
+        "non_authoritative": true,
+        "mode": "simulation",
+        "module_id": projection.module_id(),
+        "storage_scope_id": projection.storage_scope_id(),
+        "revision": projection.revision(),
+        "durable_commit_seq": projection.durable_commit_seq(),
+        "records": [{
+            "sequence": 1,
+            "event": {
+                "kind": "input_accepted",
+                "input_digest": safe_digest,
+                "note": "g3-secret"
+            }
+        }],
+        "evidence_digest": safe_digest
+    });
+    let untyped_bytes = canonicalize(&untyped_document).unwrap().0.into_vec();
+    let error =
+        dolly_observability::ReplayEvidence::recover_from_bytes(&untyped_bytes, &projection)
+            .unwrap_err();
+    assert!(!error.to_string().contains("g3-secret"));
+    assert!(!format!("{error:?}").contains("g3-secret"));
+}
+
+#[test]
+fn replay_recovery_rejects_a_different_storage_projection() {
+    let (_first_connection, _first_authority, first_projection) = storage_projection();
+    let (_second_connection, _second_authority, second_projection) = storage_projection();
+    let mut recorder = ReplayRecorder::simulation(&first_projection);
+    recorder
+        .append(HostReplayEvent::InputAccepted {
+            input_digest: Sha256Digest::compute(b"safe-input"),
+        })
+        .unwrap();
+    let bytes = recorder
+        .finish()
+        .unwrap()
+        .canonical_bytes()
+        .unwrap()
+        .into_vec();
+
+    assert!(matches!(
+        dolly_observability::ReplayEvidence::recover_from_bytes(&bytes, &second_projection),
+        Err(ReplayError::IdentityMismatch)
+    ));
+}
+
+#[test]
+fn replay_digest_is_canonical_ordered_and_non_authoritative() {
+    let (_connection, _authority, projection) = storage_projection();
+    let event = HostReplayEvent::Succeeded {
+        input_digest: Sha256Digest::compute(b"input"),
+        result_digest: Sha256Digest::compute(b"result"),
+    };
+    let (first_digest, first_bytes) = replay_with_event(&projection, event.clone());
+    let (second_digest, second_bytes) = replay_with_event(&projection, event.clone());
+    assert_eq!(first_digest, second_digest);
+    assert_eq!(first_bytes, second_bytes);
+
+    let evidence = ReplayRecorder::simulation(&projection).finish().unwrap();
+    assert!(!evidence.is_authoritative());
+    let recovered =
+        dolly_observability::ReplayEvidence::recover_from_bytes(&first_bytes, &projection).unwrap();
+    assert_eq!(recovered.digest().to_string(), first_digest);
+    assert_eq!(recovered.records()[0].sequence(), 1);
+    assert_eq!(recovered.records()[0].event(), &event);
+}
+
+#[test]
+fn replay_preserves_order_and_bounds_without_raw_append_path() {
+    let (_connection, _authority, projection) = storage_projection();
+    let limits = ReplayLimits::new(1, 4096, 4096).unwrap();
+    let event = HostReplayEvent::InputAccepted {
+        input_digest: Sha256Digest::compute(b"safe-input"),
+    };
+    let mut recorder = ReplayRecorder::new(&projection, ReplayMode::Verification, limits).unwrap();
+    assert_eq!(
+        recorder.append_ordered(2, event.clone()),
         Err(ReplayError::Ordering {
             expected: 1,
             actual: 2
         })
     );
     assert_eq!(recorder.len(), 0);
+    assert_eq!(recorder.append(event.clone()).unwrap(), 1);
+    assert_eq!(
+        recorder.append(event.clone()),
+        Err(ReplayError::RecordLimit { limit: 1 })
+    );
+    assert_eq!(recorder.len(), 1);
+
+    let mut small_record = ReplayRecorder::new(
+        &projection,
+        ReplayMode::Simulation,
+        ReplayLimits::new(1, 1, 4096).unwrap(),
+    )
+    .unwrap();
     assert!(matches!(
-        recorder.append(json!({"capability_grant": "opaque"}), None),
-        Err(ReplayError::ForbiddenData { .. })
+        small_record.append(event.clone()),
+        Err(ReplayError::RecordTooLarge { .. })
     ));
-    assert_eq!(recorder.len(), 0);
+    assert_eq!(small_record.len(), 0);
+
+    let mut small_total = ReplayRecorder::new(
+        &projection,
+        ReplayMode::Simulation,
+        ReplayLimits::new(1, 4096, 1).unwrap(),
+    )
+    .unwrap();
     assert!(matches!(
-        ReplayRecorder::new(module_id(), scope_id(), ReplayMode::LiveReplay, limits),
+        small_total.append(event),
+        Err(ReplayError::TotalLimit { .. })
+    ));
+    assert_eq!(small_total.len(), 0);
+    assert!(matches!(
+        ReplayRecorder::new(&projection, ReplayMode::LiveReplay, limits),
         Err(ReplayError::LiveReplayNotSupported)
     ));
 }
 
 #[test]
 fn replay_recovery_rejects_truncated_evidence() {
-    let mut recorder = ReplayRecorder::simulation(module_id(), scope_id());
-    recorder.append(json!({"input": "complete"}), None).unwrap();
+    let (_connection, _authority, projection) = storage_projection();
+    let mut recorder = ReplayRecorder::simulation(&projection);
+    recorder
+        .append(HostReplayEvent::InputAccepted {
+            input_digest: Sha256Digest::compute(b"safe-input"),
+        })
+        .unwrap();
     let bytes = recorder
         .finish()
         .unwrap()
@@ -355,7 +465,10 @@ fn replay_recovery_rejects_truncated_evidence() {
         .unwrap()
         .into_vec();
     assert!(matches!(
-        dolly_observability::ReplayEvidence::recover_from_bytes(&bytes[..bytes.len() - 1]),
+        dolly_observability::ReplayEvidence::recover_from_bytes(
+            &bytes[..bytes.len() - 1],
+            &projection
+        ),
         Err(ReplayError::Corrupt(_))
     ));
 }
