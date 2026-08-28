@@ -33,8 +33,9 @@ pub use restore_identity::{
 };
 pub use config_transaction::{
     CONFIGURATION_SCHEMA_SQL, CONFIGURATION_SCHEMA_VERSION, ConfigurationChange,
-    ConfigurationDisposition, ConfigurationError, ConfigurationReceipt, ConfigurationSnapshot,
-    ConfigurationStore, ConfigurationTransaction, MAX_CONFIGURATION_REVISION,
+    ConfigurationDisposition, ConfigurationError, ConfigurationReceipt,
+    ConfigurationSnapshot, ConfigurationStore, ConfigurationTransaction,
+    ConfigurationTransactionAuthority, MAX_CONFIGURATION_REVISION,
 };
 pub use transaction::{
     CoreTransaction, HostCapabilityGrant, HostConnectionAuthority,

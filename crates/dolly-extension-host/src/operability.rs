@@ -12,6 +12,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use dolly_core_domain::ExtensionId;
+use dolly_storage::{ConfigurationSnapshot, ConfigurationTransactionAuthority};
 
 use dolly_worker::daemon::{DaemonError, DaemonLifecycleToken, InFlightWork};
 
@@ -80,6 +81,39 @@ impl OperationalPremise {
 
     pub fn extension_generation(&self) -> i64 {
         self.invocation.extension_generation()
+    }
+
+    /// Create the immutable configuration authority for this live invocation.
+    ///
+    /// The authority is available only after the exact daemon lifecycle has
+    /// been bound to this admitted premise. The supplied snapshot is the
+    /// canonical configuration base used by the transaction request.
+    pub fn configuration_transaction_authority(
+        &self,
+        base: &ConfigurationSnapshot,
+    ) -> Result<ConfigurationTransactionAuthority, ExternalIoError> {
+        let lifecycle = self
+            .lifecycle
+            .as_ref()
+            .ok_or(ExternalIoError::StaleGeneration)?;
+        lifecycle.check().map_err(map_lifecycle_error)?;
+        let extension_id = self.extension_id().ok_or(ExternalIoError::Unauthorized)?;
+        ConfigurationTransactionAuthority::new(
+            extension_id,
+            self.module_id(),
+            self.invocation.extension_connection_id(),
+            self.invocation.incarnation_revision(),
+            self.invocation.worker_epoch().clone(),
+            self.invocation.worker_epoch_fence(),
+            lifecycle.generation().value(),
+            self.extension_generation(),
+            base.revision(),
+            base.digest().clone(),
+            self.invocation.manifest().graph_revision.value(),
+            self.invocation.graph_digest().clone(),
+            self.invocation.extension_connection_id(),
+        )
+        .map_err(|_| ExternalIoError::StaleGeneration)
     }
 }
 

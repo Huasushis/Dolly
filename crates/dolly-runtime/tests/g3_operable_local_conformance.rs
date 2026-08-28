@@ -14,7 +14,9 @@ use dolly_core_reducer::{
 };
 use dolly_protocol::FrameLimits;
 use dolly_runtime::{DispatchResult, ExecutionPremise, LeaseRequest, RuntimeTransactionEngine};
-use dolly_storage::SqliteCoreStore;
+use dolly_storage::{
+    ConfigurationDisposition, ConfigurationStore, ConfigurationTransaction, SqliteCoreStore,
+};
 use dolly_worker::daemon::{
     DaemonCommand, DaemonError, DaemonGeneration, DaemonLifecycleIdentity, DaemonReadinessConfig,
     DaemonState, LocalDaemonSupervisor, RestartBounds,
@@ -681,6 +683,29 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
     assert_eq!(before_core.pages, after_core.pages);
     assert_eq!(before_core.blocks, after_core.blocks);
     assert_operational_fences(&dispatch, &operational);
+    let (old_config_authority, baseline_receipt) = {
+        let mut configuration =
+            ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
+        let base = configuration.current().expect("initial configuration");
+        let authority = operational
+            .configuration_transaction_authority(&base)
+            .expect("live Host configuration authority");
+        configuration
+            .bind_authority(&authority)
+            .expect("initial configuration authority");
+        let baseline = ConfigurationTransaction::new(
+            "g3-config-baseline",
+            Some(base.revision()),
+            json!({"mode": "base"}),
+        )
+        .expect("baseline configuration request");
+        let receipt = configuration
+            .apply(&authority, &baseline)
+            .expect("baseline configuration commit");
+        assert_eq!(receipt.disposition(), ConfigurationDisposition::Committed);
+        assert_eq!(receipt.authority_digest(), authority.authority_digest());
+        (authority, receipt)
+    };
     let fence = dispatch.premise.fence();
     let connection_id = fence.extension_connection_id();
     let module_id = dispatch.premise.identity().module_id();
@@ -947,6 +972,130 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
         .expect("fresh G2 owner must bind")
     };
     assert_operational_fences(&fresh_dispatch, &fresh_operational);
+    let fresh_config_authority = {
+        let mut configuration =
+            ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
+        let base = configuration.current().expect("current configuration");
+        let authority = fresh_operational
+            .configuration_transaction_authority(&base)
+            .expect("fresh Host configuration authority");
+        assert_ne!(
+            authority.authority_digest(),
+            old_config_authority.authority_digest(),
+            "restart must rotate configuration authority"
+        );
+        configuration
+            .rotate_authority(&old_config_authority, &authority)
+            .expect("fresh lifecycle must rotate configuration authority");
+        authority
+    };
+    let stale_configuration = ConfigurationTransaction::new(
+        "g3-config-stale",
+        Some(baseline_receipt.revision()),
+        json!({"mode": "stale"}),
+    )
+    .expect("stale configuration request");
+    let stale_rollback =
+        ConfigurationTransaction::rollback("g3-config-stale-rollback", Some(1), 1)
+            .expect("stale rollback request");
+    let before_stale_configuration = durable_snapshot(&dispatch.connection);
+    {
+        let mut configuration =
+            ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
+        assert!(matches!(
+            configuration.apply(&old_config_authority, &stale_configuration),
+            Err(dolly_storage::ConfigurationError::AuthorityConflict)
+        ));
+    }
+    assert_eq!(
+        durable_snapshot(&dispatch.connection),
+        before_stale_configuration,
+        "stale apply must not mutate any durable row"
+    );
+    {
+        let mut configuration =
+            ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
+        assert!(matches!(
+            configuration.apply(&old_config_authority, &stale_rollback),
+            Err(dolly_storage::ConfigurationError::AuthorityConflict)
+        ));
+    }
+    assert_eq!(
+        durable_snapshot(&dispatch.connection),
+        before_stale_configuration,
+        "stale rollback must not mutate any durable row"
+    );
+    let fresh_configuration = ConfigurationTransaction::new(
+        "g3-config-fresh",
+        Some(baseline_receipt.revision()),
+        json!({"mode": "fresh"}),
+    )
+    .expect("fresh configuration request");
+    let fresh_configuration_receipt = {
+        let mut configuration =
+            ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
+        configuration
+            .apply(&fresh_config_authority, &fresh_configuration)
+            .expect("fresh configuration request must commit")
+    };
+    assert_eq!(
+        fresh_configuration_receipt.disposition(),
+        ConfigurationDisposition::Committed
+    );
+    assert_eq!(
+        fresh_configuration_receipt.authority_digest(),
+        fresh_config_authority.authority_digest()
+    );
+    let after_fresh_configuration = durable_snapshot(&dispatch.connection);
+    let replayed_configuration = {
+        let mut configuration =
+            ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
+        configuration
+            .apply(&fresh_config_authority, &fresh_configuration)
+            .expect("exact fresh configuration replay")
+    };
+    assert_eq!(
+        replayed_configuration.disposition(),
+        ConfigurationDisposition::Replayed
+    );
+    assert_eq!(
+        durable_snapshot(&dispatch.connection),
+        after_fresh_configuration,
+        "exact replay must not allocate another configuration revision"
+    );
+    let changed_configuration =
+        ConfigurationTransaction::new("g3-config-fresh", Some(1), json!({"mode": "changed"}))
+            .expect("changed configuration request");
+    let before_changed_configuration = durable_snapshot(&dispatch.connection);
+    {
+        let mut configuration =
+            ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
+        assert!(matches!(
+            configuration.apply(&fresh_config_authority, &changed_configuration),
+            Err(dolly_storage::ConfigurationError::IdempotencyConflict)
+        ));
+    }
+    assert_eq!(
+        durable_snapshot(&dispatch.connection),
+        before_changed_configuration,
+        "changed replay identity must not mutate durable state"
+    );
+    let incompatible_rollback =
+        ConfigurationTransaction::rollback("g3-config-incompatible-rollback", Some(2), 1)
+            .expect("incompatible rollback request");
+    {
+        let mut configuration =
+            ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
+        assert!(matches!(
+            configuration.apply(&fresh_config_authority, &incompatible_rollback),
+            Err(dolly_storage::ConfigurationError::RollbackAuthorityConflict)
+        ));
+    }
+    assert_eq!(
+        durable_snapshot(&dispatch.connection),
+        before_changed_configuration,
+        "rollback from an older authority must not restore blind historical bytes"
+    );
     let mut fresh_policy = dolly_extension_host::ExternalIoPolicy::new(
         "org.example.extension",
         fresh_operational.config_revision(),

@@ -7,6 +7,7 @@
 //! `SecretRef` URI and are rejected when supplied as plaintext.
 
 use dolly_canonical_json::{Sha256Digest, canonicalize};
+use dolly_core_domain::WorkerEpoch;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -14,25 +15,44 @@ use thiserror::Error;
 /// Maximum configuration revision accepted by the safe integer contract.
 pub const MAX_CONFIGURATION_REVISION: u64 = 9_007_199_254_740_991;
 /// Logical schema version for the configuration transaction ledger.
-pub const CONFIGURATION_SCHEMA_VERSION: i64 = 1;
+pub const CONFIGURATION_SCHEMA_VERSION: i64 = 2;
 
 /// Tables owned by the configuration transaction ledger.
 pub const CONFIGURATION_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS configuration_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    schema_version INTEGER NOT NULL CHECK (schema_version = 1)
+    schema_version INTEGER NOT NULL CHECK (schema_version = 2)
 );
-INSERT OR IGNORE INTO configuration_meta (singleton, schema_version) VALUES (1, 1);
+INSERT OR IGNORE INTO configuration_meta (singleton, schema_version) VALUES (1, 2);
 CREATE TABLE IF NOT EXISTS configuration_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     current_revision INTEGER NOT NULL CHECK (current_revision BETWEEN 0 AND 9007199254740991),
     current_digest TEXT NOT NULL,
     current_jcs BLOB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS configuration_authority (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    extension_id TEXT NOT NULL,
+    module_id TEXT NOT NULL,
+    extension_connection_id TEXT NOT NULL,
+    host_incarnation_revision INTEGER NOT NULL CHECK (host_incarnation_revision BETWEEN 1 AND 9007199254740991),
+    worker_epoch TEXT NOT NULL,
+    worker_epoch_fence INTEGER NOT NULL CHECK (worker_epoch_fence BETWEEN 1 AND 9007199254740991),
+    daemon_generation INTEGER NOT NULL CHECK (daemon_generation BETWEEN 1 AND 9007199254740991),
+    extension_generation INTEGER NOT NULL CHECK (extension_generation BETWEEN 1 AND 9007199254740991),
+    base_config_revision INTEGER NOT NULL CHECK (base_config_revision BETWEEN 0 AND 9007199254740991),
+    base_config_digest TEXT NOT NULL,
+    graph_revision INTEGER NOT NULL CHECK (graph_revision BETWEEN 1 AND 9007199254740991),
+    graph_digest TEXT NOT NULL,
+    control_channel_id TEXT NOT NULL,
+    authority_digest TEXT NOT NULL,
+    authority_jcs BLOB NOT NULL
+);
 CREATE TABLE IF NOT EXISTS configuration_revisions (
     revision INTEGER PRIMARY KEY CHECK (revision BETWEEN 1 AND 9007199254740991),
     digest TEXT NOT NULL,
     config_jcs BLOB NOT NULL,
+    authority_digest TEXT NOT NULL,
     transaction_id TEXT NOT NULL UNIQUE,
     previous_revision INTEGER NOT NULL CHECK (previous_revision BETWEEN 0 AND 9007199254740991),
     operation TEXT NOT NULL CHECK (operation IN ('replace', 'rollback')),
@@ -41,6 +61,8 @@ CREATE TABLE IF NOT EXISTS configuration_revisions (
 CREATE TABLE IF NOT EXISTS configuration_transactions (
     transaction_id TEXT PRIMARY KEY,
     request_digest TEXT NOT NULL,
+    authority_digest TEXT NOT NULL,
+    request_jcs BLOB NOT NULL,
     result_revision INTEGER NOT NULL CHECK (result_revision BETWEEN 1 AND 9007199254740991),
     result_digest TEXT NOT NULL,
     disposition TEXT NOT NULL CHECK (disposition = 'committed')
@@ -60,11 +82,33 @@ const CONFIGURATION_TABLE_COLUMNS: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "configuration_authority",
+        &[
+            "singleton",
+            "extension_id",
+            "module_id",
+            "extension_connection_id",
+            "host_incarnation_revision",
+            "worker_epoch",
+            "worker_epoch_fence",
+            "daemon_generation",
+            "extension_generation",
+            "base_config_revision",
+            "base_config_digest",
+            "graph_revision",
+            "graph_digest",
+            "control_channel_id",
+            "authority_digest",
+            "authority_jcs",
+        ],
+    ),
+    (
         "configuration_revisions",
         &[
             "revision",
             "digest",
             "config_jcs",
+            "authority_digest",
             "transaction_id",
             "previous_revision",
             "operation",
@@ -76,6 +120,8 @@ const CONFIGURATION_TABLE_COLUMNS: &[(&str, &[&str])] = &[
         &[
             "transaction_id",
             "request_digest",
+            "authority_digest",
+            "request_jcs",
             "result_revision",
             "result_digest",
             "disposition",
@@ -88,6 +134,139 @@ const CONFIGURATION_TABLE_COLUMNS: &[(&str, &[&str])] = &[
 pub enum ConfigurationChange {
     Replace(Value),
     Rollback { target_revision: u64 },
+}
+
+/// Immutable authority for one configuration transaction generation.
+///
+/// The Host creates this value only from a live lifecycle and an admitted
+/// OperationalPremise. Its private fields cover the exact Extension, Module,
+/// Host connection and incarnation, WorkerEpoch and fence, daemon and
+/// Extension generations, base configuration, graph, and control channel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigurationTransactionAuthority {
+    extension_id: String,
+    module_id: String,
+    extension_connection_id: String,
+    host_incarnation_revision: i64,
+    worker_epoch: WorkerEpoch,
+    worker_epoch_fence: i64,
+    daemon_generation: u64,
+    extension_generation: i64,
+    base_config_revision: u64,
+    base_config_digest: Sha256Digest,
+    graph_revision: u64,
+    graph_digest: Sha256Digest,
+    control_channel_id: String,
+    authority_digest: Sha256Digest,
+    authority_jcs: Vec<u8>,
+}
+
+impl ConfigurationTransactionAuthority {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        extension_id: impl Into<String>,
+        module_id: impl Into<String>,
+        extension_connection_id: impl Into<String>,
+        host_incarnation_revision: i64,
+        worker_epoch: WorkerEpoch,
+        worker_epoch_fence: i64,
+        daemon_generation: u64,
+        extension_generation: i64,
+        base_config_revision: u64,
+        base_config_digest: Sha256Digest,
+        graph_revision: u64,
+        graph_digest: Sha256Digest,
+        control_channel_id: impl Into<String>,
+    ) -> Result<Self, ConfigurationError> {
+        let extension_id = extension_id.into();
+        let module_id = module_id.into();
+        let extension_connection_id = extension_connection_id.into();
+        let control_channel_id = control_channel_id.into();
+        if !valid_authority_identifier(&extension_id)
+            || !valid_authority_identifier(&module_id)
+            || !valid_authority_identifier(&extension_connection_id)
+            || !valid_authority_identifier(&control_channel_id)
+            || host_incarnation_revision <= 0
+            || host_incarnation_revision > MAX_CONFIGURATION_REVISION as i64
+            || worker_epoch_fence <= 0
+            || worker_epoch_fence > MAX_CONFIGURATION_REVISION as i64
+            || daemon_generation == 0
+            || daemon_generation > MAX_CONFIGURATION_REVISION
+            || extension_generation <= 0
+            || extension_generation as u64 > MAX_CONFIGURATION_REVISION
+            || base_config_revision > MAX_CONFIGURATION_REVISION
+            || graph_revision == 0
+            || graph_revision > MAX_CONFIGURATION_REVISION
+        {
+            return Err(ConfigurationError::InvalidAuthority);
+        }
+        let authority_value = json!({
+            "extension_id": extension_id,
+            "module_id": module_id,
+            "extension_connection_id": extension_connection_id,
+            "host_incarnation_revision": host_incarnation_revision,
+            "worker_epoch": worker_epoch.to_string(),
+            "worker_epoch_fence": worker_epoch_fence,
+            "daemon_generation": daemon_generation,
+            "extension_generation": extension_generation,
+            "base_config_revision": base_config_revision,
+            "base_config_digest": base_config_digest.to_canonical_string(),
+            "graph_revision": graph_revision,
+            "graph_digest": graph_digest.to_canonical_string(),
+            "control_channel_id": control_channel_id,
+        });
+        let (authority_bytes, authority_digest) =
+            canonicalize(&authority_value).map_err(|_| ConfigurationError::InvalidAuthority)?;
+        Ok(Self {
+            extension_id,
+            module_id,
+            extension_connection_id,
+            host_incarnation_revision,
+            worker_epoch,
+            worker_epoch_fence,
+            daemon_generation,
+            extension_generation,
+            base_config_revision,
+            base_config_digest,
+            graph_revision,
+            graph_digest,
+            control_channel_id,
+            authority_digest,
+            authority_jcs: authority_bytes.into_vec(),
+        })
+    }
+
+    pub fn authority_digest(&self) -> &Sha256Digest {
+        &self.authority_digest
+    }
+
+    fn same_owner_except_generation(&self, other: &Self) -> bool {
+        self.extension_id == other.extension_id
+            && self.module_id == other.module_id
+            && self.extension_connection_id == other.extension_connection_id
+            && self.host_incarnation_revision == other.host_incarnation_revision
+            && self.worker_epoch == other.worker_epoch
+            && self.worker_epoch_fence == other.worker_epoch_fence
+            && self.control_channel_id == other.control_channel_id
+    }
+
+    fn is_next_generation_of(&self, previous: &Self) -> bool {
+        self.same_owner_except_generation(previous)
+            && self.daemon_generation == previous.daemon_generation.saturating_add(1)
+            && self.extension_generation == previous.extension_generation.saturating_add(1)
+    }
+}
+
+fn valid_authority_identifier(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 255 && !value.chars().any(char::is_whitespace)
+}
+
+/// Immutable configuration bytes and their canonical revision digest.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConfigurationSnapshot {
+    revision: u64,
+    digest: Sha256Digest,
+    configuration: Value,
 }
 
 /// A caller-supplied transaction identity and optimistic revision fence.
@@ -189,12 +368,16 @@ pub enum ConfigurationDisposition {
     Replayed,
 }
 
+
+
 /// Immutable receipt for a committed or replayed configuration transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfigurationReceipt {
     transaction_id: String,
     revision: u64,
     digest: Sha256Digest,
+    request_digest: Sha256Digest,
+    authority_digest: Sha256Digest,
     disposition: ConfigurationDisposition,
 }
 
@@ -211,19 +394,18 @@ impl ConfigurationReceipt {
         &self.digest
     }
 
+    pub fn request_digest(&self) -> &Sha256Digest {
+        &self.request_digest
+    }
+
+    pub fn authority_digest(&self) -> &Sha256Digest {
+        &self.authority_digest
+    }
+
     pub fn disposition(&self) -> ConfigurationDisposition {
         self.disposition
     }
 }
-
-/// Current canonical configuration pointer and decoded value.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ConfigurationSnapshot {
-    revision: u64,
-    digest: Sha256Digest,
-    configuration: Value,
-}
-
 impl ConfigurationSnapshot {
     pub fn revision(&self) -> u64 {
         self.revision
@@ -250,12 +432,20 @@ pub enum ConfigurationError {
     Corrupt,
     #[error("configuration transaction is invalid")]
     InvalidTransaction,
+    #[error("configuration authority is invalid")]
+    InvalidAuthority,
     #[error("configuration contains plaintext secret material")]
     PlaintextSecret,
     #[error("configuration value is invalid")]
     InvalidConfiguration,
     #[error("configuration revision conflict")]
     RevisionConflict { expected: u64, actual: u64 },
+    #[error("configuration authority is unavailable")]
+    AuthorityUnavailable,
+    #[error("configuration authority is unavailable or stale")]
+    AuthorityConflict,
+    #[error("configuration rollback target is incompatible with current authority")]
+    RollbackAuthorityConflict,
     #[error("configuration transaction replay identity conflicts")]
     IdempotencyConflict,
     #[error("configuration rollback target is unavailable")]
@@ -281,27 +471,85 @@ impl<'connection> ConfigurationStore<'connection> {
         load_state(self.connection)
     }
 
-    /// Atomically apply a replacement or rollback and record its replay key.
+    /// Establish the first sealed authority for this configuration ledger.
+    pub fn bind_authority(
+        &mut self,
+        authority: &ConfigurationTransactionAuthority,
+    ) -> Result<(), ConfigurationError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(ConfigurationError::Storage)?;
+        if let Some(current) = load_authority_digest(&transaction)? {
+            if current != *authority.authority_digest() {
+                return Err(ConfigurationError::AuthorityConflict);
+            }
+            transaction.commit().map_err(ConfigurationError::Storage)?;
+            return Ok(());
+        }
+        write_authority(&transaction, authority)?;
+        transaction.commit().map_err(ConfigurationError::Storage)?;
+        Ok(())
+    }
+
+    /// Replace the current authority only with the exact next generation.
+    pub fn rotate_authority(
+        &mut self,
+        previous: &ConfigurationTransactionAuthority,
+        next: &ConfigurationTransactionAuthority,
+    ) -> Result<(), ConfigurationError> {
+        if !next.is_next_generation_of(previous) {
+            return Err(ConfigurationError::AuthorityConflict);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(ConfigurationError::Storage)?;
+        let current = load_authority_digest(&transaction)?
+            .ok_or(ConfigurationError::AuthorityUnavailable)?;
+        if current != *previous.authority_digest() {
+            return Err(ConfigurationError::AuthorityConflict);
+        }
+        write_authority(&transaction, next)?;
+        transaction.commit().map_err(ConfigurationError::Storage)?;
+        Ok(())
+    }
+
+    /// Atomically apply a replacement or rollback under the exact authority.
     pub fn apply(
         &mut self,
+        authority: &ConfigurationTransactionAuthority,
         request: &ConfigurationTransaction,
     ) -> Result<ConfigurationReceipt, ConfigurationError> {
         request.validate()?;
-        let request_digest = request_digest(request)?;
+        let (request_jcs, request_digest_value) = request_identity(request, authority)?;
+        let request_digest = request_digest_value.to_canonical_string();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(ConfigurationError::Storage)?;
 
+        let current_authority = load_authority_digest(&transaction)?
+            .ok_or(ConfigurationError::AuthorityUnavailable)?;
+        if current_authority != *authority.authority_digest() {
+            return Err(ConfigurationError::AuthorityConflict);
+        }
+
         if let Some(receipt) = load_transaction(&transaction, request.transaction_id())? {
-            if receipt.0 != request_digest {
+            if receipt.request_digest != request_digest {
                 return Err(ConfigurationError::IdempotencyConflict);
             }
+            let authority_digest: Sha256Digest = receipt
+                .authority_digest
+                .parse()
+                .map_err(|_| ConfigurationError::Corrupt)?;
             transaction.commit().map_err(ConfigurationError::Storage)?;
             return Ok(ConfigurationReceipt {
                 transaction_id: request.transaction_id().to_owned(),
-                revision: receipt.1,
-                digest: receipt.2,
+                revision: receipt.revision,
+                digest: receipt.result_digest,
+                request_digest: request_digest_value,
+                authority_digest,
                 disposition: ConfigurationDisposition::Replayed,
             });
         }
@@ -317,12 +565,17 @@ impl<'connection> ConfigurationStore<'connection> {
         }
 
         let (configuration, operation, rollback_target_revision) = match request.change() {
-            ConfigurationChange::Replace(configuration) => (configuration.clone(), "replace", None),
-            ConfigurationChange::Rollback { target_revision } => (
-                load_revision_configuration(&transaction, *target_revision)?,
-                "rollback",
-                Some(*target_revision),
-            ),
+            ConfigurationChange::Replace(configuration) => {
+                (configuration.clone(), "replace", None)
+            }
+            ConfigurationChange::Rollback { target_revision } => {
+                let (configuration, target_authority) =
+                    load_revision_configuration(&transaction, *target_revision)?;
+                if target_authority.as_ref() != Some(authority.authority_digest()) {
+                    return Err(ConfigurationError::RollbackAuthorityConflict);
+                }
+                (configuration, "rollback", Some(*target_revision))
+            }
         };
         reject_plaintext_secrets(&configuration)?;
         let (canonical_bytes, digest) = canonical_configuration(&configuration)?;
@@ -337,13 +590,14 @@ impl<'connection> ConfigurationStore<'connection> {
         transaction
             .execute(
                 "INSERT INTO configuration_revisions
-                 (revision, digest, config_jcs, transaction_id, previous_revision,
+                 (revision, digest, config_jcs, authority_digest, transaction_id, previous_revision,
                   operation, rollback_target_revision)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     next_revision as i64,
                     digest_text,
                     canonical_bytes,
+                    authority.authority_digest().to_canonical_string(),
                     request.transaction_id(),
                     current.revision as i64,
                     operation,
@@ -366,11 +620,14 @@ impl<'connection> ConfigurationStore<'connection> {
         transaction
             .execute(
                 "INSERT INTO configuration_transactions
-                 (transaction_id, request_digest, result_revision, result_digest, disposition)
-                 VALUES (?1, ?2, ?3, ?4, 'committed')",
+                 (transaction_id, request_digest, authority_digest, request_jcs,
+                  result_revision, result_digest, disposition)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'committed')",
                 params![
                     request.transaction_id(),
                     request_digest,
+                    authority.authority_digest().to_canonical_string(),
+                    request_jcs,
                     next_revision as i64,
                     digest.to_canonical_string(),
                 ],
@@ -381,6 +638,8 @@ impl<'connection> ConfigurationStore<'connection> {
             transaction_id: request.transaction_id().to_owned(),
             revision: next_revision,
             digest,
+            request_digest: request_digest_value,
+            authority_digest: authority.authority_digest().clone(),
             disposition: ConfigurationDisposition::Committed,
         })
     }
@@ -392,8 +651,16 @@ impl<'connection> ConfigurationStore<'connection> {
             .ok_or(ConfigurationError::TransactionUnavailable)?;
         Ok(ConfigurationReceipt {
             transaction_id: transaction_id.to_owned(),
-            revision: receipt.1,
-            digest: receipt.2,
+            revision: receipt.revision,
+            digest: receipt.result_digest,
+            request_digest: receipt
+                .request_digest
+                .parse()
+                .map_err(|_| ConfigurationError::Corrupt)?,
+            authority_digest: receipt
+                .authority_digest
+                .parse()
+                .map_err(|_| ConfigurationError::Corrupt)?,
             disposition: ConfigurationDisposition::Replayed,
         })
     }
@@ -529,26 +796,118 @@ fn load_state(connection: &Connection) -> Result<ConfigurationSnapshot, Configur
     Ok(snapshot)
 }
 
-fn load_revision_configuration(
-    transaction: &Transaction<'_>,
-    revision: u64,
-) -> Result<Value, ConfigurationError> {
-    if revision == 0 {
-        return Ok(json!({}));
-    }
-    if revision > MAX_CONFIGURATION_REVISION {
-        return Err(ConfigurationError::RollbackTargetUnavailable);
-    }
-    let bytes: Option<Vec<u8>> = transaction
+fn load_authority_digest(
+    connection: &Connection,
+) -> Result<Option<Sha256Digest>, ConfigurationError> {
+    let authority_digest: Option<String> = connection
         .query_row(
-            "SELECT config_jcs FROM configuration_revisions WHERE revision = ?1",
-            [revision as i64],
+            "SELECT authority_digest FROM configuration_authority WHERE singleton = 1",
+            [],
             |row| row.get(0),
         )
         .optional()
         .map_err(ConfigurationError::Storage)?;
-    let bytes = bytes.ok_or(ConfigurationError::RollbackTargetUnavailable)?;
-    decode_snapshot(revision, &bytes).map(|snapshot| snapshot.configuration)
+    authority_digest
+        .map(|value| {
+            let digest: Sha256Digest = value.parse().map_err(|_| ConfigurationError::Corrupt)?;
+            if digest.to_canonical_string() != value {
+                return Err(ConfigurationError::Corrupt);
+            }
+            Ok(digest)
+        })
+        .transpose()
+}
+
+fn write_authority(
+    transaction: &Transaction<'_>,
+    authority: &ConfigurationTransactionAuthority,
+) -> Result<(), ConfigurationError> {
+    transaction
+        .execute(
+            "INSERT INTO configuration_authority
+             (singleton, extension_id, module_id, extension_connection_id,
+              host_incarnation_revision, worker_epoch, worker_epoch_fence,
+              daemon_generation, extension_generation, base_config_revision,
+              base_config_digest, graph_revision, graph_digest, control_channel_id,
+              authority_digest, authority_jcs)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+             ON CONFLICT(singleton) DO UPDATE SET
+              extension_id = excluded.extension_id,
+              module_id = excluded.module_id,
+              extension_connection_id = excluded.extension_connection_id,
+              host_incarnation_revision = excluded.host_incarnation_revision,
+              worker_epoch = excluded.worker_epoch,
+              worker_epoch_fence = excluded.worker_epoch_fence,
+              daemon_generation = excluded.daemon_generation,
+              extension_generation = excluded.extension_generation,
+              base_config_revision = excluded.base_config_revision,
+              base_config_digest = excluded.base_config_digest,
+              graph_revision = excluded.graph_revision,
+              graph_digest = excluded.graph_digest,
+              control_channel_id = excluded.control_channel_id,
+              authority_digest = excluded.authority_digest,
+              authority_jcs = excluded.authority_jcs",
+            params![
+                &authority.extension_id,
+                &authority.module_id,
+                &authority.extension_connection_id,
+                authority.host_incarnation_revision,
+                authority.worker_epoch.to_string(),
+                authority.worker_epoch_fence,
+                authority.daemon_generation as i64,
+                authority.extension_generation,
+                authority.base_config_revision as i64,
+                authority.base_config_digest.to_canonical_string(),
+                authority.graph_revision as i64,
+                authority.graph_digest.to_canonical_string(),
+                &authority.control_channel_id,
+                authority.authority_digest.to_canonical_string(),
+                authority.authority_jcs.as_slice(),
+            ],
+        )
+        .map_err(ConfigurationError::Storage)?;
+    Ok(())
+}
+
+fn load_revision_configuration(
+    transaction: &Transaction<'_>,
+    revision: u64,
+) -> Result<(Value, Option<Sha256Digest>), ConfigurationError> {
+    if revision == 0 {
+        return Ok((json!({}), None));
+    }
+    if revision > MAX_CONFIGURATION_REVISION {
+        return Err(ConfigurationError::RollbackTargetUnavailable);
+    }
+    let row: Option<(Vec<u8>, String, String)> = transaction
+        .query_row(
+            "SELECT config_jcs, digest, authority_digest
+             FROM configuration_revisions WHERE revision = ?1",
+            [revision as i64],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(ConfigurationError::Storage)?;
+    let Some((bytes, digest_text, authority_text)) = row else {
+        return Err(ConfigurationError::RollbackTargetUnavailable);
+    };
+    let expected_digest: Sha256Digest = digest_text
+        .parse()
+        .map_err(|_| ConfigurationError::Corrupt)?;
+    if expected_digest.to_canonical_string() != digest_text {
+        return Err(ConfigurationError::Corrupt);
+    }
+    let authority_digest: Sha256Digest = authority_text
+        .parse()
+        .map_err(|_| ConfigurationError::Corrupt)?;
+    if authority_digest.to_canonical_string() != authority_text {
+        return Err(ConfigurationError::Corrupt);
+    }
+    let snapshot = decode_snapshot(revision, &bytes)?;
+    if snapshot.digest != expected_digest {
+        return Err(ConfigurationError::Corrupt);
+    }
+    Ok((snapshot.configuration, Some(authority_digest)))
 }
 
 fn decode_snapshot(
@@ -577,7 +936,10 @@ fn canonical_configuration(
     Ok((bytes.into_vec(), digest))
 }
 
-fn request_digest(request: &ConfigurationTransaction) -> Result<String, ConfigurationError> {
+fn request_identity(
+    request: &ConfigurationTransaction,
+    authority: &ConfigurationTransactionAuthority,
+) -> Result<(Vec<u8>, Sha256Digest), ConfigurationError> {
     let change = match request.change() {
         ConfigurationChange::Replace(configuration) => json!({
             "operation": "replace",
@@ -588,39 +950,88 @@ fn request_digest(request: &ConfigurationTransaction) -> Result<String, Configur
             "target_revision": target_revision,
         }),
     };
+    let authority_value: Value = serde_json::from_slice(&authority.authority_jcs)
+        .map_err(|_| ConfigurationError::Corrupt)?;
     let request_value = json!({
         "transaction_id": request.transaction_id(),
         "expected_revision": request.expected_revision(),
         "change": change,
+        "authority": authority_value,
     });
-    canonicalize(&request_value)
-        .map(|(_, digest)| digest.to_canonical_string())
-        .map_err(|_| ConfigurationError::InvalidTransaction)
+    let (bytes, digest) =
+        canonicalize(&request_value).map_err(|_| ConfigurationError::InvalidTransaction)?;
+    Ok((bytes.into_vec(), digest))
+}
+
+struct StoredTransaction {
+    request_digest: String,
+    authority_digest: String,
+    revision: u64,
+    result_digest: Sha256Digest,
 }
 
 fn load_transaction(
     connection: &Connection,
     transaction_id: &str,
-) -> Result<Option<(String, u64, Sha256Digest)>, ConfigurationError> {
-    let row: Option<(String, i64, String)> = connection
+) -> Result<Option<StoredTransaction>, ConfigurationError> {
+    let row: Option<(String, String, Vec<u8>, i64, String)> = connection
         .query_row(
-            "SELECT request_digest, result_revision, result_digest
+            "SELECT request_digest, authority_digest, request_jcs,
+                    result_revision, result_digest
              FROM configuration_transactions WHERE transaction_id = ?1",
             [transaction_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()
         .map_err(ConfigurationError::Storage)?;
-    let Some((request_digest, revision, digest_text)) = row else {
+    let Some((request_digest, authority_digest, request_jcs, revision, result_digest_text)) = row
+    else {
         return Ok(None);
     };
     if !(1..=MAX_CONFIGURATION_REVISION as i64).contains(&revision) {
         return Err(ConfigurationError::Corrupt);
     }
-    let digest = digest_text
+    let request_digest_value: Sha256Digest = request_digest
         .parse()
         .map_err(|_| ConfigurationError::Corrupt)?;
-    Ok(Some((request_digest, revision as u64, digest)))
+    if request_digest_value.to_canonical_string() != request_digest {
+        return Err(ConfigurationError::Corrupt);
+    }
+    let authority_digest_value: Sha256Digest = authority_digest
+        .parse()
+        .map_err(|_| ConfigurationError::Corrupt)?;
+    if authority_digest_value.to_canonical_string() != authority_digest {
+        return Err(ConfigurationError::Corrupt);
+    }
+    let request_value: Value =
+        serde_json::from_slice(&request_jcs).map_err(|_| ConfigurationError::Corrupt)?;
+    let (canonical_request, computed_request_digest) = canonicalize(&request_value)
+        .map_err(|_| ConfigurationError::Corrupt)?;
+    if canonical_request.as_ref() != request_jcs.as_slice()
+        || computed_request_digest != request_digest_value
+    {
+        return Err(ConfigurationError::Corrupt);
+    }
+    let result_digest: Sha256Digest = result_digest_text
+        .parse()
+        .map_err(|_| ConfigurationError::Corrupt)?;
+    if result_digest.to_canonical_string() != result_digest_text {
+        return Err(ConfigurationError::Corrupt);
+    }
+    Ok(Some(StoredTransaction {
+        request_digest,
+        authority_digest,
+        revision: revision as u64,
+        result_digest,
+    }))
 }
 
 fn validate_transaction_id(transaction_id: &str) -> Result<(), ConfigurationError> {
@@ -715,7 +1126,7 @@ fn valid_secret_ref(reference: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
+    use rusqlite::{Connection, types::Value as SqlValue};
 
     fn new_store<'connection>(
         connection: &'connection mut Connection,
@@ -723,29 +1134,101 @@ mod tests {
         ConfigurationStore::new(connection).expect("schema")
     }
 
+    fn authority(
+        daemon_generation: u64,
+        extension_generation: i64,
+        base_revision: u64,
+        base_digest: Sha256Digest,
+        graph_revision: u64,
+        graph_digest: Sha256Digest,
+    ) -> ConfigurationTransactionAuthority {
+        ConfigurationTransactionAuthority::new(
+            "org.example.extension",
+            "module-one",
+            "connection-one",
+            1,
+            "018f0f00-0000-7000-8000-000000000001"
+                .parse()
+                .expect("worker epoch"),
+            1,
+            daemon_generation,
+            extension_generation,
+            base_revision,
+            base_digest,
+            graph_revision,
+            graph_digest,
+            "connection-one",
+        )
+        .expect("authority")
+    }
+
+    fn authority_for(
+        store: &ConfigurationStore<'_>,
+        daemon_generation: u64,
+        extension_generation: i64,
+    ) -> ConfigurationTransactionAuthority {
+        let base = store.current().expect("current");
+        authority(
+            daemon_generation,
+            extension_generation,
+            base.revision(),
+            base.digest().clone(),
+            1,
+            Sha256Digest::compute(b"graph-v1"),
+        )
+    }
+
+    fn database_rows(store: &ConfigurationStore<'_>) -> Vec<(String, Vec<Vec<SqlValue>>)> {
+        [
+            "configuration_meta",
+            "configuration_state",
+            "configuration_authority",
+            "configuration_revisions",
+            "configuration_transactions",
+        ]
+        .into_iter()
+        .map(|table| {
+            let mut statement = store
+                .connection
+                .prepare(&format!("SELECT * FROM {table}"))
+                .expect("query");
+            let column_count = statement.column_count();
+            let mut rows = statement.query([]).expect("rows");
+            let mut values = Vec::new();
+            while let Some(row) = rows.next().expect("row") {
+                values.push(
+                    (0..column_count)
+                        .map(|column| row.get(column).expect("value"))
+                        .collect(),
+                );
+            }
+            (table.to_owned(), values)
+        })
+        .collect()
+    }
+
     #[test]
     fn replacement_is_atomic_and_exact_replay_is_idempotent() {
         let mut connection = Connection::open_in_memory().expect("database");
         let mut store = new_store(&mut connection);
+        let authority = authority_for(&store, 1, 1);
+        store.bind_authority(&authority).expect("bind");
         let request = ConfigurationTransaction::new(
             "tx-1",
             Some(0),
             json!({"endpoint": "https://example.test", "credential": "secret://vault/api"}),
         )
         .expect("request");
-        let committed = store.apply(&request).expect("commit");
+        let committed = store.apply(&authority, &request).expect("commit");
         assert_eq!(committed.disposition(), ConfigurationDisposition::Committed);
         assert_eq!(committed.revision(), 1);
-        let replayed = store.apply(&request).expect("replay");
-        assert_eq!(
-            replayed,
-            ConfigurationReceipt {
-                transaction_id: "tx-1".into(),
-                revision: 1,
-                digest: committed.digest().clone(),
-                disposition: ConfigurationDisposition::Replayed,
-            }
-        );
+        let replayed = store.apply(&authority, &request).expect("replay");
+        assert_eq!(replayed.transaction_id(), committed.transaction_id());
+        assert_eq!(replayed.revision(), committed.revision());
+        assert_eq!(replayed.digest(), committed.digest());
+        assert_eq!(replayed.request_digest(), committed.request_digest());
+        assert_eq!(replayed.authority_digest(), committed.authority_digest());
+        assert_eq!(replayed.disposition(), ConfigurationDisposition::Replayed);
         assert_eq!(store.current().expect("current").revision(), 1);
     }
 
@@ -753,13 +1236,15 @@ mod tests {
     fn stale_revision_and_plaintext_secret_are_rejected_without_writes() {
         let mut connection = Connection::open_in_memory().expect("database");
         let mut store = new_store(&mut connection);
+        let authority = authority_for(&store, 1, 1);
+        store.bind_authority(&authority).expect("bind");
         let first =
             ConfigurationTransaction::new("tx-1", Some(0), json!({"value": 1})).expect("request");
-        store.apply(&first).expect("first");
+        store.apply(&authority, &first).expect("first");
         let stale =
             ConfigurationTransaction::new("tx-2", Some(0), json!({"value": 2})).expect("request");
         assert!(matches!(
-            store.apply(&stale),
+            store.apply(&authority, &stale),
             Err(ConfigurationError::RevisionConflict { .. })
         ));
         let plaintext =
@@ -775,17 +1260,129 @@ mod tests {
     fn rollback_creates_new_revision_and_restores_historical_value() {
         let mut connection = Connection::open_in_memory().expect("database");
         let mut store = new_store(&mut connection);
+        let authority = authority_for(&store, 1, 1);
+        store.bind_authority(&authority).expect("bind");
         store
-            .apply(&ConfigurationTransaction::new("tx-1", Some(0), json!({"v": 1})).unwrap())
+            .apply(
+                &authority,
+                &ConfigurationTransaction::new("tx-1", Some(0), json!({"v": 1})).unwrap(),
+            )
             .expect("first");
         store
-            .apply(&ConfigurationTransaction::new("tx-2", Some(1), json!({"v": 2})).unwrap())
+            .apply(
+                &authority,
+                &ConfigurationTransaction::new("tx-2", Some(1), json!({"v": 2})).unwrap(),
+            )
             .expect("second");
         let rollback = ConfigurationTransaction::rollback("tx-3", Some(2), 1).unwrap();
-        let receipt = store.apply(&rollback).expect("rollback");
+        let receipt = store.apply(&authority, &rollback).expect("rollback");
         assert_eq!(receipt.revision(), 3);
         assert_eq!(store.current().unwrap().configuration(), &json!({"v": 1}));
         assert_eq!(store.revision(2).unwrap().configuration(), &json!({"v": 2}));
+    }
+
+    #[test]
+    fn rotation_rejects_stale_and_incompatible_requests_without_database_changes() {
+        let mut connection = Connection::open_in_memory().expect("database");
+        let mut store = new_store(&mut connection);
+        let old_authority = authority_for(&store, 1, 1);
+        store.bind_authority(&old_authority).expect("bind");
+        store
+            .apply(
+                &old_authority,
+                &ConfigurationTransaction::new("baseline", Some(0), json!({"mode": "base"}))
+                    .unwrap(),
+            )
+            .expect("baseline");
+
+        let fresh_authority = authority_for(&store, 2, 2);
+        store
+            .rotate_authority(&old_authority, &fresh_authority)
+            .expect("rotate");
+        let proposed = ConfigurationTransaction::new(
+            "proposal-n",
+            Some(1),
+            json!({"mode": "next"}),
+        )
+        .expect("proposal");
+        let stale_rollback = ConfigurationTransaction::rollback("rollback-n", Some(1), 1)
+            .expect("rollback");
+
+        let before = database_rows(&store);
+        assert!(matches!(
+            store.apply(&old_authority, &proposed),
+            Err(ConfigurationError::AuthorityConflict)
+        ));
+        assert_eq!(database_rows(&store), before);
+        assert!(matches!(
+            store.apply(&old_authority, &stale_rollback),
+            Err(ConfigurationError::AuthorityConflict)
+        ));
+        assert_eq!(database_rows(&store), before);
+
+        let wrong_base = authority(
+            2,
+            2,
+            0,
+            Sha256Digest::compute(b"wrong-base"),
+            1,
+            Sha256Digest::compute(b"graph-v1"),
+        );
+        assert!(matches!(
+            store.apply(&wrong_base, &proposed),
+            Err(ConfigurationError::AuthorityConflict)
+        ));
+        assert_eq!(database_rows(&store), before);
+        let wrong_graph = authority(
+            2,
+            2,
+            fresh_authority_base_revision(&store),
+            fresh_authority_base_digest(&store),
+            2,
+            Sha256Digest::compute(b"graph-v2"),
+        );
+        assert!(matches!(
+            store.apply(&wrong_graph, &proposed),
+            Err(ConfigurationError::AuthorityConflict)
+        ));
+        assert_eq!(database_rows(&store), before);
+
+        let committed = store.apply(&fresh_authority, &proposed).expect("fresh apply");
+        assert_eq!(committed.disposition(), ConfigurationDisposition::Committed);
+        let replayed = store.apply(&fresh_authority, &proposed).expect("replay");
+        assert_eq!(replayed.disposition(), ConfigurationDisposition::Replayed);
+        let after_replay = database_rows(&store);
+        let changed_request =
+            ConfigurationTransaction::new("proposal-n", Some(1), json!({"mode": "changed"}))
+                .expect("changed request");
+        assert!(matches!(
+            store.apply(&fresh_authority, &changed_request),
+            Err(ConfigurationError::IdempotencyConflict)
+        ));
+        assert_eq!(database_rows(&store), after_replay);
+
+        let rollback_current = ConfigurationTransaction::rollback("rollback-current", Some(2), 1)
+            .expect("rollback");
+        assert!(matches!(
+            store.apply(&fresh_authority, &rollback_current),
+            Err(ConfigurationError::RollbackAuthorityConflict)
+        ));
+        assert_eq!(database_rows(&store), after_replay);
+
+        let future_authority = authority_for(&store, 3, 3);
+        assert!(matches!(
+            store.apply(&future_authority, &proposed),
+            Err(ConfigurationError::AuthorityConflict)
+        ));
+        assert_eq!(database_rows(&store), after_replay);
+    }
+
+    fn fresh_authority_base_revision(store: &ConfigurationStore<'_>) -> u64 {
+        store.current().expect("current").revision()
+    }
+
+    fn fresh_authority_base_digest(store: &ConfigurationStore<'_>) -> Sha256Digest {
+        store.current().expect("current").digest().clone()
     }
 
     #[test]
