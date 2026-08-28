@@ -1,10 +1,11 @@
-use dolly_canonical_json::{Sha256Digest, canonicalize};
+use dolly_canonical_json::{CanonicalJsonObject, CanonicalJsonValue, Sha256Digest, canonicalize};
 use dolly_core_domain::LeaseToken;
 use dolly_core_reducer::{
     BuildManifestCommand, CoreCommand, EnvironmentInput, InstallConfigCommand, InstallGraphCommand,
     TransitionOutcome,
 };
-use dolly_extension_host::admit_activation;
+use dolly_extension_host::{CapabilityProjection, admit_activation, admit_sdk_capability};
+use dolly_extension_sdk::{CapabilityRequest, ResultData};
 use dolly_protocol::FrameLimits;
 use dolly_runtime::{DispatchResult, LeaseRequest, RuntimeTransactionEngine};
 use dolly_storage::SqliteCoreStore;
@@ -21,7 +22,6 @@ fn input() -> EnvironmentInput {
         ..Default::default()
     }
 }
-
 
 fn graph_input() -> EnvironmentInput {
     EnvironmentInput {
@@ -173,7 +173,9 @@ fn accepted_g1_frame_becomes_fenced_premise_and_replay_is_same_key() {
         Some(7),
     );
     let reservation = engine.allocate_request(&request, &graph_input()).unwrap();
-    let premise = engine.prepare_execution(&request, &reservation, &graph_input()).unwrap();
+    let premise = engine
+        .prepare_execution(&request, &reservation, &graph_input())
+        .unwrap();
     let dispatch: DispatchResult = engine
         .dispatch_execution(&premise, "g2-dispatch", &lease_token, &input())
         .unwrap();
@@ -184,6 +186,39 @@ fn accepted_g1_frame_becomes_fenced_premise_and_replay_is_same_key() {
     assert_eq!(admitted.frame_digest().to_string(), dispatch.frame_digest());
     assert_eq!(admitted.lease_token_digest().to_string(), token_digest);
     assert_eq!(admitted.replay_key().0, ACTIVATION_ID);
+    let arguments = CanonicalJsonObject::try_from_iter([(
+        "page_id".into(),
+        CanonicalJsonValue::String("page".into()),
+    )])
+    .unwrap();
+    let projection = CapabilityProjection::new(
+        "org.example.extension",
+        "timer",
+        &admitted.manifest_digest().to_string(),
+        vec!["host.block.get".into()],
+    )
+    .unwrap();
+    let sdk_request = CapabilityRequest::new("host.block.get", arguments.clone()).unwrap();
+    let admitted_request = admit_sdk_capability(&admitted, &projection, sdk_request).unwrap();
+    assert_eq!(admitted_request.method(), "host.block.get");
+    assert_eq!(admitted_request.arguments(), &arguments);
+    let undeclared = CapabilityRequest::new("host.model.invoke", arguments.clone()).unwrap();
+    assert!(admit_sdk_capability(&admitted, &projection, undeclared).is_err());
+    let result = ResultData::success(None, None);
+    let receipt = admitted.result_receipt(&result).unwrap();
+    assert_eq!(receipt.replay_key(), admitted.replay_key());
+    assert_eq!(receipt.result_digest(), &result.digest().unwrap());
+    let receipt_value: Value = serde_json::from_slice(receipt.bytes()).unwrap();
+    assert_eq!(receipt_value["invocation"]["activation_id"], ACTIVATION_ID);
+    assert_eq!(
+        receipt_value["invocation"]["frame_digest"],
+        dispatch.frame_digest()
+    );
+    assert_eq!(receipt_value["result"]["payload"]["status"], "success");
+    assert_eq!(
+        canonicalize(&receipt_value).unwrap().0.as_bytes(),
+        receipt.bytes()
+    );
 
     let replay = engine
         .dispatch_execution(&premise, "g2-dispatch-replay", &lease_token, &input())
@@ -192,4 +227,8 @@ fn accepted_g1_frame_becomes_fenced_premise_and_replay_is_same_key() {
     assert_eq!(replayed.replay_key(), admitted.replay_key());
     assert_eq!(replayed.frame_digest(), admitted.frame_digest());
     assert_eq!(replay.transition().state, dispatch.transition().state);
+    let replay_receipt = replayed.result_receipt(&result).unwrap();
+    assert_eq!(replay_receipt.replay_key(), receipt.replay_key());
+    assert_eq!(replay_receipt.result_digest(), receipt.result_digest());
+    assert_eq!(replay_receipt.receipt_digest(), receipt.receipt_digest());
 }
