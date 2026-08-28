@@ -19,3 +19,4 @@ thiserror = "2"
 dolly-extension-host = { path = "../dolly-extension-host" }
 dolly-protocol = { path = "../dolly-protocol" }
 dolly-extension-sdk = { path = "../dolly-extension-sdk" }
+dolly-worker = { path = "../dolly-worker" }

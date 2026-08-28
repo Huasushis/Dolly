@@ -244,6 +244,7 @@ dependencies = [
  "dolly-protocol",
  "dolly-schema",
  "dolly-storage",
+ "dolly-worker",
  "rusqlite",
  "serde",
  "serde_json",

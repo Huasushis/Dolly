@@ -15,8 +15,13 @@ use dolly_core_reducer::{
 use dolly_protocol::FrameLimits;
 use dolly_runtime::{DispatchResult, ExecutionPremise, LeaseRequest, RuntimeTransactionEngine};
 use dolly_storage::SqliteCoreStore;
+use dolly_worker::daemon::{
+    DaemonCommand, DaemonError, DaemonGeneration, DaemonReadinessConfig, DaemonState,
+    LocalDaemonSupervisor, RestartBounds,
+};
 use rusqlite::{Connection, types::Value as SqlValue};
 use serde_json::{Value, json};
+use std::time::Duration;
 
 fn canonical_digest(value: &Value) -> String {
     canonicalize(value)
@@ -432,6 +437,48 @@ fn case<'a>(document: &'a Value, id: &str, label: &str) -> &'a Value {
         .find(|candidate| candidate["id"] == id)
         .unwrap_or_else(|| panic!("{label} matrix case {id} is missing"))
 }
+const DAEMON_HANDSHAKE_SCRIPT: &str = r#"
+mode="$DOLLY_G3_DAEMON_MODE"
+if [ "$mode" = ready ]; then
+  printf 'DOLLY_DAEMON_READY_V1 %s %s %s %s %s\n' \
+    "$DOLLY_DAEMON_GENERATION" \
+    "$DOLLY_DAEMON_WORKER_EPOCH" \
+    "$DOLLY_DAEMON_CONTROL_CHANNEL_ID" \
+    "$DOLLY_DAEMON_OWNER_TOKEN" \
+    "$DOLLY_DAEMON_STORAGE_READY"
+fi
+sleep 2
+"#;
+
+fn daemon_command(mode: &str) -> DaemonCommand {
+    DaemonCommand::new("sh")
+        .expect("daemon command")
+        .arg("-c")
+        .arg(DAEMON_HANDSHAKE_SCRIPT)
+        .env("DOLLY_G3_DAEMON_MODE", mode)
+}
+
+fn daemon_readiness(dispatch: &G1Dispatch) -> DaemonReadinessConfig {
+    let fence = dispatch.premise.fence();
+    DaemonReadinessConfig::new(
+        fence.worker_epoch().to_string(),
+        fence.extension_connection_id().to_string(),
+        dispatch.premise.identity().activation_id().to_string(),
+    )
+    .expect("daemon readiness")
+    .with_storage_ready(true)
+    .with_startup_timeout(Duration::from_millis(100))
+    .with_stop_timeout(Duration::from_millis(100))
+    .with_restart_bounds(
+        RestartBounds::new(
+            Duration::from_millis(1),
+            Duration::from_millis(8),
+            Duration::from_secs(1),
+            3,
+        )
+        .expect("daemon restart bounds"),
+    )
+}
 
 #[test]
 fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_premise_before_io()
@@ -501,17 +548,54 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
             .expect("core state before operational admission")
     };
     let before_durable = durable_snapshot(&dispatch.connection);
-    let operational = {
-        let store = SqliteCoreStore::new(&mut dispatch.connection)
-            .expect("core schema for operational admission");
-        dolly_extension_host::admit_operational_activation(
-            &dispatch.premise,
-            &dispatch.result,
-            &store,
-            FrameLimits::defaults(),
-        )
-        .expect("accepted G2 invocation must reach operational premise")
-    };
+    assert!(
+        !before_durable.is_empty(),
+        "storage readiness must be observable"
+    );
+    let readiness = daemon_readiness(&dispatch);
+
+    let mut unauthenticated =
+        LocalDaemonSupervisor::with_readiness(daemon_command("silent"), readiness.clone());
+    assert!(matches!(
+        unauthenticated.start(),
+        Err(DaemonError::ReadinessTimeout)
+    ));
+    assert!(matches!(
+        unauthenticated.state(),
+        DaemonState::Exited(_) | DaemonState::Quarantined(_)
+    ));
+    let first_generation = DaemonGeneration::new(1).expect("first daemon generation");
+    assert!(matches!(
+        unauthenticated.acquire_work_guard(first_generation),
+        Err(DaemonError::StaleGeneration { .. })
+    ));
+    unauthenticated.stop().expect("stop unauthenticated child");
+
+    let mut supervisor = LocalDaemonSupervisor::with_readiness(daemon_command("ready"), readiness);
+    let daemon_generation = supervisor
+        .start()
+        .expect("authenticated readiness must pass");
+    assert_eq!(supervisor.state(), DaemonState::Running(daemon_generation));
+    let work_guard = supervisor
+        .acquire_work_guard(daemon_generation)
+        .expect("ready generation must issue a work guard");
+    assert_eq!(work_guard.generation(), daemon_generation);
+    assert!(work_guard.is_usable());
+    assert_eq!(supervisor.active_work_count(), 1);
+
+    let operational = supervisor
+        .with_work_guard(&work_guard, || {
+            let store = SqliteCoreStore::new(&mut dispatch.connection)
+                .expect("core schema for operational admission");
+            dolly_extension_host::admit_operational_activation(
+                &dispatch.premise,
+                &dispatch.result,
+                &store,
+                FrameLimits::defaults(),
+            )
+        })
+        .expect("operational admission must remain inside the work guard")
+        .expect("accepted G2 invocation must reach operational premise");
     let after_core = {
         let store = SqliteCoreStore::new(&mut dispatch.connection)
             .expect("core schema after operational admission");
@@ -529,6 +613,17 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
     assert_eq!(before_core.pages, after_core.pages);
     assert_eq!(before_core.blocks, after_core.blocks);
     assert_operational_fences(&dispatch, &operational);
+
+    supervisor.stop().expect("stop authenticated child");
+    assert!(!work_guard.is_usable());
+    assert_eq!(supervisor.active_work_count(), 0);
+    let mut effect_executions = 0;
+    assert!(
+        supervisor
+            .with_work_guard(&work_guard, || effect_executions += 1)
+            .is_err()
+    );
+    assert_eq!(effect_executions, 0, "fenced work cannot execute an effect");
 }
 
 #[test]
