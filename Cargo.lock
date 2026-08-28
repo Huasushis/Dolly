@@ -228,6 +228,8 @@ dependencies = [
  "dolly-canonical-json",
  "dolly-core-domain",
  "dolly-core-reducer",
+ "dolly-extension-host",
+ "dolly-protocol",
  "dolly-schema",
  "dolly-storage",
  "rusqlite",

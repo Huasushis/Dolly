@@ -14,6 +14,7 @@ use dolly_core_reducer::{
     InstallGraphCommand, TransitionOutcome,
 };
 use dolly_runtime::{DispatchResult, ExecutionPremise, LeaseRequest, RuntimeTransactionEngine};
+use dolly_protocol::FrameLimits;
 use dolly_storage::SqliteCoreStore;
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -369,16 +370,188 @@ fn g2_admission_001_valid_committed_g1_module_activate_reaches_one_host_admissio
         state.blocks.is_empty(),
         "admission must not publish a Block"
     );
-    let receipt = dispatch
-        .result
-        .transition()
-        .reply
-        .as_ref()
-        .and_then(|reply| reply.get("host_admission"))
-        .expect("G2-ADMISSION-001: committed module.activate frame has no Host admission receipt");
-    assert_eq!(receipt["method"], "module.activate");
-    assert_eq!(receipt["context"], context);
-    assert_eq!(receipt["request"], observed);
+    let admitted = dolly_extension_host::admit_activation(
+        &dispatch.premise,
+        &dispatch.result,
+        FrameLimits::defaults(),
+    )
+    .expect("accepted G1 dispatch must pass Host admission");
+    let premise = &dispatch.premise;
+    let admitted_manifest =
+        serde_json::to_value(admitted.manifest()).expect("admitted manifest must serialize");
+    assert_eq!(admitted_manifest, dispatch.manifest);
+    assert_eq!(admitted.activation_id(), premise.identity().activation_id());
+    assert_eq!(
+        admitted.activation_id(),
+        context["activation_id"].as_str().expect("activation_id context")
+    );
+    assert_eq!(admitted.module_id(), premise.identity().module_id());
+    assert_eq!(
+        admitted.module_id(),
+        context["module_id"].as_str().expect("module_id context")
+    );
+    assert_eq!(admitted.request_id(), premise.fence().request_id());
+    assert_eq!(
+        admitted.request_id(),
+        context["request_id"].as_str().expect("request_id context")
+    );
+    assert_eq!(admitted.reservation_id(), premise.fence().reservation_id());
+    assert_eq!(admitted.lease_id(), premise.fence().lease_id());
+    assert_eq!(admitted.worker_epoch(), premise.fence().worker_epoch());
+    assert_eq!(
+        admitted.worker_epoch().to_string(),
+        context["worker_epoch"].as_str().expect("worker_epoch context")
+    );
+    assert_eq!(
+        admitted.worker_epoch_fence(),
+        premise.fence().worker_epoch_fence()
+    );
+    assert_eq!(
+        admitted.worker_epoch_fence(),
+        context["worker_epoch_fence"]
+            .as_i64()
+            .expect("worker_epoch_fence context")
+    );
+    assert_eq!(
+        admitted.incarnation_revision(),
+        premise.fence().incarnation_revision()
+    );
+    assert_eq!(
+        admitted.incarnation_revision(),
+        context["host_incarnation"]["incarnation_revision"]
+            .as_i64()
+            .expect("incarnation_revision context")
+    );
+    assert_eq!(
+        admitted.extension_connection_id(),
+        premise.fence().extension_connection_id()
+    );
+    assert_eq!(
+        admitted.extension_connection_id(),
+        context["host_incarnation"]["extension_connection_id"]
+            .as_str()
+            .expect("extension_connection_id context")
+    );
+    assert_eq!(
+        admitted.extension_generation(),
+        premise.fence().extension_generation()
+    );
+    assert_eq!(
+        admitted.extension_generation(),
+        context["extension_generation"]
+            .as_i64()
+            .expect("extension_generation context")
+    );
+    assert_eq!(admitted.lease_generation(), premise.fence().lease_generation());
+    assert_eq!(
+        admitted.lease_generation(),
+        context["lease_generation"]
+            .as_i64()
+            .expect("lease_generation context")
+    );
+    assert_eq!(admitted.attempt(), premise.fence().attempt());
+    let fixture_token: LeaseToken = source["lease_token"]
+        .as_str()
+        .expect("lease token")
+        .parse()
+        .expect("fixture lease token is valid");
+    let expected_token_digest =
+        Sha256Digest::compute(fixture_token.expose_bytes()).to_canonical_string();
+    assert_eq!(
+        admitted.lease_token_digest().to_string(),
+        expected_token_digest
+    );
+    assert_eq!(
+        admitted.graph_digest().to_string(),
+        premise.digests().graph_digest()
+    );
+    assert_eq!(
+        admitted.graph_digest().to_string(),
+        canonical_digest(&graph_snapshot(premise.identity().module_id()))
+    );
+    assert_eq!(
+        admitted.descriptor_digest().to_string(),
+        premise.digests().descriptor_digest()
+    );
+    assert_eq!(
+        admitted.descriptor_digest().to_string(),
+        canonical_digest(&descriptor(premise.identity().module_id()))
+    );
+    assert_eq!(
+        admitted.manifest_digest().to_string(),
+        premise.digests().manifest_digest()
+    );
+    assert_eq!(
+        admitted.manifest_digest().to_string(),
+        dispatch.manifest["manifest_digest"]
+            .as_str()
+            .expect("manifest digest")
+    );
+    assert_eq!(
+        admitted.effective_config_digest().to_string(),
+        premise.digests().effective_config_digest()
+    );
+    assert_eq!(
+        admitted.effective_config_digest().to_string(),
+        canonical_digest(&dispatch.manifest["effective_config"])
+    );
+    assert_eq!(
+        admitted.effective_config_schema_digest().to_string(),
+        premise.digests().effective_config_schema_digest()
+    );
+    assert_eq!(
+        admitted.effective_config_schema_digest().to_string(),
+        dispatch.manifest["effective_config_schema_digest"]
+            .as_str()
+            .expect("effective config schema digest")
+    );
+    assert_eq!(
+        admitted.manifest().graph_revision.value(),
+        dispatch.manifest["graph_revision"]
+            .as_u64()
+            .expect("graph revision")
+    );
+    assert_eq!(
+        admitted.manifest().config_revision.value(),
+        dispatch.manifest["config_revision"]
+            .as_u64()
+            .expect("config revision")
+    );
+    assert_eq!(
+        admitted.manifest().descriptor_revision.value(),
+        dispatch.manifest["descriptor_revision"]
+            .as_u64()
+            .expect("descriptor revision")
+    );
+    assert_eq!(
+        admitted.frame_digest().to_string(),
+        dispatch.result.frame_digest()
+    );
+    assert_eq!(
+        admitted.frame_digest().to_string(),
+        context["frame_digest"].as_str().expect("frame digest context")
+    );
+    assert_eq!(admitted.order(), premise.order());
+    assert_eq!(admitted.replay_scope(), premise.replay_scope());
+
+    let capability_digest = admitted.manifest_digest().to_string();
+    let projection = dolly_extension_host::CapabilityProjection::new(
+        "org.example.extension",
+        admitted.module_id(),
+        &capability_digest,
+        vec!["host.block.get".into()],
+    )
+    .expect("Host capability projection");
+    let capability = dolly_extension_host::CapabilityRequest::new(
+        "org.example.extension",
+        admitted.module_id(),
+        &capability_digest,
+        "host.block.get",
+        dolly_extension_host::RpcDirection::ExtensionToHost,
+    )
+    .expect("Host capability request");
+    dolly_extension_host::admit_capability(&projection, &capability)
+        .expect("bound capability must pass Host admission");
 }
 
 #[test]
