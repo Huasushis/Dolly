@@ -62,7 +62,6 @@
       "lease_token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
       "token_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "rpc_id": "rpc-g1-activation-001",
-      "effect_consumer_calls": 0,
       "expected_request": {
         "jsonrpc": "2.0",
         "id": "rpc-g1-activation-001",

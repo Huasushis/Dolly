@@ -15,7 +15,7 @@ use dolly_core_reducer::{
     ActivationState, BuildManifestCommand, CoreCommand, EnvironmentInput, InstallConfigCommand,
     InstallGraphCommand, TransitionOutcome,
 };
-use dolly_runtime::{LeaseRequest, RuntimeTransactionEngine};
+use dolly_runtime::{DispatchResult, LeaseRequest, RuntimeTransactionEngine};
 use dolly_storage::SqliteCoreStore;
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -259,6 +259,7 @@ fn g1_exec_001_valid_durable_activation_emits_exact_module_activate_premise_befo
         )
         .expect("accepted manifest transaction");
     assert_eq!(built.outcome, TransitionOutcome::Committed);
+    let execution_start = engine.snapshot().expect("pre-execution snapshot");
 
     let lease_token: LeaseToken = case["lease_token"]
         .as_str()
@@ -290,7 +291,7 @@ fn g1_exec_001_valid_durable_activation_emits_exact_module_activate_premise_befo
         leased.activations[activation_id].extension_generation,
         Some(7)
     );
-    let dispatched = engine
+    let dispatched: DispatchResult = engine
         .dispatch_execution(
             &premise,
             "g1-exec-dispatch-001",
@@ -372,7 +373,75 @@ fn g1_exec_001_valid_durable_activation_emits_exact_module_activate_premise_befo
         "g1-extension-connection"
     );
 
-    // The effect boundary is deliberately not entered by this matrix.
-    let effect_consumer_calls = 0;
-    assert_eq!(effect_consumer_calls, case["effect_consumer_calls"]);
+    let execution_events: Vec<_> = durable
+        .journal
+        .iter()
+        .skip(execution_start.journal.len())
+        .collect();
+    assert_eq!(execution_events.len(), 3);
+    assert_eq!(
+        execution_events
+            .iter()
+            .map(|event| event.event.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "HostRequestAllocated",
+            "LeaseIssued",
+            "LeaseDispatchRecorded"
+        ]
+    );
+    let allocation_details = execution_events[0].details.as_ref().unwrap();
+    assert_eq!(
+        allocation_details["reservation_id"],
+        premise.fence().reservation_id()
+    );
+    assert_eq!(
+        allocation_details["request_id"],
+        premise.fence().request_id()
+    );
+    let lease_details = execution_events[1].details.as_ref().unwrap();
+    assert_eq!(lease_details["lease_id"], "g1-exec-lease-id-001");
+    assert_eq!(
+        lease_details["reservation_id"],
+        premise.fence().reservation_id()
+    );
+    assert_eq!(
+        lease_details["incarnation_revision"],
+        json!(premise.fence().incarnation_revision())
+    );
+    let dispatch_details = execution_events[2].details.as_ref().unwrap();
+    assert_eq!(dispatch_details["lease_id"], "g1-exec-lease-id-001");
+    assert_eq!(dispatch_details["dispatch_state"], "started");
+    assert_eq!(
+        dispatch_details["frame_digest"],
+        dispatched.frame_digest()
+    );
+    assert_eq!(durable.outputs, execution_start.outputs);
+    assert_eq!(durable.deliveries, execution_start.deliveries);
+    assert_eq!(durable.runtime_events, execution_start.runtime_events);
+    assert_eq!(durable.blocks, execution_start.blocks);
+    assert_eq!(durable.pages, execution_start.pages);
+    assert_eq!(durable.subscriptions, execution_start.subscriptions);
+    assert_eq!(durable.manifests, execution_start.manifests);
+    assert_eq!(durable.generations, execution_start.generations);
+    assert_eq!(durable.current_generation, execution_start.current_generation);
+    assert_eq!(durable.quarantines, execution_start.quarantines);
+    assert_eq!(durable.security_incidents, execution_start.security_incidents);
+    assert_eq!(
+        durable.host_request_reservations.len(),
+        execution_start.host_request_reservations.len() + 1
+    );
+    let reservation_record = durable
+        .host_request_reservations
+        .get(premise.fence().reservation_id())
+        .expect("durable Host request reservation");
+    assert_eq!(reservation_record["state"], "bound");
+    assert_eq!(
+        reservation_record["request_id"],
+        premise.fence().request_id()
+    );
+    assert_eq!(
+        reservation_record["incarnation_revision"],
+        json!(premise.fence().incarnation_revision())
+    );
 }
