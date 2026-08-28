@@ -721,6 +721,13 @@ impl Drop for SecretMaterial {
 /// Host-owned provider interface. Implementations must bind lookups to the
 /// supplied sealed owner and reference.
 trait SecretProvider: Send + Sync {
+    fn provision(
+        &self,
+        owner: &SecretOwner,
+        reference: SecretRef,
+        bytes: &[u8],
+    ) -> Result<(), SecretError>;
+
     fn resolve(
         &self,
         owner: &SecretOwner,
@@ -744,6 +751,18 @@ struct HostSecretAuthority {
 impl HostSecretAuthority {
     fn new(provider: Arc<dyn SecretProvider>) -> Self {
         Self { provider }
+    }
+
+    fn provision(
+        &self,
+        owner: &SecretOwner,
+        reference: SecretRef,
+        bytes: &[u8],
+    ) -> Result<(), SecretError> {
+        owner.check_live()?;
+        self.provider.provision(owner, reference, bytes)?;
+        owner.check_live()?;
+        Ok(())
     }
 
     fn with_secret<T>(
@@ -788,6 +807,17 @@ impl fmt::Debug for InMemorySecretProvider {
 }
 
 impl SecretProvider for InMemorySecretProvider {
+    fn provision(
+        &self,
+        owner: &SecretOwner,
+        reference: SecretRef,
+        bytes: &[u8],
+    ) -> Result<(), SecretError> {
+        let mut values = self.values.lock().map_err(|_| SecretError::Unavailable)?;
+        values.insert((owner.clone(), reference), bytes.to_vec());
+        Ok(())
+    }
+
     fn resolve(
         &self,
         owner: &SecretOwner,
@@ -862,6 +892,36 @@ impl HostExternalIoAuthority {
             policy.extension_generation(),
         );
         Self::from_owner_with_provider(policy, owner, secrets).expect("test authority")
+    }
+
+    /// Provision one secret for this authority's admitted live owner.
+    pub fn provision_secret(
+        &self,
+        premise: &OperationalPremise,
+        reference: SecretRef,
+        bytes: &[u8],
+    ) -> Result<(), ExternalIoError> {
+        let owner = SecretOwner::from_premise(premise)?;
+        if owner != self.owner {
+            return Err(ExternalIoError::StaleGeneration);
+        }
+        self.owner
+            .check_live()
+            .map_err(|_| ExternalIoError::StaleGeneration)?;
+        let gate = self
+            .gate
+            .lock()
+            .map_err(|_| ExternalIoError::AuthorityUnavailable)?;
+        if gate.stopped {
+            return Err(ExternalIoError::Stopped);
+        }
+        if gate.active_generation != self.owner.extension_generation {
+            return Err(ExternalIoError::StaleGeneration);
+        }
+        drop(gate);
+        self.secrets
+            .provision(&self.owner, reference, bytes)
+            .map_err(|_| ExternalIoError::AuthorityUnavailable)
     }
 
     pub fn policy(&self) -> &ExternalIoPolicy {

@@ -881,11 +881,40 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
     let authority = operational
         .external_io_authority(policy)
         .expect("live external authority");
+    let secret_reference: dolly_extension_host::SecretRef =
+        "secret://vault/g3".parse().expect("secret reference");
+    let unprovisioned_request = dolly_extension_host::ExternalIoRequest::new(
+        "org.example.extension",
+        "read",
+        target.clone(),
+        Some(
+            "secret://vault/unprovisioned"
+                .parse()
+                .expect("unprovisioned reference"),
+        ),
+    )
+    .expect("unprovisioned external request");
+    let unprovisioned_permit = authority
+        .authorize(&operational, unprovisioned_request)
+        .expect("live premise must authorize unprovisioned request");
+    let unprovisioned_effects = std::cell::Cell::new(0);
+    let unprovisioned_result = unprovisioned_permit.execute(|_| {
+        unprovisioned_effects.set(unprovisioned_effects.get() + 1);
+        Ok::<_, ()>(())
+    });
+    assert!(matches!(
+        unprovisioned_result,
+        Err(dolly_extension_host::ExternalIoExecutionError::SecretUnavailable)
+    ));
+    assert_eq!(unprovisioned_effects.get(), 0);
+    authority
+        .provision_secret(&operational, secret_reference.clone(), b"g3-secret")
+        .expect("live owner must provision a secret");
     let request = dolly_extension_host::ExternalIoRequest::new(
         "org.example.extension",
         "read",
         target.clone(),
-        Some("secret://vault/g3".parse().expect("secret reference")),
+        Some(secret_reference.clone()),
     )
     .expect("external request");
     let stopped_permit = authority
@@ -905,6 +934,16 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
         Err(dolly_extension_host::ExternalIoError::Stopped)
             | Err(dolly_extension_host::ExternalIoError::StaleGeneration)
     ));
+    let stopped_provision =
+        authority.provision_secret(&escaped_premise, secret_reference.clone(), b"stale-secret");
+    assert!(
+        matches!(
+            stopped_provision,
+            Err(dolly_extension_host::ExternalIoError::Stopped)
+                | Err(dolly_extension_host::ExternalIoError::StaleGeneration)
+        ),
+        "stopped lifecycle cannot provision a secret"
+    );
     let stopped_config_base = {
         let configuration =
             ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
@@ -1227,6 +1266,16 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
         before_changed_configuration,
         "rollback from an older authority must not restore blind historical bytes"
     );
+    let wrong_owner_provision =
+        authority.provision_secret(&fresh_operational, secret_reference.clone(), b"wrong-owner");
+    assert!(
+        matches!(
+            wrong_owner_provision,
+            Err(dolly_extension_host::ExternalIoError::StaleGeneration)
+                | Err(dolly_extension_host::ExternalIoError::Stopped)
+        ),
+        "old authority cannot provision for a fresh lifecycle owner"
+    );
     let mut fresh_policy = dolly_extension_host::ExternalIoPolicy::new(
         "org.example.extension",
         fresh_operational.config_revision(),
@@ -1240,14 +1289,29 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
     let fresh_authority = fresh_operational
         .external_io_authority(fresh_policy)
         .expect("fresh external authority");
-    let fresh_request =
-        dolly_extension_host::ExternalIoRequest::new("org.example.extension", "read", target, None)
-            .expect("fresh external request");
+    fresh_authority
+        .provision_secret(
+            &fresh_operational,
+            secret_reference.clone(),
+            b"fresh-secret",
+        )
+        .expect("fresh owner must provision a secret");
+    let fresh_request = dolly_extension_host::ExternalIoRequest::new(
+        "org.example.extension",
+        "read",
+        target,
+        Some(secret_reference),
+    )
+    .expect("fresh external request");
     let fresh_permit = fresh_authority
         .authorize(&fresh_operational, fresh_request)
         .expect("fresh premise must authorize");
     let fresh_result = fresh_permit.execute(|context| {
         assert!(!context.is_cancelled());
+        assert_eq!(
+            context.secret_bytes(),
+            Some(b"fresh-secret".as_slice())
+        );
         effect_executions.set(effect_executions.get() + 1);
         Ok::<_, ()>(())
     });
