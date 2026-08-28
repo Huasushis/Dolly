@@ -13,7 +13,9 @@ use crate::content::{ObjectReader, delete_staging};
 use crate::error::{AssetError, AssetErrorCode, ErrorPhase};
 use crate::gc::{self, GcReport};
 use crate::pipeline::{ImportPipeline, RecoveryReport, validate_request};
-use crate::record::{AssetLease, AssetPin, AssetReference, ImportRequest, StatusResult};
+use crate::record::{
+    AssetLease, AssetPin, AssetReference, ImportRecord, ImportRequest, StatusResult,
+};
 use crate::remote::{DeniedFetcher, RemoteFetcher, SshDenyPolicy};
 use crate::replica::{DisabledReplica, ReplicaDriver};
 use crate::retention;
@@ -25,12 +27,17 @@ use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 
 /// An opaque security-domain capability minted by the service for the Host.
-/// Fields are private: a caller cannot forge or widen its domain or module.
+/// Fields are private: a caller cannot forge or widen its domain, module, or
+/// instance, and cannot replay a capability minted by another (stale) Host
+/// lifecycle because the epoch binds it to the issuing service instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssetCapability {
     domain: String,
     module_id: String,
     instance_id: String,
+    /// The issuing service's Host-lifecycle epoch. Capabilities from another
+    /// service instance (or a pre-restart instance) fail closed.
+    epoch: u64,
 }
 
 impl AssetCapability {
@@ -39,6 +46,9 @@ impl AssetCapability {
     }
     pub fn module_id(&self) -> &str {
         &self.module_id
+    }
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
     }
 }
 
@@ -118,6 +128,10 @@ pub struct AssetService {
     fetcher: Box<dyn RemoteFetcher>,
     replica: Box<dyn ReplicaDriver>,
     policy: SshDenyPolicy,
+    /// This service instance's Host-lifecycle epoch. Every capability is
+    /// bound to it; a capability from another (stale) service instance is
+    /// refused before any store read or mutation.
+    epoch: u64,
 }
 
 impl AssetService {
@@ -153,6 +167,7 @@ impl AssetService {
             replica: Box::new(DisabledReplica::new(prefix)),
             policy: SshDenyPolicy::new(&[]),
             config,
+            epoch: mint_lifecycle_epoch(),
         })
     }
 
@@ -193,6 +208,7 @@ impl AssetService {
             replica: Box::new(replica),
             policy: SshDenyPolicy::new(&[]),
             config,
+            epoch: mint_lifecycle_epoch(),
         })
     }
 
@@ -207,7 +223,21 @@ impl AssetService {
             domain: domain.into(),
             instance_id: instance_id.into(),
             module_id: module_id.into(),
+            epoch: self.epoch,
         }
+    }
+
+    /// Fail closed when the capability was minted by another service
+    /// instance: a stale Host lifecycle must not reach the store.
+    fn check_live(&self, capability: &AssetCapability) -> Result<(), AssetError> {
+        if capability.epoch != self.epoch {
+            return Err(AssetError::new(
+                AssetErrorCode::Unauthorized,
+                ErrorPhase::Accept,
+                "capability belongs to a different Host lifecycle".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Register a Host-issued file capability inside an allowed root.
@@ -283,6 +313,7 @@ impl AssetService {
         capability: &AssetCapability,
         request: &ImportRequest,
     ) -> Result<StatusResult, AssetError> {
+        self.check_live(capability)?;
         self.check_request_module(capability, request)?;
         let result = self.pipeline().import(&capability.domain, request);
         self.reconcile_rejected_canceled(&capability.domain, request, &result);
@@ -310,60 +341,62 @@ impl AssetService {
         )
     }
 
-    /// Read-only status; domain-scoped to the capability's own imports.
+    /// Read-only status; bound to the capability's exact instance, module,
+    /// and security domain. Unknown and cross-owner `ImportId`s both resolve
+    /// to the closed `absent` outcome (spec §7: they are indistinguishable),
+    /// which never carries an `AssetRef` and never mirrors a lifecycle state.
     pub fn status(
         &mut self,
         capability: &AssetCapability,
         import_id: &str,
     ) -> Result<StatusResult, AssetError> {
-        let result = self.pipeline().status(import_id)?;
-        if result.import_id != import_id {
-            return Err(AssetError::new(
-                AssetErrorCode::NotFound,
-                ErrorPhase::Accept,
-                "no such import".to_string(),
-            ));
+        self.check_live(capability)?;
+        match self.load_owned_import(capability, import_id)? {
+            Some(record) => Ok(StatusResult::from_record(&record)),
+            None => Ok(StatusResult::absent(import_id)),
         }
-        // Domain check: only the capability's own module may see its import.
-        let record_domain = self.import_domain(import_id)?;
-        if record_domain != capability.domain {
-            return Err(AssetError::new(
-                AssetErrorCode::Unauthorized,
-                ErrorPhase::Accept,
-                "import belongs to another security domain".to_string(),
-            ));
-        }
-        Ok(result)
     }
 
-    fn import_domain(&mut self, import_id: &str) -> Result<String, AssetError> {
+    /// Load one import record after binding the capability's exact instance,
+    /// module, and security domain. Unknown and cross-owner lookups both
+    /// yield `None`, so a caller cannot distinguish them and no record body
+    /// is returned to the wrong owner.
+    fn load_owned_import(
+        &mut self,
+        capability: &AssetCapability,
+        import_id: &str,
+    ) -> Result<Option<ImportRecord>, AssetError> {
         let tx = self.store.transaction().map_err(store_error_public)?;
         let record = tx.load_import(import_id).map_err(store_error_public)?;
         tx.commit().map_err(store_error_public)?;
-        record
-            .map(|r| r.security_domain)
-            .ok_or_else(|| {
-                AssetError::new(
-                    AssetErrorCode::NotFound,
-                    ErrorPhase::Accept,
-                    "no such import".to_string(),
-                )
-            })
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        if record.security_domain != capability.domain
+            || record.module_id != capability.module_id
+            || record.instance_id != capability.instance_id
+        {
+            return Ok(None);
+        }
+        Ok(Some(record))
     }
 
-    /// Cancel a non-terminal import.
+    /// Cancel a non-terminal import owned by the capability's exact
+    /// instance, module, and security domain. Cross-owner and unknown
+    /// `ImportId`s are refused before any mutation.
     pub fn cancel(
         &mut self,
         capability: &AssetCapability,
         import_id: &str,
     ) -> Result<StatusResult, AssetError> {
-        let domain = self.import_domain(import_id)?;
-        if domain != capability.domain {
+        self.check_live(capability)?;
+        if self.load_owned_import(capability, import_id)?.is_none() {
             return Err(AssetError::new(
-                AssetErrorCode::Unauthorized,
+                AssetErrorCode::NotFound,
                 ErrorPhase::Accept,
-                "import belongs to another security domain".to_string(),
-            ));
+                "no such import".to_string(),
+            )
+            .with_import_id(import_id));
         }
         self.pipeline().cancel(import_id)
     }
@@ -530,6 +563,15 @@ impl AssetService {
             }
         }
     }
+}
+
+/// A fresh per-service Host-lifecycle epoch that every capability is bound
+/// to. A capability minted by another service instance (or a pre-restart
+/// instance) is refused before any store read or mutation.
+fn mint_lifecycle_epoch() -> u64 {
+    let mut bytes = [0u8; 8];
+    let _ = getrandom::fill(&mut bytes);
+    u64::from_le_bytes(bytes)
 }
 
 fn mint_capability_token() -> LeaseToken {
