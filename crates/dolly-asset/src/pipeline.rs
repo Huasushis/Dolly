@@ -193,28 +193,18 @@ impl<'a> ImportPipeline<'a> {
         let digest = params_digest(request)?;
         let now = self.clock.now();
 
-        // Replay check: the same ImportId must carry identical parameters.
+        // Replay check. One gate covers every reconciliation: the complete
+        // expected identity — exact security domain (from the capability, not
+        // the request), module id, module instance id, and the canonical
+        // parameter digest — must all match. Any discrepancy is a
+        // cause-neutral conflict; absence stays indistinguishable from a
+        // record owned by someone else.
         {
             let tx = self.store.transaction().map_err(store_error)?;
             let existing = tx.load_import(&request.import_id).map_err(store_error)?;
             tx.commit().map_err(store_error)?;
             if let Some(record) = existing {
-                if record.params_digest != digest {
-                    return Err(AssetError::new(
-                        AssetErrorCode::ImportIdConflict,
-                        ErrorPhase::Validate,
-                        "ImportId reused with different parameters".to_string(),
-                    )
-                    .with_import_id(&request.import_id));
-                }
-                // The security domain is supplied by the caller's capability,
-                // not by the request, so it never enters the digest. A
-                // byte-identical replay from another domain must fail closed
-                // here rather than disclose or reuse the first domain's
-                // record and its AssetRef.
-                if record.security_domain != security_domain {
-                    // Cause-neutral: never reveal that another domain owns the
-                    // identifier, so absence stays indistinguishable.
+                if !record_matches_identity(&record, security_domain, request, &digest) {
                     return Err(import_id_in_use(&request.import_id));
                 }
                 return Ok(StatusResult::from_record(&record));
@@ -264,18 +254,13 @@ impl<'a> ImportPipeline<'a> {
             updated_at: now.iso(),
             updated_at_ms: now.millis,
         };
-        {
-            let tx = self.store.transaction().map_err(store_error)?;
-            let inserted = tx.insert_import_if_absent(&record).map_err(store_error)?;
-            tx.commit().map_err(store_error)?;
-            if !inserted {
-                // A concurrent importer (another service instance over the
-                // same store, or a Host restart) created the same ImportId
-                // between this caller's replay read and this insert. Only a
-                // record owned by this security domain may be replayed; a
-                // foreign-domain winner is refused without revealing it.
-                return self.return_current_owned(security_domain, &request.import_id);
-            }
+        if !self.claim_import_if_absent(&record)? {
+            // A concurrent importer won the identifier between this caller's
+            // replay read and this insert. The identical identity gate as
+            // the replay check decides here, so the losing insert can never
+            // bypass the initial owner/digest decision or disclose the
+            // winner's lifecycle or AssetRef.
+            return self.reconcile_concurrent_winner(security_domain, request, &digest);
         }
 
         // ACQUIRING: read bytes into a private staging object.
@@ -294,7 +279,7 @@ impl<'a> ImportPipeline<'a> {
                 // State already moved (recovery or another writer). Only this
                 // caller's record can have moved, because the insert above
                 // won the identifier; the owner check still runs for safety.
-                return self.return_current_owned(security_domain, &request.import_id);
+                return self.return_current_owned(security_domain, request, &digest, &request.import_id);
             }
         }
 
@@ -365,7 +350,7 @@ impl<'a> ImportPipeline<'a> {
             );
             tx.commit().map_err(store_error)?;
             if result.is_err() {
-                return self.return_current_owned(security_domain, &request.import_id);
+                return self.return_current_owned(security_domain, request, &digest, &request.import_id);
             }
         }
 
@@ -409,7 +394,7 @@ impl<'a> ImportPipeline<'a> {
         if state == ImportState::Replicating {
             let _ = self.replicate(&request.import_id, &asset_id, byte_length, content_hash, now);
         }
-        self.return_current_owned(security_domain, &request.import_id)
+        self.return_current_owned(security_domain, request, &digest, &request.import_id)
     }
 
     /// The VERIFYING body: length, media probe, declared-type check.
@@ -979,14 +964,16 @@ impl<'a> ImportPipeline<'a> {
         }
     }
 
-    /// Read-only replay of the current record, refusing when it is not owned
-    /// by `security_domain`. Every import path that returns an existing
-    /// record goes through here, so a foreign-domain winner — a concurrent
-    /// importer who created the ImportId, or the loser of an
-    /// `insert_import_if_absent` race — is never disclosed or reused.
+    /// Read-only replay of the current record through the complete identity
+    /// gate. Every import path that returns an existing record goes through
+    /// here, so a concurrent winner of the identifier — or the loser of an
+    /// `insert_import_if_absent` race — is never disclosed or reused unless
+    /// every identity field matches exactly.
     fn return_current_owned(
         &mut self,
         security_domain: &str,
+        request: &ImportRequest,
+        digest: &str,
         import_id: &str,
     ) -> Result<StatusResult, AssetError> {
         let tx = self.store.transaction().map_err(store_error)?;
@@ -1000,11 +987,54 @@ impl<'a> ImportPipeline<'a> {
             )
             .with_import_id(import_id));
         };
-        if record.security_domain != security_domain {
+        if !record_matches_identity(&record, security_domain, request, digest) {
             return Err(import_id_in_use(import_id));
         }
         Ok(StatusResult::from_record(&record))
     }
+
+    /// Claim the durable ACCEPTED record for `record`. `Ok(true)` when this
+    /// caller won the identifier; `Ok(false)` when a concurrent importer
+    /// already owns it — the losing-insert case, which the caller resolves
+    /// through [`Self::reconcile_concurrent_winner`].
+    fn claim_import_if_absent(
+        &mut self,
+        record: &ImportRecord,
+    ) -> Result<bool, AssetError> {
+        let tx = self.store.transaction().map_err(store_error)?;
+        let inserted = tx.insert_import_if_absent(record).map_err(store_error)?;
+        tx.commit().map_err(store_error)?;
+        Ok(inserted)
+    }
+
+    /// Reconcile a concurrent winner of the identifier with the identical
+    /// identity gate as the replay check, so the losing insert can never
+    /// bypass the initial owner/digest decision.
+    fn reconcile_concurrent_winner(
+        &mut self,
+        security_domain: &str,
+        request: &ImportRequest,
+        digest: &str,
+    ) -> Result<StatusResult, AssetError> {
+        self.return_current_owned(security_domain, request, digest, &request.import_id)
+    }
+}
+
+/// The complete expected identity an existing record must match for this
+/// caller to replay it: exact security domain, module id, module instance
+/// id, and the canonical parameter digest. The security domain comes from
+/// the caller's capability and is never part of the request or its digest,
+/// so it is checked explicitly.
+fn record_matches_identity(
+    record: &ImportRecord,
+    security_domain: &str,
+    request: &ImportRequest,
+    digest: &str,
+) -> bool {
+    record.security_domain == security_domain
+        && record.module_id == request.module_id
+        && record.instance_id == request.instance_id
+        &&         record.params_digest == digest
 }
 
 /// The nondisclosing refusal for an ImportId owned by another importer. The
@@ -1068,5 +1098,329 @@ fn store_error(error: StoreError) -> AssetError {
             ErrorPhase::Commit,
             format!("sqlite failure: {e}"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::SystemClock;
+    use crate::remote::DeniedFetcher;
+    use crate::replica::DisabledReplica;
+    use crate::service::{FileCapabilityTable, StreamCapabilityTable};
+    use crate::store::AssetStore;
+    use std::path::Path;
+
+    const T0: u64 = 1_800_000_000_000;
+
+    fn import_id(n: u64) -> String {
+        format!("0198ab31-6c44-7e8a-b2bb-{n:012}")
+    }
+
+    fn deadline() -> String {
+        "2026-08-09T15:00:00.000000Z".to_string()
+    }
+
+    /// A minimal byte sequence that sniffs as a 4x2 PNG.
+    fn png_bytes() -> Vec<u8> {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        bytes.extend_from_slice(&[0, 0, 0, 13]);
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&4u32.to_be_bytes());
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+        bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+        bytes.extend_from_slice(&[0u8; 24]);
+        bytes
+    }
+
+    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    fn base64(bytes: &[u8]) -> String {
+        let mut out = String::new();
+        let mut acc: u32 = 0;
+        let mut bits: u32 = 0;
+        for &b in bytes {
+            acc = (acc << 8) | b as u32;
+            bits += 8;
+            while bits >= 6 {
+                bits -= 6;
+                out.push(B64[((acc >> bits) & 0x3f) as usize] as char);
+            }
+        }
+        if bits > 0 {
+            out.push(B64[((acc << (6 - bits)) & 0x3f) as usize] as char);
+        }
+        while out.len() % 4 != 0 {
+            out.push('=');
+        }
+        out
+    }
+
+    fn request(id: u64, png: &[u8]) -> ImportRequest {
+        ImportRequest {
+            import_id: import_id(id),
+            instance_id: "instance-a".to_string(),
+            module_id: "module-a".to_string(),
+            activation_id: None,
+            lease_token: None,
+            media_kind: MediaKind::Image,
+            source: Source::InlineBase64 { base64: base64(png) },
+            declared_media_type: Some(MediaType::parse("image/png").unwrap()),
+            remote_required: false,
+            expected_byte_length: None,
+            deadline: deadline(),
+        }
+    }
+
+    fn config_at(dir: &Path) -> ResolvedAssetConfig {
+        let mut config = ResolvedAssetConfig::with_local_root(dir.to_path_buf());
+        config.max_decoded_bytes = 64 * 1024;
+        config.max_inline_base64_chars = 128 * 1024;
+        config.max_image_pixels = 1_000_000;
+        config.gc_grace_ms = 60_000;
+        config
+    }
+
+    /// A pipeline over a fresh durable store, holding every dependency in
+    /// one scope so the test can drive the exact reconciliation branches.
+    struct Harness {
+        _dir: tempfile::TempDir,
+        store: AssetStore,
+        config: ResolvedAssetConfig,
+        clock: SystemClock,
+        file_caps: FileCapabilityTable,
+        stream_caps: StreamCapabilityTable,
+        fetcher: DeniedFetcher,
+        policy: SshDenyPolicy,
+        replica: DisabledReplica,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let store = AssetStore::open(&dir.path().join("asset-store.sqlite")).unwrap();
+            let config = config_at(dir.path());
+            Self {
+                _dir: dir,
+                store,
+                config,
+                clock: SystemClock,
+                file_caps: FileCapabilityTable::default(),
+                stream_caps: StreamCapabilityTable::default(),
+                fetcher: DeniedFetcher,
+                policy: SshDenyPolicy::new(&[]),
+                replica: DisabledReplica::new("assets"),
+            }
+        }
+
+        fn pipeline(&mut self) -> ImportPipeline<'_> {
+            ImportPipeline {
+                store: &mut self.store,
+                config: &self.config,
+                content_root: &self._dir.path(),
+                clock: &mut self.clock,
+                file_caps: &self.file_caps,
+                stream_caps: &mut self.stream_caps,
+                fetcher: &mut self.fetcher,
+                policy: &self.policy,
+                replica: &mut self.replica,
+            }
+        }
+    }
+
+    /// An ACCEPTED record owned by `security_domain` with a real canonical
+    /// digest, ready to claim under a fresh identifier.
+    fn accepted_record(security_domain: &str, id: &str, digest: &str) -> ImportRecord {
+        ImportRecord {
+            import_id: id.to_string(),
+            instance_id: "instance-a".to_string(),
+            module_id: "module-a".to_string(),
+            security_domain: security_domain.to_string(),
+            state: ImportState::Accepted,
+            params_digest: digest.to_string(),
+            media_kind: "image".to_string(),
+            source_kind: "inline_base64".to_string(),
+            source_json: "{}".to_string(),
+            declared_media_type: Some("image/png".to_string()),
+            expected_byte_length: None,
+            remote_required: false,
+            deadline: deadline(),
+            max_bytes: 64 * 1024,
+            asset_id: None,
+            detected_media_type: None,
+            byte_length: None,
+            encoded_width: None,
+            encoded_height: None,
+            orientation: None,
+            staging_bytes: None,
+            staging_hash: None,
+            error_code: None,
+            error_message: None,
+            error_retryable: None,
+            error_outcome: None,
+            error_details_json: None,
+            replica_state: ReplicaState::Disabled,
+            replica_attempt: 0,
+            retry_at_ms: None,
+            created_at: "2026-08-09T15:00:00.000000Z".to_string(),
+            updated_at: "2026-08-09T15:00:00.000000Z".to_string(),
+            updated_at_ms: T0,
+        }
+    }
+
+    /// An AVAILABLE record owned by `security_domain` carrying a real
+    /// canonical AssetRef, used to prove the identity gate still returns the
+    /// authoritative record on a true replay while refusing every mismatch.
+    fn available_record(security_domain: &str, id: &str, digest: &str) -> ImportRecord {
+        let mut record = accepted_record(security_domain, id, digest);
+        record.state = ImportState::Available;
+        record.asset_id = Some(AssetId::from_digest([1u8; 32]).to_string());
+        record.detected_media_type = Some("image/png".to_string());
+        record.byte_length = Some(123);
+        record.encoded_width = Some(4);
+        record.encoded_height = Some(2);
+        record.orientation = Some(1);
+        record
+    }
+
+    #[test]
+    fn losing_insert_reconciliation_is_deterministic_and_identity_gated() {
+        let mut harness = Harness::new();
+        let png = png_bytes();
+        let request = request(801, &png);
+        let digest = params_digest(&request).unwrap();
+
+        // 1. Both contenders observe absence before anyone claims the id.
+        assert_eq!(
+            harness
+                .store
+                .transaction()
+                .unwrap()
+                .load_import(&import_id(801))
+                .unwrap(),
+            None,
+            "both contenders observe absence first"
+        );
+
+        // 2. One domain wins real insert through the public import path.
+        let winner = harness.pipeline().import("work", &request).unwrap();
+        assert_eq!(winner.state, "available");
+
+        // 3. The other domain loses the insert: the same claim primitive the
+        //    pipeline uses reports the identifier is already taken.
+        let loser_record = accepted_record("personal", &import_id(801), &digest);
+        assert!(
+            !harness.pipeline().claim_import_if_absent(&loser_record).unwrap(),
+            "the losing contender specifically loses the insert"
+        );
+
+        // 4. The losing-insert reconciliation runs the identical identity
+        //    gate as the replay check: cause-neutral refusal, no lifecycle
+        //    state, no AssetRef, no mutation.
+        let refusal = harness
+            .pipeline()
+            .reconcile_concurrent_winner("personal", &request, &digest)
+            .unwrap_err();
+        assert_eq!(refusal.code, AssetErrorCode::ImportIdConflict);
+        assert_eq!(refusal.message, "ImportId is already in use");
+        assert!(refusal.asset_id.is_none(), "no AssetRef disclosure");
+        assert_eq!(
+            harness.store.load_import_count().unwrap(),
+            1,
+            "the refusal creates no second record"
+        );
+        let winner_record = {
+            let tx = harness.store.transaction().unwrap();
+            let record = tx.load_import(&import_id(801)).unwrap().unwrap();
+            tx.commit().unwrap();
+            record
+        };
+        assert_eq!(
+            winner_record.security_domain, "work",
+            "the winning record is unmodified"
+        );
+        assert_eq!(winner_record.state, ImportState::Available);
+        assert!(winner_record.asset_id.is_some(), "the winner's AssetRef is intact");
+    }
+
+    #[test]
+    fn identity_gate_returns_authoritative_replay_only_on_complete_match() {
+        let mut harness = Harness::new();
+        let png = png_bytes();
+        let request = request(802, &png);
+        let digest = params_digest(&request).unwrap();
+        let id = import_id(802);
+
+        // Seed an owned AVAILABLE record with the real expected digest.
+        let owned = available_record("personal", &id, &digest);
+        assert!(harness.pipeline().claim_import_if_absent(&owned).unwrap());
+
+        // True same-owner same-digest replay returns the authoritative record
+        // with its canonical AssetRef.
+        let replay = harness
+            .pipeline()
+            .reconcile_concurrent_winner("personal", &request, &digest)
+            .unwrap();
+        assert_eq!(replay.state, "available");
+        let asset = replay.asset.expect("true replay carries the authoritative AssetRef");
+        assert_eq!(
+            asset.asset_id,
+            AssetId::from_digest([1u8; 32]),
+            "the same canonical AssetRef is returned"
+        );
+
+        // Any single identity mismatch is the identical cause-neutral refusal.
+        for (label, domain, contender_request, contender_digest) in [
+            ("other domain", "work", request.clone(), digest.clone()),
+            (
+                "other module",
+                "personal",
+                {
+                    let mut r = request.clone();
+                    r.module_id = "module-b".to_string();
+                    r
+                },
+                digest.clone(),
+            ),
+            (
+                "other instance",
+                "personal",
+                {
+                    let mut r = request.clone();
+                    r.instance_id = "instance-b".to_string();
+                    r
+                },
+                digest.clone(),
+            ),
+            (
+                "different parameters",
+                "personal",
+                request.clone(),
+                params_digest(&ImportRequest {
+                    declared_media_type: Some(MediaType::parse("image/jpeg").unwrap()),
+                    ..request.clone()
+                })
+                .unwrap(),
+            ),
+        ] {
+            let refusal = harness
+                .pipeline()
+                .reconcile_concurrent_winner(domain, &contender_request, &contender_digest)
+                .unwrap_err();
+            assert_eq!(refusal.code, AssetErrorCode::ImportIdConflict, "{label}");
+            assert_eq!(refusal.message, "ImportId is already in use", "{label}");
+            assert!(refusal.asset_id.is_none(), "{label}: no AssetRef disclosure");
+        }
+
+        // The owned record was never mutated by the refused contenders.
+        let after = {
+            let tx = harness.store.transaction().unwrap();
+            let record = tx.load_import(&id).unwrap().unwrap();
+            tx.commit().unwrap();
+            record
+        };
+        assert_eq!(after.security_domain, "personal");
+        assert_eq!(after.params_digest, digest);
+        assert_eq!(after.state, ImportState::Available);
     }
 }

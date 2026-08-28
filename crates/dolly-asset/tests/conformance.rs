@@ -1314,6 +1314,10 @@ fn byte_identical_replay_across_domains_fails_closed_without_disclosure() {
         AssetErrorCode::ImportIdConflict,
         "a cross-domain replay must be refused, never answered with the first domain's record"
     );
+    assert_eq!(
+        err.message, "ImportId is already in use",
+        "the refusal is cause-neutral and reveals no ownership"
+    );
     assert!(
         err.asset_id.is_none(),
         "the refusal must carry no identifier into the first domain's asset"
@@ -1390,219 +1394,89 @@ fn facade_end_to_end_available_emission_is_live() {
     assert_eq!(obj["encoded_height"].as_u64(), Some(2));
 }
 
+
 #[test]
-fn losing_insert_race_across_domains_is_refused_deterministically() {
-    // Two service instances over the same durable store: the only setup in
-    // which the insert-losing race path can occur. The winner ("work")
-    // claims the identifier inside an UNCOMMITTED transaction, so the
-    // contender ("personal") deterministically observes absence — an
-    // uncommitted insert is invisible to its replay read — and its own
-    // insert then loses to the committed winner.
+fn same_domain_cross_owner_and_different_parameter_replays_are_neutral_conflicts() {
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_path_buf();
-    let (mut service_work, _clock) = service_at(&root, TestClock::new(T0));
+    let (mut service, _clock) = service_at(dir.path(), TestClock::new(T0));
     let png = png_bytes(4, 2);
+    let id = 711;
 
-    let record_work = dolly_asset::ImportRecord {
-        import_id: import_id(801),
-        instance_id: "instance-a".to_string(),
-        module_id: "module-a".to_string(),
-        security_domain: "work".to_string(),
-        state: ImportState::Accepted,
-        params_digest: "x".to_string(),
-        media_kind: "image".to_string(),
-        source_kind: "inline_base64".to_string(),
-        source_json: "{}".to_string(),
-        declared_media_type: Some("image/png".to_string()),
-        expected_byte_length: None,
-        remote_required: false,
-        deadline: deadline(),
-        max_bytes: 64 * 1024,
-        asset_id: None,
-        detected_media_type: None,
-        byte_length: None,
-        encoded_width: None,
-        encoded_height: None,
-        orientation: None,
-        staging_bytes: None,
-        staging_hash: None,
-        error_code: None,
-        error_message: None,
-        error_retryable: None,
-        error_outcome: None,
-        error_details_json: None,
-        replica_state: ReplicaState::Disabled,
-        replica_attempt: 0,
-        retry_at_ms: None,
-        created_at: "2026-08-09T15:00:00.000000Z".to_string(),
-        updated_at: "2026-08-09T15:00:00.000000Z".to_string(),
-        updated_at_ms: T0,
-    };
-    let cap_work = service_work.issue_capability("work", "instance-a", "module-a");
-    let tx_work = service_work.store_transaction().unwrap();
-    assert!(tx_work.insert_import_if_absent(&record_work).unwrap());
-
-    // The contender opens its own service over the same store and replays
-    // the byte-identical request under "personal" while "work" still holds
-    // the uncommitted identifier claim. The contender is constructed inside
-    // the thread because the asset service is not Send.
-    let contender_root = root.clone();
-    let handle = std::thread::spawn(move || {
-        let (mut service, _clock) = service_at(&contender_root, TestClock::new(T0));
-        let cap = service.issue_capability("personal", "instance-a", "module-a");
-        service.import(
-            &cap,
-            &request(
-                801,
-                Source::InlineBase64 { base64: base64(&png) },
-                Some("image/png"),
-                false,
-            ),
+    // Owner imports to AVAILABLE in the personal domain.
+    let owner = cap(&service);
+    let available = service
+        .import(
+            &owner,
+            &request(id, Source::InlineBase64 { base64: base64(&png) }, Some("image/png"), false),
         )
-    });
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    tx_work.commit().unwrap();
-    let personal_result = handle.join().unwrap();
+        .unwrap();
+    assert_eq!(available.state, "available");
 
-    // The losing foreign domain is refused, nondisclosing, and never sees
-    // the winner's lifecycle state or AssetRef.
-    let err = personal_result.unwrap_err();
-    assert_eq!(err.code, AssetErrorCode::ImportIdConflict);
-    assert!(
-        err.asset_id.is_none(),
-        "the refusal must not carry the winner's asset identifier"
+    // Same security domain, different module, byte-identical request: the
+    // complete identity gate refuses with the exact cause-neutral conflict.
+    let other_module = service.issue_capability("personal", "instance-a", "module-b");
+    let mut contender = request(
+        id,
+        Source::InlineBase64 { base64: base64(&png) },
+        Some("image/png"),
+        false,
     );
-    assert!(
-        !err.message.contains("work") && !err.message.contains("security domain"),
-        "the conflict message must stay cause-neutral: {:?}",
-        err.message
+    contender.module_id = "module-b".to_string();
+    let err = service.import(&other_module, &contender).unwrap_err();
+    assert_eq!(err.code, AssetErrorCode::ImportIdConflict, "cross-module");
+    assert_eq!(err.message, "ImportId is already in use", "cross-module message is cause-neutral");
+    assert!(err.asset_id.is_none(), "cross-module refusal discloses no AssetId");
+
+    // Same security domain, different module instance, byte-identical
+    // request: refused identically.
+    let other_instance = service.issue_capability("personal", "instance-b", "module-a");
+    let mut contender = request(
+        id,
+        Source::InlineBase64 { base64: base64(&png) },
+        Some("image/png"),
+        false,
+    );
+    contender.instance_id = "instance-b".to_string();
+    let err = service.import(&other_instance, &contender).unwrap_err();
+    assert_eq!(err.code, AssetErrorCode::ImportIdConflict, "cross-instance");
+    assert_eq!(err.message, "ImportId is already in use", "cross-instance message is cause-neutral");
+    assert!(err.asset_id.is_none(), "cross-instance refusal discloses no AssetId");
+
+    // Same owner (module/instance/domain) but different parameters: refused
+    // with the same cause-neutral code and message, never the recorded state.
+    let different = request(
+        id,
+        Source::InlineBase64 {
+            base64: base64(&png_bytes(8, 8)),
+        },
+        Some("image/png"),
+        false,
+    );
+    let err = service.import(&owner, &different).unwrap_err();
+    assert_eq!(err.code, AssetErrorCode::ImportIdConflict, "different parameters");
+    assert_eq!(err.message, "ImportId is already in use", "different-parameter message is cause-neutral");
+    assert!(err.asset_id.is_none(), "different-parameter refusal discloses no AssetId");
+
+    // None of the refused contenders created or mutated any record: exactly
+    // one durable AVAILABLE record remains with the same canonical AssetRef.
+    assert_eq!(service.store_import_count(), 1);
+    let status = service.status(&owner, &import_id(id)).unwrap();
+    assert_eq!(status.state, "available");
+    assert_eq!(
+        status.asset.as_ref(),
+        available.asset.as_ref(),
+        "the winning record is unmodified"
     );
 
-    // The loser observes only the closed absent status for that import id,
-    // and the race leaves exactly one durable record.
-    let (mut service_loser, _clock) = service_at(&root, TestClock::new(T0));
-    assert_eq!(service_loser.store_import_count(), 1, "the race creates exactly one record");
-    let loser_cap = service_loser.issue_capability("personal", "instance-a", "module-a");
-    let personal_status = service_loser.status(&loser_cap, &import_id(801)).unwrap();
-    assert_eq!(personal_status.state, "absent");
-    assert!(personal_status.asset.is_none());
-
-    // The winner's record is unmodified and authoritative.
-    let winner_status = service_work.status(&cap_work, &import_id(801)).unwrap();
-    assert_eq!(winner_status.state, "accepted");
-    assert!(winner_status.asset.is_none(), "winner seed record was not modified");
-}
-
-#[test]
-fn concurrent_cross_domain_imports_contend_and_loser_is_refused() {
-    // Two service instances over one store, one domain each, same module and
-    // instance and byte-identical ImportId/request: both observe absence and
-    // contend for the identifier. Whatever the interleaving, exactly one
-    // domain wins an AVAILABLE record; the loser is refused with a
-    // nondisclosing conflict, sees only the absent status afterwards, never
-    // touches the winner's lifecycle/AssetRef, and no second record is left.
-    for round in 0..10 {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        let png = png_bytes(8, 4);
-        // Initialize the durable store once so the two racing opens below
-        // operate on an existing schema (no first-open migration race).
-        let (mut init, _clock) = service_at(&root, TestClock::new(T0));
-        drop(init);
-
-        let handle_a = std::thread::spawn({
-            let root = root.clone();
-            let png = png.clone();
-            move || {
-                let (mut service, _clock) = service_at(&root, TestClock::new(T0));
-                let cap = service.issue_capability("personal", "instance-a", "module-a");
-                service.import(
-                    &cap,
-                    &request(
-                        801,
-                        Source::InlineBase64 { base64: base64(&png) },
-                        Some("image/png"),
-                        false,
-                    ),
-                )
-            }
-        });
-        let handle_b = std::thread::spawn({
-            let root = root.clone();
-            let png = png.clone();
-            move || {
-                let (mut service, _clock) = service_at(&root, TestClock::new(T0));
-                let cap = service.issue_capability("work", "instance-a", "module-a");
-                service.import(
-                    &cap,
-                    &request(
-                        801,
-                        Source::InlineBase64 { base64: base64(&png) },
-                        Some("image/png"),
-                        false,
-                    ),
-                )
-            }
-        });
-        let result_a = handle_a.join().unwrap();
-        let result_b = handle_b.join().unwrap();
-
-        let winners: Vec<_> = [&result_a, &result_b]
-            .iter()
-            .filter_map(|r| r.as_ref().ok())
-            .collect();
-        let losers: Vec<_> = [&result_a, &result_b]
-            .iter()
-            .filter_map(|r| r.as_ref().err())
-            .collect();
-        assert_eq!(
-            winners.len(),
-            1,
-            "exactly one domain wins the identifier (round {round})"
-        );
-        assert_eq!(losers.len(), 1, "exactly one domain is refused (round {round})");
-        assert_eq!(
-            winners[0].state,
-            "available",
-            "the winner reaches AVAILABLE (round {round})"
-        );
-        let winner_asset = winners[0].asset.as_ref().expect("winner carries an AssetRef").clone();
-        assert_eq!(winner_asset.byte_length, png.len() as u64);
-        assert_eq!(winner_asset.encoded_width, Some(8));
-        assert_eq!(winner_asset.encoded_height, Some(4));
-
-        let err = losers[0];
-        assert_eq!(
-            err.code,
-            AssetErrorCode::ImportIdConflict,
-            "the loser is refused nondisclosing (round {round})"
-        );
-        assert!(
-            err.asset_id.is_none(),
-            "the refusal never carries the winner's AssetId (round {round})"
-        );
-
-        // Exactly one durable record; the loser's later status is absent, and
-        // the winner's status returns the same canonical AssetRef.
-        let (mut service, _clock) = service_at(&root, TestClock::new(T0));
-        assert_eq!(service.store_import_count(), 1, "one record after the race (round {round})");
-        for (domain, outcome) in [("personal", &result_a), ("work", &result_b)] {
-            let cap = service.issue_capability(domain, "instance-a", "module-a");
-            let status = service.status(&cap, &import_id(801)).unwrap();
-            match outcome {
-                Ok(_) => {
-                    assert_eq!(status.state, "available", "winner status (round {round})");
-                    assert_eq!(
-                        status.asset.as_ref(),
-                        Some(&winner_asset),
-                        "winner status returns the same canonical AssetRef (round {round})"
-                    );
-                }
-                Err(_) => {
-                    assert_eq!(status.state, "absent", "loser status is absent (round {round})");
-                    assert!(status.asset.is_none(), "loser never sees an AssetRef (round {round})");
-                }
-            }
-        }
-    }
+    // The true byte-identical replay (same owner and parameters) still
+    // returns the authoritative record.
+    let replay = request(
+        id,
+        Source::InlineBase64 { base64: base64(&png) },
+        Some("image/png"),
+        false,
+    );
+    let replayed = service.import(&owner, &replay).unwrap();
+    assert_eq!(replayed.state, "available");
+    assert_eq!(replayed.asset, available.asset, "true replay returns the authoritative AssetRef");
 }
