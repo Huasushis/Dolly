@@ -1327,7 +1327,7 @@ fn g4_wp010_bounded_import_and_crash_recovery_round_trip() {
     product_red(
         "G4-WP010-IMPORT-BOUND-001",
         seam,
-        "the exercised dolly_asset surface implements bounded ACCEPTED->AVAILABLE import, crash recovery, and returns NotFound (never an authoritative absent) for a never-created import (all proven above), but the runtime Core route that this probe drove (CoreCommand::Ingress) commits asset_input blocks verbatim and never invokes AssetService, so no ImportId or AssetRef ever enters a committed record and no host.asset.import/status service exists to answer absent (Asset Host seam A)",
+        "the exercised dolly_asset surface implements bounded ACCEPTED->AVAILABLE import, crash recovery, and returns NotFound (never an authoritative absent) for a never-created import (all proven above); this probe does not drive the runtime Core route, and no host.asset.import/status service exists that would let a committed asset_input block reach this service, so no ImportId/AssetRef can enter a committed record and no host can read absent (Asset Host seam A)",
         "WP-010 Asset Host seam (A)",
     );
 }
@@ -2378,7 +2378,7 @@ fn g4_wp013a_outbound_rate_limits_use_bounded_queues_and_caller_deadlines() {
     product_red(
         "G4-WP013A-BACKPRESSURE-001",
         seam,
-        "the exercised dolly_channel admission path bounds pending sends and rate limits per session with a token bucket: the one-piece send is admitted into the real outbound ledger and then confirmed, while the three-piece burst is refused as CHANNEL_RATE_LIMITED retryable with no transport call (verified above). That proves admission exists, not queuing: there is no bounded outbound QUEUE primitive and no caller-deadline wait/expiry anywhere in the dispatch path, so a burst is REJECTED rather than queued under a caller deadline (committed-Action consumer seam D)",
+        "the exercised dolly_channel admission path rate-limits per session with a token bucket: a one-piece send is admitted and confirmed, while a three-piece burst in the same second is refused as CHANNEL_RATE_LIMITED retryable with no transport call (verified above). That proves the rate bucket, not queuing: there is no bounded outbound QUEUE primitive and no caller-deadline wait/expiry anywhere in the dispatch path, so a burst is REJECTED rather than queued under a caller deadline (committed-Action consumer seam D)",
         "WP-013A committed-Action consumer seam (D)",
     );
 }

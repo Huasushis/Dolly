@@ -91,8 +91,8 @@
       "kind": "asset_import_bound",
       "expected": "product_red",
       "seam": "Asset Host seam (A): a runtime host.asset.import / host.asset.status route from a committed asset_input block into dolly_asset::AssetService, with StatusResult answering an authoritative absent for a never-created import",
-      "causal_red": "the exercised dolly_asset surface implements bounded ACCEPTED->AVAILABLE import, crash recovery, and answers NotFound (never an authoritative absent) for a never-created import (all proven by driving it), but the runtime Core route that this probe drove (CoreCommand::Ingress) commits asset_input blocks verbatim and never invokes AssetService, so no ImportId or AssetRef ever enters a committed record and no host.asset.import/status service exists to answer absent",
-      "verify": "drive service import, crash recovery, and a status read of a never-created import (NotFound, not absent), then require the runtime to route a committed asset_input block to ImportId/AssetRef and expose a status that can answer absent; absent -> PRODUCT_RED"
+      "causal_red": "the exercised dolly_asset surface implements bounded ACCEPTED->AVAILABLE import, crash recovery, and answers NotFound (never an authoritative absent) for a never-created import (all proven by driving it); this probe does not drive the runtime Core route, and no host.asset.import/status service exists that would let a committed asset_input block reach this service, so no ImportId/AssetRef can enter a committed record and no host can read absent",
+      "verify": "drive service import, crash recovery, and a status read of a never-created import (NotFound, not absent) \u2014 all proven above; this probe does not drive the runtime Core route, and the absent host.asset.import/status route that would reach this service is the RED; absent -> PRODUCT_RED"
     },
     {
       "id": "G4-WP010-IDENTITY-DEDUP-001",
@@ -224,7 +224,7 @@
       "kind": "channel_backpressure",
       "expected": "product_red",
       "seam": "committed-Action outbound consumer seam (D): a bounded outbound queue with caller-deadline enforcement in the dispatch path, so a burst is queued under a caller deadline and transport unavailability never blocks Core input state",
-      "causal_red": "the exercised dolly_channel admission path bounds pending sends and rate limits per session with a token bucket (verified: a one-piece send is admitted and confirmed while a three-piece burst is refused as CHANNEL_RATE_LIMITED retryable with no transport call). That proves admission, not queuing: there is no bounded outbound QUEUE primitive and no caller-deadline wait/expiry in the dispatch path, so a burst is REJECTED rather than queued under a caller deadline",
+      "causal_red": "the exercised dolly_channel admission path rate-limits per session with a token bucket (verified: a one-piece send is admitted and confirmed while a three-piece burst is refused as CHANNEL_RATE_LIMITED retryable with no transport call). That proves the rate bucket, not queuing: there is no bounded outbound QUEUE primitive and no caller-deadline wait/expiry in the dispatch path, so a burst is REJECTED rather than queued under a caller deadline",
       "verify": "drive the token-bucket admission limit (accept then refuse a burst), then require a bounded queue with caller-deadline expiry for the refused burst; absent -> PRODUCT_RED"
     },
     {
