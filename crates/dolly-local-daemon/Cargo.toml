@@ -1,0 +1,22 @@
+[package]
+name = "dolly-local-daemon"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dolly-canonical-json = { path = "../dolly-canonical-json" }
+dolly-core-domain = { path = "../dolly-core-domain" }
+dolly-core-reducer = { path = "../dolly-core-reducer" }
+dolly-extension-host = { path = "../dolly-extension-host" }
+dolly-protocol = { path = "../dolly-protocol" }
+dolly-runtime = { path = "../dolly-runtime" }
+dolly-storage = { path = "../dolly-storage" }
+dolly-worker = { path = "../dolly-worker" }
+rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[dev-dependencies]
+tempfile = "3"

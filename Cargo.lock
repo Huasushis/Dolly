@@ -215,6 +215,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "dolly-local-daemon"
+version = "0.1.0"
+dependencies = [
+ "dolly-canonical-json",
+ "dolly-core-domain",
+ "dolly-core-reducer",
+ "dolly-extension-host",
+ "dolly-protocol",
+ "dolly-runtime",
+ "dolly-storage",
+ "dolly-worker",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "dolly-observability"
 version = "0.1.0"
 dependencies = [

@@ -14,6 +14,7 @@ members = [
     "crates/dolly-tool-coordinator",
     "crates/dolly-observability",
     "crates/dolly-worker",
+    "crates/dolly-local-daemon",
 ]
 
 [workspace.package]
