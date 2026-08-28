@@ -743,6 +743,34 @@ fn live_grant_under_another_extension_cannot_reuse_module_outputs_even_with_iden
     // The owning Extension's grant still works.
     let (mapping, _) = committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap());
     assert_eq!(mapping.extension_id, EXTENSION_ID);
+
+    // Anti-spoof: a graph that names an Extension owner with NO Host grant
+    // for the module's descriptor in that graph is rejected even by the
+    // otherwise-owning Extension, because the owner is derived from the
+    // Host-owned grant context, never from the graph input.
+    let mut spoofed_body = body.clone();
+    spoofed_body["descriptors"][MODULE_ID]["owner_extension_id"] = json!("org.dolly.mystery-extension");
+    {
+        let mut store = SqliteCoreStore::new(&mut harness.connection).unwrap();
+        install_graph(&mut store, "spoofed-graph", 2, &spoofed_body);
+        install_grant(
+            &mut store,
+            &harness.authority,
+            MODULE_ID,
+            1,
+            2,
+            &digest(&spoofed_body),
+            &["host.ingress.submit"],
+        );
+    }
+    let grant_v2 = harness.load_current_grant(MODULE_ID);
+    // A fresh external event id keeps the submission on the commit path so
+    // graph admission is actually reached (a replayed key would conflict
+    // first by design).
+    let fresh = request("msg-spoof", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"spoof"}));
+    let error = submit(&mut harness.connection, &harness.authority, &grant_v2, &fresh)
+        .expect_err("a graph naming a non-granted Extension owner must be rejected");
+    assert_eq!(error.code(), HostIngressErrorCode::NotAuthorized);
 }
 
 #[test]
