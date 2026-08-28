@@ -215,8 +215,12 @@ impl<'de> Deserialize<'de> for MediaType {
 
 /// The downstream-safe reference to one available asset. Consumers receive
 /// only this value; paths, capabilities, and secrets never appear in it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// The wire form is canonical: `byte_length` and image dimensions are capped
+/// at the largest lossless JSON integer (2^53 - 1), and EXIF `orientation`,
+/// when present, is restricted to 1..=8. Deserialization fails closed on
+/// oversized, non-canonical, or forged forms.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AssetRef {
     pub asset_id: AssetId,
     pub media_type: MediaType,
@@ -231,6 +235,69 @@ pub struct AssetRef {
     pub display_width: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_height: Option<u64>,
+}
+
+impl AssetRef {
+    /// The largest integer a JSON number can carry losslessly; the wire
+    /// schemas cap byte lengths and dimensions at this value.
+    pub const MAX_WIRE_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+    /// Fail closed on non-canonical or forged wire forms: `byte_length` and
+    /// image dimensions must fit the lossless JSON integer range and, when
+    /// present, be non-zero, and EXIF `orientation` must be in 1..=8.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.byte_length > Self::MAX_WIRE_SAFE_INTEGER {
+            return Err("byte_length exceeds the canonical wire integer range".to_string());
+        }
+        if let Some(orientation) = self.orientation {
+            if !(1..=8).contains(&orientation) {
+                return Err("orientation must be 1..=8 when present".to_string());
+            }
+        }
+        for (name, value) in [
+            ("encoded_width", self.encoded_width),
+            ("encoded_height", self.encoded_height),
+            ("display_width", self.display_width),
+            ("display_height", self.display_height),
+        ] {
+            if let Some(v) = value {
+                if v == 0 || v > Self::MAX_WIRE_SAFE_INTEGER {
+                    return Err(format!("{name} is outside the canonical wire range"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for AssetRef {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireAssetRef {
+            asset_id: AssetId,
+            media_type: MediaType,
+            byte_length: u64,
+            orientation: Option<u8>,
+            encoded_width: Option<u64>,
+            encoded_height: Option<u64>,
+            display_width: Option<u64>,
+            display_height: Option<u64>,
+        }
+        let wire = WireAssetRef::deserialize(deserializer)?;
+        let reference = AssetRef {
+            asset_id: wire.asset_id,
+            media_type: wire.media_type,
+            byte_length: wire.byte_length,
+            orientation: wire.orientation,
+            encoded_width: wire.encoded_width,
+            encoded_height: wire.encoded_height,
+            display_width: wire.display_width,
+            display_height: wire.display_height,
+        };
+        reference.validate().map_err(serde::de::Error::custom)?;
+        Ok(reference)
+    }
 }
 
 // ---------------------------------------------------------------------------

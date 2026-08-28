@@ -9,14 +9,15 @@
 //! Scope of this crate: the import state machine with idempotent replay and
 //! crash recovery, the content-addressed local store, media sniffing and
 //! image metadata bounds, leases/pins/durable references, the
-//! mark/tombstone/sweep GC protocol, security-domain isolation, and the
-//! replica/remote capability contracts. Channel and multimodal delivery are
-//! out of scope here.
+//! mark/tombstone/sweep GC protocol, security-domain isolation, the
+//! replica/remote capability contracts, and the Asset Host import/status
+//! façade (`facade`). Channel and multimodal delivery are out of scope here.
 
 pub mod clock;
 pub mod config;
 pub mod content;
 pub mod error;
+pub mod facade;
 pub mod gc;
 pub mod identity;
 pub mod media;
@@ -36,6 +37,7 @@ pub use config::{
 pub use error::{
     AssetError, AssetErrorCode, AssetErrorDetails, AssetErrorEnvelope, AssetResult, ErrorPhase,
 };
+pub use facade::{AssetHostFacade, AssetStatusRequest};
 pub use identity::{AssetId, AssetRef, ContentHash, MediaType};
 pub use pipeline::{ImportPipeline, RecoveryReport};
 pub use record::{

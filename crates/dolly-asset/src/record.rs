@@ -147,6 +147,9 @@ impl ImportRecord {
         format!("staging-{}", self.import_id)
     }
 
+    /// Build the downstream-safe reference for an `AVAILABLE` record. Fails
+    /// closed: any non-canonical recorded value yields `None` rather than a
+    /// reference a consumer could mistake for authority.
     pub fn asset_ref(&self) -> Option<AssetRef> {
         let asset_id = self.asset_id.as_ref()?;
         let byte_length = self.byte_length?;
@@ -156,7 +159,7 @@ impl ImportRecord {
                 .unwrap_or("application/octet-stream"),
         )
         .ok()?;
-        Some(AssetRef {
+        let reference = AssetRef {
             asset_id: asset_id.parse().ok()?,
             media_type,
             byte_length,
@@ -165,7 +168,10 @@ impl ImportRecord {
             encoded_height: self.encoded_height,
             display_width: self.display_width(),
             display_height: self.display_height(),
-        })
+        };
+        // Fail closed: a record can never mint a non-canonical reference.
+        reference.validate().ok()?;
+        Some(reference)
     }
 
     /// Upright display dimensions: swap axes for orientations 5..=8.
@@ -369,6 +375,21 @@ pub struct StatusResult {
 }
 
 impl StatusResult {
+    /// The closed not-found status for an unknown or unauthorized
+    /// `ImportId`. Only this outcome authorizes replay of a byte-identical
+    /// import. It never carries an `AssetRef` and never mirrors a lifecycle
+    /// state the import never reached, so a caller cannot mistake it for any
+    /// recorded state.
+    pub fn absent(import_id: impl Into<String>) -> Self {
+        StatusResult {
+            import_id: import_id.into(),
+            state: "absent".to_string(),
+            terminal: false,
+            asset: None,
+            error: None,
+        }
+    }
+
     pub fn from_record(record: &ImportRecord) -> Self {
         let state = record.state.wire_name().to_string();
         let terminal = record.state.is_terminal();

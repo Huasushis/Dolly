@@ -6,7 +6,7 @@
 use dolly_asset::clock::{Clock, ClockTime};
 use dolly_asset::config::{ReplicaConfig, ResolvedAssetConfig};
 use dolly_asset::error::{AssetErrorCode, ErrorPhase};
-use dolly_asset::identity::{AssetId, ContentHash};
+use dolly_asset::identity::{AssetId, AssetRef, ContentHash};
 use dolly_asset::record::{ImportRequest, ImportState, MediaKind, Source};
 use dolly_asset::remote::DeniedFetcher;
 use dolly_asset::replica::{DisabledReplica, InMemoryReplica};
@@ -801,4 +801,305 @@ fn seed_record(
     let tx = service.store_transaction().unwrap();
     assert!(tx.insert_import_if_absent(&record).unwrap());
     tx.commit().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 9. Asset Host import/status façade: closed absent, exact owner binding,
+//    Host-lifecycle fencing, and canonical wire round-trips.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn status_of_unknown_import_id_is_closed_absent_never_a_lifecycle_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut service, _clock) = service_at(dir.path(), TestClock::new(T0));
+    let capability = cap(&service);
+
+    // Unknown ImportId -> closed absent, not an error, not a lifecycle state.
+    let status = service.status(&capability, &import_id(501)).unwrap();
+    assert_eq!(status.state, "absent");
+    assert!(!status.terminal);
+    assert!(status.asset.is_none(), "absent must never mint an AssetRef");
+    assert!(status.error.is_none());
+    assert_eq!(status.import_id, import_id(501));
+
+    // The absent wire form must not collide with any recorded state name.
+    assert_ne!(status.state, "accepted");
+    assert_ne!(status.state, "available");
+    assert_ne!(status.state, "rejected");
+    assert_ne!(status.state, "cancelled");
+
+    // A status result for a real import is authoritative and never absent.
+    let png = png_bytes(4, 2);
+    service
+        .import(
+            &capability,
+            &request(502, Source::InlineBase64 { base64: base64(&png) }, Some("image/png"), false),
+        )
+        .unwrap();
+    assert_eq!(service.status(&capability, &import_id(502)).unwrap().state, "available");
+
+    // Re-serializing the absent result round-trips the closed wire form.
+    let json = serde_json::to_string(&status).unwrap();
+    let back: dolly_asset::StatusResult = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, status);
+    assert_eq!(back.state, "absent");
+    assert!(back.asset.is_none());
+}
+
+#[test]
+fn status_binds_instance_module_and_domain_and_is_non_disclosing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut service, _clock) = service_at(dir.path(), TestClock::new(T0));
+    let png = png_bytes(4, 2);
+    let result = service
+        .import(
+            &cap(&service),
+            &request(503, Source::InlineBase64 { base64: base64(&png) }, Some("image/png"), false),
+        )
+        .unwrap();
+    assert_eq!(result.state, "available");
+    let owner_status = service.status(&cap(&service), &import_id(503)).unwrap();
+    assert_eq!(owner_status.state, "available");
+    assert_eq!(owner_status.asset, result.asset, "owner status returns the same canonical AssetRef");
+
+    // Same domain and instance, different module: indistinguishable absent.
+    let other_module = service.issue_capability("personal", "instance-a", "module-b");
+    let s = service.status(&other_module, &import_id(503)).unwrap();
+    assert_eq!(s.state, "absent", "cross-module status must not disclose the record");
+    assert!(s.asset.is_none());
+
+    // Same domain and module, different instance: indistinguishable absent.
+    let other_instance = service.issue_capability("personal", "instance-b", "module-a");
+    let s = service.status(&other_instance, &import_id(503)).unwrap();
+    assert_eq!(s.state, "absent", "cross-instance status must not disclose the record");
+    assert!(s.asset.is_none());
+
+    // Different security domain: indistinguishable absent.
+    let other_domain = service.issue_capability("work", "instance-a", "module-a");
+    let s = service.status(&other_domain, &import_id(503)).unwrap();
+    assert_eq!(s.state, "absent", "cross-domain status must not disclose the record");
+    assert!(s.asset.is_none());
+
+    // The owner can still read its own record afterwards.
+    assert_eq!(service.status(&cap(&service), &import_id(503)).unwrap().state, "available");
+}
+
+#[test]
+fn cancel_binds_owner_and_cross_owner_cancel_never_mutates() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut service, _clock) = service_at(dir.path(), TestClock::new(T0));
+    seed_record(&mut service, 504, ImportState::Accepted, None, None);
+
+    // Cross-module and cross-instance cancel are refused before mutation.
+    let other_module = service.issue_capability("personal", "instance-a", "module-b");
+    let err = service.cancel(&other_module, &import_id(504)).unwrap_err();
+    assert_eq!(err.code, AssetErrorCode::NotFound);
+    let other_instance = service.issue_capability("personal", "instance-b", "module-a");
+    let err = service.cancel(&other_instance, &import_id(504)).unwrap_err();
+    assert_eq!(err.code, AssetErrorCode::NotFound);
+    let other_domain = service.issue_capability("work", "instance-a", "module-a");
+    let err = service.cancel(&other_domain, &import_id(504)).unwrap_err();
+    assert_eq!(err.code, AssetErrorCode::NotFound);
+
+    // The record is untouched: still accepted for the owner.
+    let status = service.status(&cap(&service), &import_id(504)).unwrap();
+    assert_eq!(status.state, "accepted", "denied cancellation must not mutate the record");
+
+    // The owner may cancel.
+    let cancelled = service.cancel(&cap(&service), &import_id(504)).unwrap();
+    assert_eq!(cancelled.state, "cancelled");
+}
+
+#[test]
+fn stale_capability_from_another_service_instance_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut first, _clock) = service_at(dir.path(), TestClock::new(T0));
+    let png = png_bytes(4, 2);
+    first
+        .import(
+            &cap(&first),
+            &request(505, Source::InlineBase64 { base64: base64(&png) }, Some("image/png"), false),
+        )
+        .unwrap();
+    let stale = cap(&first);
+
+    // A fresh service over the same durable store is a new Host lifecycle.
+    let (mut second, _clock) = service_at(dir.path(), TestClock::new(T0));
+    let err = second.status(&stale, &import_id(505)).unwrap_err();
+    assert_eq!(err.code, AssetErrorCode::Unauthorized, "stale capability status refused");
+    let err = second.cancel(&stale, &import_id(505)).unwrap_err();
+    assert_eq!(err.code, AssetErrorCode::Unauthorized, "stale capability cancel refused");
+    let err = second
+        .import(
+            &stale,
+            &request(506, Source::InlineBase64 { base64: base64(&png) }, Some("image/png"), false),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, AssetErrorCode::Unauthorized, "stale capability import refused");
+    assert_eq!(second.store_import_count(), 1, "denied import leaves no partial record");
+
+    // The current lifecycle's own capability still sees the durable record.
+    let fresh = cap(&second);
+    let status = second.status(&fresh, &import_id(505)).unwrap();
+    assert_eq!(status.state, "available", "durable record survives across service instances");
+}
+
+#[test]
+fn import_authz_binds_module_and_instance_before_any_durable_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut service, _clock) = service_at(dir.path(), TestClock::new(T0));
+    let png = png_bytes(4, 2);
+
+    let wrong_module = service.issue_capability("personal", "instance-a", "module-b");
+    let mut r = request(507, Source::InlineBase64 { base64: base64(&png) }, Some("image/png"), false);
+    r.module_id = "module-a".to_string();
+    let err = service.import(&wrong_module, &r).unwrap_err();
+    assert_eq!(err.code, AssetErrorCode::Unauthorized);
+
+    let wrong_instance = service.issue_capability("personal", "instance-b", "module-a");
+    let mut r = request(508, Source::InlineBase64 { base64: base64(&png) }, Some("image/png"), false);
+    r.instance_id = "instance-a".to_string();
+    let err = service.import(&wrong_instance, &r).unwrap_err();
+    assert_eq!(err.code, AssetErrorCode::Unauthorized);
+
+    // The request carries no domain; the capability's domain is authoritative
+    // and the request is unaffected by it. Only module/instance mismatches
+    // are denied by the capability.
+    assert_eq!(
+        service.store_import_count(),
+        0,
+        "denied imports leave no partial authority"
+    );
+}
+
+#[test]
+fn canonical_asset_ref_wire_round_trips_and_forged_forms_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut service, _clock) = service_at(dir.path(), TestClock::new(T0));
+    let capability = cap(&service);
+    let png = png_bytes(4, 2);
+    let result = service
+        .import(
+            &capability,
+            &request(510, Source::InlineBase64 { base64: base64(&png) }, Some("image/png"), false),
+        )
+        .unwrap();
+    let asset = result.asset.unwrap();
+
+    // Canonical round-trip.
+    let json = serde_json::to_string(&asset).unwrap();
+    let back: AssetRef = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, asset);
+    assert_eq!(back.asset_id, asset.asset_id);
+    assert_eq!(back.byte_length, png.len() as u64);
+    assert_eq!(back.encoded_width, Some(4));
+    assert_eq!(back.encoded_height, Some(2));
+    assert_eq!(back.orientation, Some(1));
+
+    let value = serde_json::to_value(&asset).unwrap();
+    let mut obj = value.as_object().unwrap().clone();
+
+    // Oversized byte length is a forged form and must be rejected.
+    let mut oversize = obj.clone();
+    oversize.insert("byte_length".into(), 9_007_199_254_740_992u64.into());
+    assert!(serde_json::from_value::<AssetRef>(oversize.into()).is_err());
+
+    // Orientation out of the 1..=8 range is a forged form.
+    for bad in [0u8, 9, 200] {
+        let mut forged = obj.clone();
+        forged.insert("orientation".into(), bad.into());
+        assert!(
+            serde_json::from_value::<AssetRef>(forged.into()).is_err(),
+            "orientation {bad} must be rejected"
+        );
+    }
+
+    // Zero or oversized dimensions are forged.
+    let mut zero_width = obj.clone();
+    zero_width.insert("encoded_width".into(), 0u64.into());
+    assert!(serde_json::from_value::<AssetRef>(zero_width.into()).is_err());
+    let mut huge_display = obj.clone();
+    huge_display.insert("display_height".into(), 9_007_199_254_740_992u64.into());
+    assert!(serde_json::from_value::<AssetRef>(huge_display.into()).is_err());
+
+    // Unknown extra fields are forged.
+    let mut extra = obj.clone();
+    extra.insert("forged".into(), true.into());
+    assert!(serde_json::from_value::<AssetRef>(extra.into()).is_err());
+
+    // Non-canonical AssetId text is forged.
+    let mut bad_id = obj.clone();
+    bad_id.insert("asset_id".into(), "ast_b3_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into());
+    assert!(serde_json::from_value::<AssetRef>(bad_id.into()).is_err());
+}
+
+#[test]
+fn facade_registers_import_and_status_with_closed_absent_and_envelopes() {
+    use dolly_asset::facade::{AssetHostFacade, AssetStatusRequest};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut facade = AssetHostFacade::open(config_at(dir.path())).unwrap();
+    let capability = facade.issue_capability("personal", "instance-a", "module-a");
+    let png = png_bytes(4, 2);
+
+    let result = facade
+        .import(
+            &capability,
+            &request(511, Source::InlineBase64 { base64: base64(&png) }, Some("image/png"), false),
+        )
+        .unwrap();
+    assert_eq!(result.state, "available");
+    let asset_json = serde_json::to_value(result.asset.as_ref().unwrap()).unwrap();
+    assert!(asset_json.get("asset_id").is_some());
+    assert!(asset_json.get("media_type").is_some());
+    assert!(asset_json.get("byte_length").is_some());
+
+    // Valid status request returns the authoritative record state.
+    let status_req = AssetStatusRequest::new(
+        "0198ab31-6c44-7e8a-b2bb-000000000111",
+        "module-a",
+        "0198ab31-6c44-7e8a-b2bb-000000000511",
+        "2026-08-10T01:02:03.000000Z",
+    )
+    .unwrap();
+    let status = facade.status(&capability, &status_req).unwrap();
+    assert_eq!(status.state, "available");
+    assert_eq!(status.asset, result.asset);
+
+    // Unknown ImportId -> closed absent through the façade.
+    let absent_req = AssetStatusRequest::new(
+        "0198ab31-6c44-7e8a-b2bb-000000000112",
+        "module-a",
+        "0198ab31-6c44-7e8a-b2bb-000000000599",
+        "2026-08-10T01:02:03.000000Z",
+    )
+    .unwrap();
+    let status = facade.status(&capability, &absent_req).unwrap();
+    assert_eq!(status.state, "absent");
+    assert!(status.asset.is_none());
+
+    // A request naming a module other than the grant is a closed envelope.
+    let mismatched = AssetStatusRequest::new(
+        "0198ab31-6c44-7e8a-b2bb-000000000113",
+        "module-b",
+        "0198ab31-6c44-7e8a-b2bb-000000000511",
+        "2026-08-10T01:02:03.000000Z",
+    )
+    .unwrap();
+    let envelope = facade.status(&capability, &mismatched).unwrap_err();
+    assert_eq!(envelope.code, "UNAUTHORIZED");
+    assert_eq!(envelope.outcome, "not_applied");
+
+    // Forged request JSON fails closed at the wire boundary.
+    let forged = r#"{"operation_id":"0198ab31-6c44-7e8a-b2bb-000000000114","module_id":"module-a","import_id":"0198ab31-6c44-7e8a-b2bb-000000000511","deadline":"2026-08-10T01:02:03.000000Z","extra":1}"#;
+    assert!(serde_json::from_str::<AssetStatusRequest>(forged).is_err());
+    let bad_grammar = r#"{"operation_id":"not-a-uuid","module_id":"module-a","import_id":"not-a-uuid","deadline":"nope"}"#;
+    assert!(serde_json::from_str::<AssetStatusRequest>(bad_grammar).is_err());
+
+    // Registration hands back the full service for the other Host lanes.
+    let mut service = facade.into_service();
+    let grant = service
+        .read(&capability, result.asset.as_ref().unwrap().asset_id.as_str())
+        .unwrap();
+    assert_eq!(grant.byte_length(), png.len() as u64);
 }
