@@ -158,6 +158,7 @@ impl AssetService {
             .prefix
             .clone()
             .unwrap_or_else(|| "dolly-assets".to_string());
+        let epoch = mint_lifecycle_epoch()?;
         Ok(Self {
             store,
             clock: Box::new(SystemClock),
@@ -167,7 +168,7 @@ impl AssetService {
             replica: Box::new(DisabledReplica::new(prefix)),
             policy: SshDenyPolicy::new(&[]),
             config,
-            epoch: mint_lifecycle_epoch(),
+            epoch,
         })
     }
 
@@ -199,6 +200,7 @@ impl AssetService {
                 format!("cannot open the asset store: {e}"),
             )
         })?;
+        let epoch = mint_lifecycle_epoch()?;
         Ok(Self {
             store,
             clock: Box::new(clock),
@@ -208,7 +210,7 @@ impl AssetService {
             replica: Box::new(replica),
             policy: SshDenyPolicy::new(&[]),
             config,
-            epoch: mint_lifecycle_epoch(),
+            epoch,
         })
     }
 
@@ -568,10 +570,20 @@ impl AssetService {
 /// A fresh per-service Host-lifecycle epoch that every capability is bound
 /// to. A capability minted by another service instance (or a pre-restart
 /// instance) is refused before any store read or mutation.
-fn mint_lifecycle_epoch() -> u64 {
+///
+/// Fails closed: if system entropy is unavailable the service refuses to
+/// open rather than minting a zero or replayable epoch, which would let one
+/// service's capability masquerade as another's.
+fn mint_lifecycle_epoch() -> Result<u64, AssetError> {
     let mut bytes = [0u8; 8];
-    let _ = getrandom::fill(&mut bytes);
-    u64::from_le_bytes(bytes)
+    getrandom::fill(&mut bytes).map_err(|_| {
+        AssetError::new(
+            AssetErrorCode::Internal,
+            ErrorPhase::Accept,
+            "cannot obtain system entropy for the Host lifecycle epoch; refusing to open",
+        )
+    })?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 fn mint_capability_token() -> LeaseToken {
