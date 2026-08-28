@@ -214,6 +214,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dolly-observability"
+version = "0.1.0"
+dependencies = [
+ "dolly-canonical-json",
+ "dolly-core-domain",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "dolly-protocol"
 version = "0.1.0"
 dependencies = [
