@@ -160,16 +160,11 @@ pub struct MediaType(String);
 
 impl MediaType {
     pub fn parse(value: &str) -> Result<Self, String> {
-        if value.is_empty()
-            || value.len() > 255
-            || value.contains('/') == false
-        {
+        if value.is_empty() || value.len() > 255 || !value.contains('/') {
             return Err("invalid media type".to_string());
         }
         let (top, sub) = value.split_once('/').expect("contains '/'");
-        if !top.is_empty() && !sub.is_empty()
-            && is_mime_token(top) && is_mime_token(sub) && top == top.to_ascii_lowercase()
-        {
+        if is_mime_type_token(top) && is_mime_type_token(sub) {
             Ok(Self(value.to_string()))
         } else {
             Err("invalid media type".to_string())
@@ -181,10 +176,24 @@ impl MediaType {
     }
 }
 
-fn is_mime_token(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || "!#$&^_.+-".contains(c))
+/// The exact normative lowercase token grammar
+/// `^[a-z0-9][a-z0-9!#$&^_.+-]*$` for one media-type side. Leading
+/// punctuation, uppercase letters, and empty sides are all malformed.
+fn is_mime_type_token(s: &str) -> bool {
+    let mut chars = s.chars();
+    let first = match chars.next() {
+        Some(c) => c,
+        None => return false,
+    };
+    if !matches!(first, 'a'..='z' | '0'..='9') {
+        return false;
+    }
+    chars.all(|c| {
+        matches!(
+            c,
+            'a'..='z' | '0'..='9' | '!' | '#' | '$' | '&' | '^' | '_' | '.' | '+' | '-'
+        )
+    })
 }
 
 impl fmt::Display for MediaType {
@@ -489,10 +498,35 @@ mod tests {
     fn media_type_validation() {
         assert!(MediaType::parse("image/png").is_ok());
         assert!(MediaType::parse("image/svg+xml").is_ok());
+        assert!(MediaType::parse("application/vnd.oasis.opendocument.text").is_ok());
         assert!(MediaType::parse("IMAGE/png").is_err());
         assert!(MediaType::parse("image").is_err());
         assert!(MediaType::parse("image/").is_err());
         assert!(MediaType::parse("").is_err());
+        // The normative lowercase token grammar; every malformed form is rejected.
+        for malformed in [
+            "image/PNG",   // uppercase subtype
+            "!image/png",  // leading punctuation in the type
+            "image/!png",  // leading punctuation in the subtype
+            "Image/png",   // uppercase first letter of the type
+            "image/pNg",   // uppercase inside the subtype
+            "image/ png",  // space inside
+            "image /png",  // space before the slash
+            "image/png ",  // trailing space
+            " image/png",  // leading space
+            "/png",        // empty type
+            "image/",      // empty subtype
+            "i/",          // empty subtype
+            "image/png/extra",
+            "image//png",
+            "image",       // no slash
+            "",            // empty
+        ] {
+            assert!(
+                MediaType::parse(malformed).is_err(),
+                "media type {malformed:?} must be rejected"
+            );
+        }
     }
 
     #[test]

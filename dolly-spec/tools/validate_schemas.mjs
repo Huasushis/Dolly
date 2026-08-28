@@ -5083,6 +5083,58 @@ assertValid("bounded remote Asset import", `${schemaBase}asset-import.schema.jso
 const unboundedRemoteAssetImport = structuredClone(boundedRemoteAssetImport);
 delete unboundedRemoteAssetImport.source.max_bytes;
 assertValid("unbounded remote Asset import", `${schemaBase}asset-import.schema.json`, unboundedRemoteAssetImport, false);
+// host.asset.status: the API of an `AVAILABLE` import carries the exact
+// canonical AssetRef emission — the three identity fields plus the optional
+// WP-010 image fields — and rejects unknown, oversized, and malformed forms.
+const availableAssetStatus = {
+  import_id: testUuid(137),
+  state: "available",
+  terminal: true,
+  asset: {
+    asset_id: testAssetId,
+    media_type: "image/png",
+    byte_length: 4096,
+    orientation: 1,
+    encoded_width: 1920,
+    encoded_height: 1080,
+    display_width: 1920,
+    display_height: 1080,
+  },
+  error: null,
+};
+const assetStatusSchema = `${schemaBase}asset-status.schema.json`;
+assertValid("AVAILABLE asset status with a full canonical AssetRef", assetStatusSchema, availableAssetStatus);
+const minimalAvailableAssetStatus = structuredClone(availableAssetStatus);
+for (const field of ["orientation", "encoded_width", "encoded_height", "display_width", "display_height"]) {
+  delete minimalAvailableAssetStatus.asset[field];
+}
+assertValid("AVAILABLE asset status without optional image fields", assetStatusSchema, minimalAvailableAssetStatus);
+assertValid("AVAILABLE asset status with an unknown asset field", assetStatusSchema, {
+  ...availableAssetStatus,
+  asset: { ...availableAssetStatus.asset, forged: 1 },
+}, false);
+for (const [label, mutate] of [
+  ["orientation 0", (asset) => { asset.orientation = 0; }],
+  ["orientation 9", (asset) => { asset.orientation = 9; }],
+  ["zero dimension", (asset) => { asset.display_height = 0; }],
+  ["oversized dimension", (asset) => { asset.encoded_width = 9007199254740992; }],
+  ["oversized byte length", (asset) => { asset.byte_length = 9007199254740992; }],
+  ["non-canonical AssetId", (asset) => { asset.asset_id = `ast_b3_${"A".repeat(52)}`; }],
+  ["uppercase media type", (asset) => { asset.media_type = "image/PNG"; }],
+]) {
+  const forged = structuredClone(availableAssetStatus);
+  mutate(forged.asset);
+  assertValid(`AVAILABLE asset status with ${label}`, assetStatusSchema, forged, false);
+}
+assertValid("absent asset status is closed and explicit", assetStatusSchema, {
+  import_id: testUuid(138),
+  state: "absent",
+  terminal: false,
+  asset: null,
+  error: null,
+});
+const absentImportResultAttempt = { ...availableAssetStatus, state: "absent" };
+assertValid("import success result cannot be absent", `${schemaBase}asset-status.schema.json#/$defs/ImportResult`, absentImportResultAttempt, false);
 
 function napcatEndpointErrors(raw, expectedProtocols, allowNonLoopback) {
   const errors = [];

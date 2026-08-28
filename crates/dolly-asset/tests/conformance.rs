@@ -1103,3 +1103,181 @@ fn facade_registers_import_and_status_with_closed_absent_and_envelopes() {
         .unwrap();
     assert_eq!(grant.byte_length(), png.len() as u64);
 }
+
+// ---------------------------------------------------------------------------
+// 10. Sol-round fixes: cross-owner import-ID replay non-disclosure, partial
+//     staging cancellation cleanup, and the real AVAILABLE wire emission.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cross_owner_import_id_replay_is_refused_without_disclosure() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut service, _clock) = service_at(dir.path(), TestClock::new(T0));
+    let capability = cap(&service);
+    let png = png_bytes(4, 2);
+
+    // The owner imports import_id(601) to AVAILABLE.
+    service
+        .import(
+            &capability,
+            &request(601, Source::InlineBase64 { base64: base64(&png) }, Some("image/png"), false),
+        )
+        .unwrap();
+    assert_eq!(service.store_import_count(), 1);
+
+    // Another module in the same domain reuses the same ImportId under its
+    // own identity: refused as a conflict, never disclosed as the owner's
+    // record, and no second durable record is created.
+    let intruder = service.issue_capability("personal", "instance-a", "module-b");
+    let mut own_identity = request(
+        601,
+        Source::InlineBase64 { base64: base64(&png) },
+        Some("image/png"),
+        false,
+    );
+    own_identity.module_id = "module-b".to_string();
+    let err = service.import(&intruder, &own_identity).unwrap_err();
+    assert_eq!(
+        err.code,
+        AssetErrorCode::ImportIdConflict,
+        "cross-owner replay must not disclose the owner's record"
+    );
+    assert_eq!(service.store_import_count(), 1, "conflict creates no second record");
+
+    // An intruder forging the owner's module in the request is refused as
+    // Unauthorized before any store access.
+    let forged = request(
+        601,
+        Source::InlineBase64 { base64: base64(&png) },
+        Some("image/png"),
+        false,
+    );
+    let err = service.import(&intruder, &forged).unwrap_err();
+    assert_eq!(err.code, AssetErrorCode::Unauthorized);
+    assert_eq!(err.phase, ErrorPhase::Validate);
+
+    // The owner still owns the intact AVAILABLE record.
+    let status = service.status(&capability, &import_id(601)).unwrap();
+    assert_eq!(status.state, "available");
+    assert!(status.asset.is_some());
+    assert_eq!(service.store_import_count(), 1);
+}
+
+#[test]
+fn cancellation_during_partial_staging_cleans_up_and_never_mints_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut service, _clock) = service_at(dir.path(), TestClock::new(T0));
+    let capability = cap(&service);
+
+    // A durable ACQUIRING import with a partial staging object on disk.
+    let staging_name = format!("staging-{}", import_id(602));
+    std::fs::create_dir_all(dir.path().join("staging")).unwrap();
+    std::fs::write(dir.path().join("staging").join(&staging_name), b"partial-bytes").unwrap();
+    assert!(dir.path().join("staging").join(&staging_name).exists());
+    seed_import_in_state(&mut service, 602, ImportState::Acquiring, Some((13, "x".to_string())), None);
+
+    // Cross-owner cancellation during the partial acquisition is refused and
+    // the partial staging object is untouched.
+    let intruder = service.issue_capability("personal", "instance-a", "module-b");
+    let err = service.cancel(&intruder, &import_id(602)).unwrap_err();
+    assert_eq!(err.code, AssetErrorCode::NotFound);
+    assert!(
+        dir.path().join("staging").join(&staging_name).exists(),
+        "a denied cancel must not remove another module's staging bytes"
+    );
+    assert_eq!(
+        service.status(&intruder, &import_id(602)).unwrap().state,
+        "absent",
+        "the intruder sees no record during the owner's partial acquisition"
+    );
+
+    // The owner cancels: the partial object is deleted and the import is
+    // CANCELLED with no AssetRef and no partial authority.
+    let cancelled = service.cancel(&capability, &import_id(602)).unwrap();
+    assert_eq!(cancelled.state, "cancelled");
+    assert!(cancelled.terminal);
+    assert!(cancelled.asset.is_none(), "cancellation must never mint authority");
+    assert!(
+        !dir.path().join("staging").join(&staging_name).exists(),
+        "cancelled partial staging bytes are deleted"
+    );
+    let status = service.status(&capability, &import_id(602)).unwrap();
+    assert_eq!(status.state, "cancelled");
+    assert!(status.asset.is_none());
+    assert_eq!(service.store_import_count(), 1, "one durable record, zero partial state");
+}
+
+#[test]
+fn real_available_emission_matches_the_authoritative_asset_object_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut service, _clock) = service_at(dir.path(), TestClock::new(T0));
+    let capability = cap(&service);
+    let png = png_bytes(4, 2);
+
+    let result = service
+        .import(
+            &capability,
+            &request(603, Source::InlineBase64 { base64: base64(&png) }, Some("image/png"), false),
+        )
+        .unwrap();
+    assert_eq!(result.state, "available");
+
+    // A real AVAILABLE emission: exactly the canonical asset fields of the
+    // authoritative asset-status schema object, no second wire shape.
+    let json = serde_json::to_value(result.asset.as_ref().unwrap()).unwrap();
+    let obj = json.as_object().unwrap();
+    let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+    keys.sort_unstable();
+    assert!(
+        keys.iter().all(|k| matches!(
+            *k,
+            "asset_id" | "media_type" | "byte_length" | "orientation"
+                | "encoded_width" | "encoded_height" | "display_width" | "display_height"
+        )),
+        "AssetRef emits only the canonical asset object fields: {keys:?}"
+    );
+    assert!(obj.contains_key("asset_id"));
+    assert!(obj.contains_key("media_type"));
+    assert!(obj.contains_key("byte_length"));
+    let bytes = obj["byte_length"].as_u64().unwrap();
+    assert!(bytes <= AssetRef::MAX_WIRE_SAFE_INTEGER);
+    assert_eq!(obj["encoded_width"].as_u64(), Some(4));
+    assert_eq!(obj["encoded_height"].as_u64(), Some(2));
+    assert_eq!(obj["display_width"].as_u64(), Some(4));
+    assert_eq!(obj["display_height"].as_u64(), Some(2));
+
+    // A reference carrying an explicit orientation emits all eight fields.
+    let full = AssetRef {
+        asset_id: AssetId::from_digest([1u8; 32]),
+        media_type: "image/png".parse().unwrap(),
+        byte_length: 123,
+        orientation: Some(1),
+        encoded_width: Some(4),
+        encoded_height: Some(2),
+        display_width: Some(4),
+        display_height: Some(2),
+    };
+    let full_json = serde_json::to_value(&full).unwrap();
+    let mut full_keys: Vec<&str> = full_json.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+    full_keys.sort_unstable();
+    assert_eq!(
+        full_keys,
+        vec![
+            "asset_id",
+            "byte_length",
+            "display_height",
+            "display_width",
+            "encoded_height",
+            "encoded_width",
+            "media_type",
+            "orientation",
+        ],
+        "the authoritative wire carries the exact canonical AssetRef and image fields"
+    );
+
+    // An absent status emits the schema-required null slots.
+    let absent = service.status(&capability, &import_id(999)).unwrap();
+    let absent_json = serde_json::to_value(&absent).unwrap();
+    assert!(absent_json.get("asset").unwrap().is_null());
+    assert!(absent_json.get("error").unwrap().is_null());
+}

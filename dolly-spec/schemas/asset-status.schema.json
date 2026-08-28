@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://dolly.example/spec/0.1/schemas/asset-status.schema.json",
   "title": "host.asset.import/status result",
+  "$comment": "The `asset` object is the exact canonical AssetRef emission: the three required identity fields plus the WP-010 image fields, which are optional and only present when an image carried them. Every integer is capped at the largest lossless JSON integer and `orientation` is restricted to 1..=8; unknown fields are rejected.",
   "$defs": {
     "ImportResult": {
       "allOf": [
@@ -41,6 +42,31 @@
             "byte_length": {
               "type": "integer",
               "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "orientation": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 8
+            },
+            "encoded_width": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "encoded_height": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "display_width": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "display_height": {
+              "type": "integer",
+              "minimum": 1,
               "maximum": 9007199254740991
             }
           }
