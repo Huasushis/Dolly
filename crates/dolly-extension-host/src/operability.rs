@@ -1011,21 +1011,6 @@ impl HostExternalIoAuthority {
         }
     }
 
-    /// Start a new live generation after a supervised daemon restart.
-    pub fn start_generation(&self, generation: i64) -> Result<(), ExternalIoError> {
-        if generation <= 0 {
-            return Err(ExternalIoError::StaleGeneration);
-        }
-        let mut gate = self
-            .gate
-            .state
-            .lock()
-            .map_err(|_| ExternalIoError::AuthorityUnavailable)?;
-        gate.active_generation = generation;
-        gate.stopped = false;
-        Ok(())
-    }
-
     pub fn authorize(
         &self,
         premise: &OperationalPremise,
@@ -1488,7 +1473,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_is_checked_before_secret_resolution_and_effect() {
+    fn stopped_authority_rejects_old_permit_without_effect() {
         let reference: SecretRef = "secret://vault/api".parse().unwrap();
         let owner = SecretOwner::for_test(
             "org.example.extension",
