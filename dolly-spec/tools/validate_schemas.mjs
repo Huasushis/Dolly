@@ -5082,37 +5082,16 @@ const boundedRemoteAssetImport = {
 assertValid("bounded remote Asset import", `${schemaBase}asset-import.schema.json`, boundedRemoteAssetImport);
 const unboundedRemoteAssetImport = structuredClone(boundedRemoteAssetImport);
 delete unboundedRemoteAssetImport.source.max_bytes;
-assertValid("unbounded remote Asset import", `${schemaBase}asset-import.schema.json`, unboundedRemoteAssetImport, false);
-// host.asset.status: the API of an `AVAILABLE` import carries the exact
-// canonical AssetRef emission — the three identity fields plus the optional
-// WP-010 image fields — and rejects unknown, oversized, and malformed forms.
-const availableAssetStatus = {
-  import_id: testUuid(137),
-  state: "available",
-  terminal: true,
-  asset: {
-    asset_id: testAssetId,
-    media_type: "image/png",
-    byte_length: 4096,
-    orientation: 1,
-    encoded_width: 1920,
-    encoded_height: 1080,
-    display_width: 1920,
-    display_height: 1080,
-  },
-  error: null,
-};
+// host.asset.status: the guard validates the ACTUAL serialized AVAILABLE
+// response obtained through AssetHostFacade and persisted by the dolly-asset
+// conformance test as examples/host-asset-status-available.json — the live
+// bytes, never a manually re-typed object. Negative cases mutate that live
+// emission and must each be rejected.
 const assetStatusSchema = `${schemaBase}asset-status.schema.json`;
-assertValid("AVAILABLE asset status with a full canonical AssetRef", assetStatusSchema, availableAssetStatus);
-const minimalAvailableAssetStatus = structuredClone(availableAssetStatus);
-for (const field of ["orientation", "encoded_width", "encoded_height", "display_width", "display_height"]) {
-  delete minimalAvailableAssetStatus.asset[field];
-}
-assertValid("AVAILABLE asset status without optional image fields", assetStatusSchema, minimalAvailableAssetStatus);
-assertValid("AVAILABLE asset status with an unknown asset field", assetStatusSchema, {
-  ...availableAssetStatus,
-  asset: { ...availableAssetStatus.asset, forged: 1 },
-}, false);
+const realFacadeAvailableEmission = JSON.parse(fs.readFileSync(
+  path.join(root, "examples", "host-asset-status-available.json"), "utf8",
+));
+assertValid("real AssetHostFacade AVAILABLE emission", assetStatusSchema, realFacadeAvailableEmission);
 for (const [label, mutate] of [
   ["orientation 0", (asset) => { asset.orientation = 0; }],
   ["orientation 9", (asset) => { asset.orientation = 9; }],
@@ -5121,10 +5100,11 @@ for (const [label, mutate] of [
   ["oversized byte length", (asset) => { asset.byte_length = 9007199254740992; }],
   ["non-canonical AssetId", (asset) => { asset.asset_id = `ast_b3_${"A".repeat(52)}`; }],
   ["uppercase media type", (asset) => { asset.media_type = "image/PNG"; }],
+  ["unknown asset field", (asset) => { asset.forged = 1; }],
 ]) {
-  const forged = structuredClone(availableAssetStatus);
+  const forged = structuredClone(realFacadeAvailableEmission);
   mutate(forged.asset);
-  assertValid(`AVAILABLE asset status with ${label}`, assetStatusSchema, forged, false);
+  assertValid(`forged AVAILABLE emission with ${label}`, assetStatusSchema, forged, false);
 }
 assertValid("absent asset status is closed and explicit", assetStatusSchema, {
   import_id: testUuid(138),
@@ -5133,7 +5113,8 @@ assertValid("absent asset status is closed and explicit", assetStatusSchema, {
   asset: null,
   error: null,
 });
-const absentImportResultAttempt = { ...availableAssetStatus, state: "absent" };
+const absentImportResultAttempt = structuredClone(realFacadeAvailableEmission);
+absentImportResultAttempt.state = "absent";
 assertValid("import success result cannot be absent", `${schemaBase}asset-status.schema.json#/$defs/ImportResult`, absentImportResultAttempt, false);
 
 function napcatEndpointErrors(raw, expectedProtocols, allowNonLoopback) {
