@@ -32,7 +32,7 @@ pub use restore_identity::{
     RestoreIdentityMode, RestoreIdentityModesPlan, RestoreIdentityPlannerError,
     RestoreIdentityPlannerErrorCode, evaluate_restore_identity_modes,
 };
-pub use host_ingress::{SqliteHostIngressStore, create_host_ingress_schema};
+pub use host_ingress::{HostIngress, SqliteHostIngressStore, create_host_ingress_schema};
 pub use transaction::{
     ActivationTransaction, CoreTransaction, HostCapabilityGrant, HostConnectionAuthority,
     HOST_CAPABILITY_GRANT_RECORD_SCHEMA, CORE_ENGINE_SCHEMA_SQL, CORE_ENGINE_SCHEMA_VERSION,

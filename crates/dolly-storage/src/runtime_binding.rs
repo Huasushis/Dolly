@@ -1334,6 +1334,17 @@ fn generation_error(error: String) -> RuntimeBindingError {
 }
 
 fn mint_worker_epoch() -> Result<WorkerEpoch, RuntimeBindingError> {
+    let text = mint_uuid_v7_text()?;
+    let uuid = UuidV7::from_string(text).map_err(generation_error)?;
+    Ok(WorkerEpoch::from_uuid_v7(uuid))
+}
+
+/// Mint one genuine RFC-9562 UUIDv7 identifier: a Unix-epoch millisecond
+/// timestamp in the top 48 bits, the version/variant bits at their canonical
+/// positions, and real cryptographic randomness in the remaining bits. This
+/// is the accepted Host allocation primitive; the Host ingress slice mints
+/// its identities through it rather than deriving digest-shaped lookalikes.
+pub(crate) fn mint_uuid_v7_text() -> Result<String, RuntimeBindingError> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes)
         .map_err(|error| RuntimeBindingError::Randomness(error.to_string()))?;
@@ -1368,8 +1379,7 @@ fn mint_worker_epoch() -> Result<WorkerEpoch, RuntimeBindingError> {
         bytes[14],
         bytes[15],
     );
-    let uuid = UuidV7::from_string(text).map_err(generation_error)?;
-    Ok(WorkerEpoch::from_uuid_v7(uuid))
+    Ok(text)
 }
 fn canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, RuntimeBindingError> {
     let (bytes, _) = canonicalize(value).map_err(canonical_error)?;
