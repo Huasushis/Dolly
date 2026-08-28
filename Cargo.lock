@@ -208,6 +208,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dolly-channel"
+version = "0.1.0"
+dependencies = [
+ "dolly-canonical-json",
+ "dolly-core-domain",
+ "dolly-schema",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "dolly-core-domain"
 version = "0.1.0"
 dependencies = [
