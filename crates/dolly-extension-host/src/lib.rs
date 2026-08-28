@@ -9,13 +9,14 @@
 //! executor.
 
 use dolly_canonical_json::{
-    CanonicalJsonObject, CanonicalJsonValue, ParseLimits, Sha256Digest, canonicalize,
-    parse_core_json,
+    CanonicalBytes, CanonicalJsonObject, CanonicalJsonValue, ParseLimits, Sha256Digest,
+    canonicalize, parse_core_json,
 };
 use dolly_core_domain::{
     Attempt, ExtensionGeneration, LeaseGeneration, LeaseToken, ModuleId, WorkerEpoch,
 };
 use dolly_core_reducer::{ActivationState, TransitionOutcome};
+use dolly_extension_sdk::{CapabilityRequest as SdkCapabilityRequest, ResultData};
 use dolly_protocol::{FrameLimits, MessageKind, message::decode_message};
 use dolly_runtime::{
     DispatchResult, ExecutionOrder, ExecutionPremise, ReplayEvidence, ReplayMode, ReplayScope,
@@ -54,6 +55,7 @@ pub struct FencedInvocationPremise {
     extension_generation: i64,
     lease_generation: i64,
     attempt: i64,
+    lease_token: LeaseToken,
     lease_token_digest: Sha256Digest,
     frame_digest: Sha256Digest,
     graph_digest: Sha256Digest,
@@ -140,6 +142,92 @@ impl FencedInvocationPremise {
             self.activation_id.clone(),
             self.manifest_digest.to_canonical_string(),
         )
+    }
+    /// Build a canonical result receipt after invocation admission.
+    pub fn result_receipt(&self, result: &ResultData) -> Result<InvocationReceipt, AdmissionError> {
+        let payload = result
+            .canonical_value()
+            .map_err(|_| AdmissionError::InvalidResult)?;
+        let result_digest = result.digest().map_err(|_| AdmissionError::InvalidResult)?;
+        let receipt_value = serde_json::json!({
+            "invocation": {
+                "activation_id": self.activation_id,
+                "module_id": self.module_id,
+                "request_id": self.request_id,
+                "frame_digest": self.frame_digest,
+                "replay_key": {
+                    "activation_id": self.activation_id,
+                    "manifest_digest": self.manifest_digest,
+                },
+            },
+            "result": {
+                "worker_epoch": self.worker_epoch.to_string(),
+                "extension_generation": self.extension_generation,
+                "activation_id": self.activation_id,
+                "manifest_digest": self.manifest_digest,
+                "lease_generation": self.lease_generation,
+                "lease_token": self.lease_token.expose_base64url(),
+                "payload": payload,
+                "result_digest": result_digest,
+            },
+        });
+        let (bytes, receipt_digest) =
+            canonicalize(&receipt_value).map_err(|_| AdmissionError::InvalidResult)?;
+        Ok(InvocationReceipt {
+            activation_id: self.activation_id.clone(),
+            manifest_digest: self.manifest_digest.clone(),
+            result_digest,
+            receipt_digest,
+            bytes,
+            result: result.clone(),
+        })
+    }
+}
+/// Canonical result and invocation receipt produced after G2 admission.
+///
+/// The SDK can supply only [`ResultData`]. All identity, lease, frame, and
+/// replay fields are copied from the opaque [`FencedInvocationPremise`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvocationReceipt {
+    activation_id: String,
+    manifest_digest: Sha256Digest,
+    result_digest: Sha256Digest,
+    receipt_digest: Sha256Digest,
+    bytes: CanonicalBytes,
+    result: ResultData,
+}
+
+impl InvocationReceipt {
+    pub fn activation_id(&self) -> &str {
+        &self.activation_id
+    }
+
+    pub fn manifest_digest(&self) -> &Sha256Digest {
+        &self.manifest_digest
+    }
+
+    pub fn replay_key(&self) -> (String, String) {
+        (
+            self.activation_id.clone(),
+            self.manifest_digest.to_canonical_string(),
+        )
+    }
+
+    pub fn result_digest(&self) -> &Sha256Digest {
+        &self.result_digest
+    }
+
+    pub fn receipt_digest(&self) -> &Sha256Digest {
+        &self.receipt_digest
+    }
+
+    pub fn result(&self) -> &ResultData {
+        &self.result
+    }
+
+    /// Canonical receipt bytes. Sending or persisting them is outside G2.
+    pub fn bytes(&self) -> &[u8] {
+        self.bytes.as_bytes()
     }
 }
 
@@ -245,6 +333,44 @@ pub fn admit_capability(
     Ok(())
 }
 
+/// Capability request data that passed Host admission. It has no executor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmittedCapabilityRequest {
+    method: String,
+    arguments: CanonicalJsonObject,
+}
+
+impl AdmittedCapabilityRequest {
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+
+    pub fn arguments(&self) -> &CanonicalJsonObject {
+        &self.arguments
+    }
+}
+
+/// Consume SDK request data only after the G1-derived premise exists.
+pub fn admit_sdk_capability(
+    premise: &FencedInvocationPremise,
+    projection: &CapabilityProjection,
+    request: SdkCapabilityRequest,
+) -> Result<AdmittedCapabilityRequest, AdmissionError> {
+    if projection.module_id != premise.module_id
+        || projection.manifest_digest != premise.manifest_digest
+        || !projection
+            .declared_methods
+            .iter()
+            .any(|method| method == request.method())
+    {
+        return Err(AdmissionError::CapabilityDenied);
+    }
+    Ok(AdmittedCapabilityRequest {
+        method: request.method().to_owned(),
+        arguments: request.arguments().clone(),
+    })
+}
+
 /// Fail-closed G2 admission errors. Raw lease tokens are never included.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum AdmissionError {
@@ -256,6 +382,8 @@ pub enum AdmissionError {
     DispatchNotCommitted,
     #[error("G1 fence mismatch: {0}")]
     FenceMismatch(&'static str),
+    #[error("SDK result data is invalid")]
+    InvalidResult,
     #[error("capability is undeclared, cross-Extension, stale, or reversed")]
     CapabilityDenied,
 }
@@ -269,6 +397,7 @@ struct ParsedActivation {
     attempt: i64,
     manifest: ActivationManifest,
     manifest_value: CanonicalJsonValue,
+    lease_token: LeaseToken,
     lease_token_digest: Sha256Digest,
 }
 
@@ -308,6 +437,7 @@ pub fn admit_activation(
         extension_generation: premise.fence().extension_generation(),
         lease_generation: premise.fence().lease_generation(),
         attempt: premise.fence().attempt(),
+        lease_token: parsed.lease_token,
         lease_token_digest: parsed.lease_token_digest,
         frame_digest: dispatch
             .frame_digest()
@@ -325,10 +455,7 @@ pub fn admit_activation(
             .map_err(|_| AdmissionError::FenceMismatch("descriptor_digest"))?,
         manifest_digest: parsed.manifest.manifest_digest.clone(),
         effective_config_digest: parsed.manifest.effective_config_digest.clone(),
-        effective_config_schema_digest: parsed
-            .manifest
-            .effective_config_schema_digest
-            .clone(),
+        effective_config_schema_digest: parsed.manifest.effective_config_schema_digest.clone(),
         manifest: parsed.manifest,
         order: premise.order().clone(),
         replay_scope: premise.replay_scope().clone(),
@@ -341,7 +468,9 @@ fn parse_frame(
 ) -> Result<ParsedActivation, AdmissionError> {
     let frame = dispatch.frame_bytes();
     if frame.len() > limits.max_frame_bytes() as usize {
-        return Err(AdmissionError::FrameRejected("frame exceeds negotiated limit".into()));
+        return Err(AdmissionError::FrameRejected(
+            "frame exceeds negotiated limit".into(),
+        ));
     }
     let message = decode_message(frame, limits)
         .map_err(|error| AdmissionError::FrameRejected(error.to_string()))?;
@@ -390,7 +519,11 @@ fn parse_frame(
     if wire.manifest.manifest_digest != digest {
         return Err(AdmissionError::FenceMismatch("manifest_digest"));
     }
-    let request_id = message.id.ok_or(AdmissionError::InvalidFrame("request id"))?;
+    let request_id = message
+        .id
+        .ok_or(AdmissionError::InvalidFrame("request id"))?;
+    let lease_token = wire.lease_token;
+    let lease_token_digest = Sha256Digest::compute(lease_token.expose_bytes());
     Ok(ParsedActivation {
         request_id,
         worker_epoch: wire.worker_epoch,
@@ -399,7 +532,8 @@ fn parse_frame(
         attempt: wire.attempt.value() as i64,
         manifest: wire.manifest,
         manifest_value,
-        lease_token_digest: Sha256Digest::compute(wire.lease_token.expose_bytes()),
+        lease_token,
+        lease_token_digest,
     })
 }
 
@@ -416,9 +550,8 @@ fn validate_frame(
     frame_digest
         .verify_bytes(dispatch.frame_bytes())
         .map_err(|_| AdmissionError::FenceMismatch("frame_digest bytes"))?;
-    let canonical_frame = canonicalize(&decode_canonical_frame(dispatch.frame_bytes(), limits)?).map_err(
-        |_| AdmissionError::InvalidFrame("canonical frame"),
-    )?;
+    let canonical_frame = canonicalize(&decode_canonical_frame(dispatch.frame_bytes(), limits)?)
+        .map_err(|_| AdmissionError::InvalidFrame("canonical frame"))?;
     if canonical_frame.0.as_bytes() != dispatch.frame_bytes() {
         return Err(AdmissionError::InvalidFrame("non-canonical frame"));
     }
@@ -438,10 +571,7 @@ fn validate_frame(
     if parsed.manifest.manifest_digest.to_string() != premise.digests().manifest_digest()
         || parsed.manifest.effective_config_digest.to_string()
             != premise.digests().effective_config_digest()
-        || parsed
-            .manifest
-            .effective_config_schema_digest
-            .to_string()
+        || parsed.manifest.effective_config_schema_digest.to_string()
             != premise.digests().effective_config_schema_digest()
     {
         return Err(AdmissionError::FenceMismatch("manifest/config digest"));
@@ -451,7 +581,8 @@ fn validate_frame(
         return Err(AdmissionError::FenceMismatch("manifest bytes"));
     }
     if parsed.manifest.required_frame_bytes < dispatch.frame_bytes().len() as u64
-        || parsed.manifest.required_frame_nesting_depth < frame_nesting_depth(dispatch.frame_bytes())
+        || parsed.manifest.required_frame_nesting_depth
+            < frame_nesting_depth(dispatch.frame_bytes())
     {
         return Err(AdmissionError::FenceMismatch("frame bounds"));
     }
@@ -499,15 +630,35 @@ fn validate_durable_state(
         "extension_connection_id",
         premise.fence().extension_connection_id(),
     )?;
-    require_str(lease, "worker_epoch_id", &premise.fence().worker_epoch().to_string())?;
+    require_str(
+        lease,
+        "worker_epoch_id",
+        &premise.fence().worker_epoch().to_string(),
+    )?;
     require_str(lease, "dispatch_state", "started")?;
     require_str(lease, "frame_digest", dispatch.frame_digest())?;
-    require_str(lease, "manifest_digest", premise.digests().manifest_digest())?;
+    require_str(
+        lease,
+        "manifest_digest",
+        premise.digests().manifest_digest(),
+    )?;
     require_i64(lease, "worker_epoch", premise.fence().worker_epoch_fence())?;
-    require_i64(lease, "incarnation_revision", premise.fence().incarnation_revision())?;
+    require_i64(
+        lease,
+        "incarnation_revision",
+        premise.fence().incarnation_revision(),
+    )?;
     require_i64(lease, "attempt", premise.fence().attempt())?;
-    require_i64(lease, "extension_generation", premise.fence().extension_generation())?;
-    require_str(lease, "token_digest", &parsed.lease_token_digest.to_string())?;
+    require_i64(
+        lease,
+        "extension_generation",
+        premise.fence().extension_generation(),
+    )?;
+    require_str(
+        lease,
+        "token_digest",
+        &parsed.lease_token_digest.to_string(),
+    )?;
     let reservation = state
         .host_request_reservations
         .get(premise.fence().reservation_id())
@@ -521,8 +672,16 @@ fn validate_durable_state(
         "extension_connection_id",
         premise.fence().extension_connection_id(),
     )?;
-    require_str(reservation, "worker_epoch_id", &premise.fence().worker_epoch().to_string())?;
-    require_i64(reservation, "worker_epoch", premise.fence().worker_epoch_fence())?;
+    require_str(
+        reservation,
+        "worker_epoch_id",
+        &premise.fence().worker_epoch().to_string(),
+    )?;
+    require_i64(
+        reservation,
+        "worker_epoch",
+        premise.fence().worker_epoch_fence(),
+    )?;
     require_i64(
         reservation,
         "incarnation_revision",
@@ -562,7 +721,10 @@ fn durable_token_digest(
         .ok_or(AdmissionError::FenceMismatch("token_hash"))
 }
 
-fn validate_order(manifest: &ActivationManifest, order: &ExecutionOrder) -> Result<(), AdmissionError> {
+fn validate_order(
+    manifest: &ActivationManifest,
+    order: &ExecutionOrder,
+) -> Result<(), AdmissionError> {
     if manifest.input_items.len() != order.input_items().len()
         || manifest.cursor_spans.len() != order.cursor_spans().len()
         || manifest.lossy_gaps.len() != order.lossy_gaps().len()
@@ -580,7 +742,8 @@ fn validate_order(manifest: &ActivationManifest, order: &ExecutionOrder) -> Resu
         {
             return Err(AdmissionError::FenceMismatch("input order"));
         }
-        for (occurrence, expected_occurrence) in item.occurrences.iter().zip(expected.occurrences()) {
+        for (occurrence, expected_occurrence) in item.occurrences.iter().zip(expected.occurrences())
+        {
             if occurrence.page_id.to_string() != expected_occurrence.page_id()
                 || occurrence.page_seq.value() != expected_occurrence.page_seq()
                 || occurrence.commit_seq.value() != expected_occurrence.commit_seq()
@@ -626,17 +789,19 @@ fn validate_replay_scope(
     // Manifest's revision and digest are checked here; this check only ensures
     // the premise remains internally coherent before exposing it.
     if manifest.descriptor_revision.value() == 0
-        || (scope.mode() == ReplayMode::FencedReplay
-            && scope.evidence() == ReplayEvidence::None)
-        || (scope.mode() == ReplayMode::NeverAutoRetry
-            && scope.evidence() != ReplayEvidence::None)
+        || (scope.mode() == ReplayMode::FencedReplay && scope.evidence() == ReplayEvidence::None)
+        || (scope.mode() == ReplayMode::NeverAutoRetry && scope.evidence() != ReplayEvidence::None)
     {
         return Err(AdmissionError::FenceMismatch("replay contract"));
     }
     Ok(())
 }
 
-fn require_str<'a>(value: &'a serde_json::Value, key: &str, expected: &str) -> Result<&'a str, AdmissionError> {
+fn require_str<'a>(
+    value: &'a serde_json::Value,
+    key: &str,
+    expected: &str,
+) -> Result<&'a str, AdmissionError> {
     let actual = value
         .get(key)
         .and_then(serde_json::Value::as_str)
@@ -655,13 +820,15 @@ fn require_i64(value: &serde_json::Value, key: &str, expected: i64) -> Result<()
 }
 
 fn canonical_value<T: Serialize>(value: &T) -> Result<CanonicalJsonValue, AdmissionError> {
-    let (bytes, _) = canonicalize(value)
-        .map_err(|_| AdmissionError::FenceMismatch("canonical value"))?;
+    let (bytes, _) =
+        canonicalize(value).map_err(|_| AdmissionError::FenceMismatch("canonical value"))?;
     parse_core_json(bytes.as_bytes(), ParseLimits::protocol_wire())
         .map_err(|_| AdmissionError::FenceMismatch("canonical value"))
 }
 
-fn deserialize_canonical<T: DeserializeOwned>(value: &CanonicalJsonValue) -> Result<T, AdmissionError> {
+fn deserialize_canonical<T: DeserializeOwned>(
+    value: &CanonicalJsonValue,
+) -> Result<T, AdmissionError> {
     T::deserialize(value.clone().into_deserializer())
         .map_err(|_| AdmissionError::FenceMismatch("typed value"))
 }
@@ -758,18 +925,46 @@ mod tests {
             RpcDirection::ExtensionToHost,
         )
         .unwrap();
-        assert_eq!(admit_capability(&projection, &request), Err(AdmissionError::CapabilityDenied));
+        assert_eq!(
+            admit_capability(&projection, &request),
+            Err(AdmissionError::CapabilityDenied)
+        );
+    }
+
+    #[test]
+    fn cross_extension_capability_is_rejected_before_any_effect() {
+        let projection = CapabilityProjection::new(
+            "org.example.extension",
+            "module",
+            DIGEST,
+            vec!["host.block.get".into()],
+        )
+        .unwrap();
+        let request = CapabilityRequest::new(
+            "org.other.extension",
+            "module",
+            DIGEST,
+            "host.block.get",
+            RpcDirection::ExtensionToHost,
+        )
+        .unwrap();
+        assert_eq!(
+            admit_capability(&projection, &request),
+            Err(AdmissionError::CapabilityDenied)
+        );
     }
 
     #[test]
     fn reverse_direction_is_rejected_before_any_effect() {
-        assert!(CapabilityRequest::new(
-            "org.example.extension",
-            "module",
-            DIGEST,
-            "host.block.get",
-            RpcDirection::HostToExtension,
-        )
-        .is_err());
+        assert!(
+            CapabilityRequest::new(
+                "org.example.extension",
+                "module",
+                DIGEST,
+                "host.block.get",
+                RpcDirection::HostToExtension,
+            )
+            .is_err()
+        );
     }
 }

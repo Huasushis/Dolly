@@ -192,11 +192,22 @@ dependencies = [
  "dolly-canonical-json",
  "dolly-core-domain",
  "dolly-core-reducer",
+ "dolly-extension-sdk",
  "dolly-protocol",
  "dolly-runtime",
  "dolly-schema",
  "dolly-storage",
  "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "dolly-extension-sdk"
+version = "0.1.0"
+dependencies = [
+ "dolly-canonical-json",
  "serde",
  "serde_json",
  "thiserror",
