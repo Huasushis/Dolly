@@ -666,6 +666,21 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
         )
         .expect("accepted G2 invocation must bind the exact daemon owner")
     };
+    let duplicate_operational = {
+        let _admission_work = supervisor
+            .begin_work(&work_guard)
+            .expect("duplicate operational admission must be tracked");
+        let store = SqliteCoreStore::new(&mut dispatch.connection)
+            .expect("core schema for duplicate operational admission");
+        dolly_extension_host::admit_operational_activation_with_lifecycle(
+            &dispatch.premise,
+            &dispatch.result,
+            &store,
+            FrameLimits::defaults(),
+            &work_guard,
+        )
+        .expect("duplicate G2 invocation must bind the same durable owner")
+    };
     let after_core = {
         let store = SqliteCoreStore::new(&mut dispatch.connection)
             .expect("core schema after operational admission");
@@ -695,6 +710,13 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
             .configuration_transaction_authority(&base_configuration, &host_store)
             .expect("live Host configuration authority")
     };
+    let duplicate_config_authority = {
+        let host_store =
+            SqliteCoreStore::new(&mut dispatch.connection).expect("current Host state");
+        duplicate_operational
+            .configuration_transaction_authority(&base_configuration, &host_store)
+            .expect("duplicate live Host configuration authority")
+    };
     let old_host_authority = {
         let host_store =
             SqliteCoreStore::new(&mut dispatch.connection).expect("current Host state");
@@ -708,6 +730,9 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
         operational
             .bind_configuration_authority(&mut configuration, &old_config_authority)
             .expect("initial configuration authority");
+        duplicate_operational
+            .bind_configuration_authority(&mut configuration, &duplicate_config_authority)
+            .expect("duplicate configuration authority");
         let baseline = ConfigurationTransaction::new(
             "g3-config-baseline",
             Some(base_configuration.revision()),
@@ -879,10 +904,20 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
     policy.allow_operation("read").expect("operation");
     policy.allow_target(target.clone());
     let authority = operational
-        .external_io_authority(policy)
+        .external_io_authority(policy.clone())
         .expect("live external authority");
     let secret_reference: dolly_extension_host::SecretRef =
         "secret://vault/g3".parse().expect("secret reference");
+    let duplicate_authority = duplicate_operational
+        .external_io_authority(policy)
+        .expect("duplicate admission must share current revision");
+    duplicate_authority
+        .provision_secret(
+            &duplicate_operational,
+            "secret://vault/g3".parse().expect("duplicate secret reference"),
+            b"duplicate-secret",
+        )
+        .expect("duplicate authority must provision at current revision");
     let unprovisioned_request = dolly_extension_host::ExternalIoRequest::new(
         "org.example.extension",
         "read",
@@ -917,6 +952,9 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
         Some(secret_reference.clone()),
     )
     .expect("external request");
+    let duplicate_permit = duplicate_authority
+        .authorize(&duplicate_operational, request.clone())
+        .expect("duplicate admission must authorize at current revision");
     let stopped_permit = authority
         .authorize(&operational, request.clone())
         .expect("live premise must authorize");
@@ -947,6 +985,17 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
         revocation_receipt.revision(),
         baseline_receipt.revision() + 1
     );
+    let replayed_revocation = {
+        let mut configuration =
+            ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
+        configuration
+            .apply(&duplicate_config_authority, &revocation_request)
+            .expect("duplicate configuration authority replay")
+    };
+    assert_eq!(
+        replayed_revocation.disposition(),
+        ConfigurationDisposition::Replayed
+    );
     assert!(matches!(
         authority.authorize(&operational, request.clone()),
         Err(dolly_extension_host::ExternalIoError::StaleGeneration)
@@ -967,6 +1016,22 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
         ))
     ));
     assert_eq!(revoked_effects.get(), 0);
+    assert!(matches!(
+        duplicate_authority.authorize(&duplicate_operational, request.clone()),
+        Err(dolly_extension_host::ExternalIoError::StaleGeneration)
+    ));
+    let duplicate_effects = std::cell::Cell::new(0);
+    let duplicate_result = duplicate_permit.execute(|_| {
+        duplicate_effects.set(duplicate_effects.get() + 1);
+        Ok::<_, ()>(())
+    });
+    assert!(matches!(
+        duplicate_result,
+        Err(dolly_extension_host::ExternalIoExecutionError::Denied(
+            dolly_extension_host::ExternalIoError::StaleGeneration
+        ))
+    ));
+    assert_eq!(duplicate_effects.get(), 0);
 
     let escaped_premise = operational.clone();
 

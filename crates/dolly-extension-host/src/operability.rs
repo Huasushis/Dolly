@@ -10,7 +10,9 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::hash::Hash;
-use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{
+    Arc, Condvar, LazyLock, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
+};
 
 use dolly_canonical_json::{Sha256Digest, canonicalize};
 use dolly_core_domain::{ExtensionId, WorkerEpoch};
@@ -375,6 +377,52 @@ impl std::hash::Hash for SecretOwner {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ConfigurationOwnerKey {
+    extension_id: String,
+    module_id: String,
+    extension_connection_id: String,
+    host_incarnation_revision: i64,
+    worker_epoch: WorkerEpoch,
+    worker_epoch_fence: i64,
+    extension_generation: i64,
+}
+
+impl SecretOwner {
+    fn configuration_owner_key(&self) -> ConfigurationOwnerKey {
+        ConfigurationOwnerKey {
+            extension_id: self.extension_id.clone(),
+            module_id: self.module_id.clone(),
+            extension_connection_id: self.extension_connection_id.clone(),
+            host_incarnation_revision: self.host_incarnation_revision,
+            worker_epoch: self.worker_epoch.clone(),
+            worker_epoch_fence: self.worker_epoch_fence,
+            extension_generation: self.extension_generation,
+        }
+    }
+}
+
+static CONFIGURATION_REVISION_SOURCES: LazyLock<
+    Mutex<HashMap<ConfigurationOwnerKey, Weak<ConfigurationRevisionState>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn shared_configuration_revision_source(
+    owner: &SecretOwner,
+) -> Arc<ConfigurationRevisionState> {
+    let mut sources = match CONFIGURATION_REVISION_SOURCES.lock() {
+        Ok(sources) => sources,
+        Err(error) => error.into_inner(),
+    };
+    sources.retain(|_, source| source.upgrade().is_some());
+    let key = owner.configuration_owner_key();
+    if let Some(source) = sources.get(&key).and_then(Weak::upgrade) {
+        return source;
+    }
+    let source = Arc::new(ConfigurationRevisionState::new());
+    sources.insert(key, Arc::downgrade(&source));
+    source
+}
+
 /// The explicit operational premise produced from one accepted G2 invocation.
 ///
 /// Its private field preserves the G2 fence and prevents callers from
@@ -413,6 +461,8 @@ impl OperationalPremise {
         }
         lifecycle.check().map_err(map_lifecycle_error)?;
         self.lifecycle = Some(lifecycle);
+        let owner = SecretOwner::from_premise(&self)?;
+        self.configuration_revision = shared_configuration_revision_source(&owner);
         Ok(self)
     }
 
