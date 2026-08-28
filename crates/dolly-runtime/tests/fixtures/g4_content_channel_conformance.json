@@ -1,0 +1,272 @@
+{
+  "schema": "dolly.g4-content-channel-conformance/v1",
+  "spec_basis": [
+    "REQ-ASSET-001",
+    "REQ-CHANNEL-001",
+    "docs/spec/services/assets.md::1-9 Asset service normative boundaries",
+    "docs/spec/extensions/channel.md::1-7 Channel Extension normative boundaries",
+    "docs/spec/extension-protocol/03-host-services-and-capabilities.md::6 Ingress and Activation status services",
+    "docs/spec/extension-protocol/03-host-services-and-capabilities.md::7 Asset services",
+    "docs/spec/roadmap/04-critical-path-and-early-use.md::G4 Content/channel substrate",
+    "docs/spec/verification/02-failure-matrix.md::recovery and replica outcomes",
+    "docs/spec/verification/03-adversarial-review.md::Assets and external I/O"
+  ],
+  "source_boundary": {
+    "g1_fixture": "crates/dolly-runtime/tests/fixtures/g1_runtime_conformance.json",
+    "g1_case": "G1-EXEC-001",
+    "g2_fixture": "crates/dolly-runtime/tests/fixtures/g2_extension_host_sdk_conformance.json",
+    "g2_case": "G2-ADMISSION-001",
+    "handoff": "committed G2 invocation context and durable Core ingress premise into the WP-010 Asset and WP-013A/013B Channel seams",
+    "authority": "Core remains the only authority for Block, Ingress, Action, and future Asset identity; Asset and Channel services derive every trusted producer premise from a committed Core transaction and never mint authority of their own",
+    "effect_boundary": "before Asset import, host.ingress.submit, and outbound Channel effects"
+  },
+  "classification": {
+    "product_red": "asserts a WP-010/013A/013B product contract that is not yet implemented; the probe exercises the current durable Core transaction first, so every harness step succeeds and only the missing named seam turns the case red",
+    "pass": "negative authority or premise-direction control already enforced by the accepted G1-G3 boundaries; regression here is a product violation, so the case must stay green",
+    "blocked": "later WP-013B seam whose interfaces (WP-010 Asset authority and WP-013A Channel send contract) are not frozen; retained in the matrix, never executed until both freeze"
+  },
+  "evidence": {
+    "wp010_import_bound_and_crash_recovery": ["G4-WP010-IMPORT-BOUND-001"],
+    "wp010_canonical_identity_and_dedup": ["G4-WP010-IDENTITY-DEDUP-001"],
+    "wp010_mime_and_security_refusal": ["G4-WP010-MIME-SECURITY-001"],
+    "wp010_leases_and_gc": ["G4-WP010-LEASE-GC-001"],
+    "wp010_replicas_and_domain_isolation": ["G4-WP010-REPLICA-001", "G4-WP010-DOMAIN-ISOLATION-001"],
+    "wp013a_authenticated_text_round_trip": ["G4-WP013A-ROUNDTRIP-001"],
+    "wp013a_ingress_reconciliation": ["G4-WP013A-INGRESS-RECONCILE-001"],
+    "wp013a_authorization": ["G4-WP013A-AUTHORIZATION-001"],
+    "wp013a_replay_and_idempotency": ["G4-WP013A-REPLAY-001"],
+    "wp013a_unknown_and_partial_outbound": ["G4-WP013A-UNKNOWN-PARTIAL-001"],
+    "wp013a_backpressure": ["G4-WP013A-BACKPRESSURE-001"],
+    "wp013a_redaction": ["G4-WP013A-REDACTION-001"],
+    "wp013a_no_direct_page_or_cursor_mutation": ["G4-WP013A-NO-DIRECT-MUTATION-001"],
+    "wp013b_asset_import_and_send_seam": ["G4-WP013B-ASSET-SEND-SEAM-001"],
+    "wp013b_mime_lease_media_abuse_round_trip": ["G4-WP013B-MIME-LEASE-001", "G4-WP013B-MEDIA-ABUSE-001"],
+    "premise_direction_controls": ["G4-CONTROL-PREMISE-DIRECTION-001", "G4-CONTROL-SOURCE-SCOPED-001", "G4-CONTROL-ACTION-OWNER-001", "G4-CONTROL-NO-DIRECT-MUTATION-001", "G4-CONTROL-ASSET-UNTRUSTED-001"]
+  },
+  "cases": [
+    {
+      "id": "G4-WP010-IMPORT-BOUND-001",
+      "name": "bounded_import_and_crash_recovery_require_a_core_owned_import_seam",
+      "kind": "asset_import_bound",
+      "expected": "product_red",
+      "seam": "host.asset.import and host.asset.status (schemas/asset-import.schema.json); ImportId persists ACCEPTED before acquisition; crash restarts from ACCEPTED unless a verified staging object exists",
+      "causal_red": "the only durable draft route today is CoreCommand::Ingress, which commits the block verbatim with a caller-chosen block_id; there is no ImportId, byte bound, staging object, AVAILABLE gate, or crash-restart record, so the round trip cannot begin",
+      "verify": "submit an asset_input ingress draft, then require an import record bound to an ImportId with an enforced size limit; absent -> PRODUCT_RED"
+    },
+    {
+      "id": "G4-WP010-IDENTITY-DEDUP-001",
+      "name": "canonical_asset_identity_and_dedup_are_core_authority_only",
+      "kind": "asset_identity_dedup",
+      "expected": "product_red",
+      "seam": "AssetId = ast_b3_ + lowercase unpadded base32 of blake3-256 over accepted bytes; identical accepted bytes within one security domain resolve to one AssetId; non-canonical encodings rejected",
+      "causal_red": "no AssetId minting authority exists anywhere in the Core transaction catalog, so identical accepted bytes cannot resolve to a single content-addressed identity and dedup is unverifiable",
+      "verify": "import identical bytes twice through the seam and require one AssetId and one durable lifecycle record; absent -> PRODUCT_RED"
+    },
+    {
+      "id": "G4-WP010-MIME-SECURITY-001",
+      "name": "mime_sniffing_and_security_refusal_precede_availability",
+      "kind": "asset_mime_security",
+      "expected": "product_red",
+      "seam": "declared media type is only a hint; bounded sniffing, MEDIA_TYPE_MISMATCH, UNSAFE_MEDIA, SOURCE_DENIED, SSRF policy, strict base64, and bounded streams",
+      "causal_red": "untrusted bytes ride verbatim inside a committed Block with no sniffing, no media allowlist, no SSRF policy, and no bounded acquisition, so refusal outcomes cannot be produced",
+      "verify": "ingress an HTML payload labeled image/png and require MEDIA_TYPE_MISMATCH or UNSAFE_MEDIA before any availability; absent -> PRODUCT_RED"
+    },
+    {
+      "id": "G4-WP010-LEASE-GC-001",
+      "name": "leases_pins_and_gc_use_atomic_durable_retention",
+      "kind": "asset_lease_gc",
+      "expected": "product_red",
+      "seam": "unguessable LeaseId with finite expiry; lease creation atomic with non-tombstone check; mark/tombstone/sweep with reference recheck; tombstone never resurrects",
+      "causal_red": "there is no lease, pin, or GC record in the durable snapshot, so retention races and tombstone semantics cannot be exercised",
+      "verify": "acquire a finite model-output lease, then require the lease to be atomic with a non-tombstone check and a GC sweep that aborts on a new reference; absent -> PRODUCT_RED"
+    },
+    {
+      "id": "G4-WP010-REPLICA-001",
+      "name": "required_replicas_never_expose_unverified_bytes",
+      "kind": "asset_replica",
+      "expected": "product_red",
+      "seam": "replica state machine disabled|pending_upload|present|upload_failed|pending_delete|delete_failed|deleted; remote_required stays REPLICATING/REPLICA_FAILED and returns REMOTE_REPLICA_FAILED",
+      "causal_red": "no replica state exists and no remote_required path can be demanded, so an unverified required replica could never be refused today",
+      "verify": "request remote_required and require non-available REPLICATING with REMOTE_REPLICA_FAILED on unverified upload; absent -> PRODUCT_RED"
+    },
+    {
+      "id": "G4-WP010-DOMAIN-ISOLATION-001",
+      "name": "security_domain_isolation_is_recorded_and_enforced",
+      "kind": "asset_domain_isolation",
+      "expected": "product_red",
+      "seam": "durable security_domain per asset record; read/stream/view authorize the caller domain; a hash match across domains grants no cross-domain read",
+      "causal_red": "the durable snapshot has no asset record and therefore no security_domain field, so identical bytes in two domains are indistinguishable and cross-domain reads are unenforceable",
+      "verify": "import identical bytes in two security domains and require distinct domain-bound records with a denied cross-domain read; absent -> PRODUCT_RED"
+    },
+    {
+      "id": "G4-WP013A-ROUNDTRIP-001",
+      "name": "authenticated_text_round_trip_runs_producer_to_durable_premise_to_consumer",
+      "kind": "channel_text_round_trip",
+      "expected": "product_red",
+      "seam": "host.ingress.submit derives producer identity and assigns Ingress/Block identity; Channel module consumes committed Blocks and emits only org.dolly.channel.send ActionResult parts",
+      "causal_red": "CoreCommand::Ingress accepts a caller-shaped block and block_id verbatim, so no producer identity is derived; there is no Channel package, no send ActionContract execution, and no round trip",
+      "verify": "derive a producer-bound text ingress, deliver it to a Channel module, and require a channel-owned outbound send action from activation output; absent -> PRODUCT_RED"
+    },
+    {
+      "id": "G4-WP013A-INGRESS-RECONCILE-001",
+      "name": "ingress_reconciliation_reads_status_instead_of_resubmitting",
+      "kind": "channel_ingress_reconcile",
+      "expected": "product_red",
+      "seam": "host.ingress.status returns absent|committed for the same authenticated principal and key; only authoritative absent permits a byte-identical replay",
+      "causal_red": "the only reconciliation today is resubmitting the identical CoreCommand::Ingress, which returns the prior mapping; there is no status read, so a lost-response caller cannot distinguish absent from committed without resubmission",
+      "verify": "after a committed ingress with a lost response, require a status read that returns the committed mapping without resubmitting; absent -> PRODUCT_RED"
+    },
+    {
+      "id": "G4-WP013A-AUTHORIZATION-001",
+      "name": "sender_conversation_session_and_capability_are_authorized_before_any_dispatch",
+      "kind": "channel_authorization",
+      "expected": "product_red",
+      "seam": "authenticated transport, authorized sender/conversation/session, capability check before send, session bound to account and policy, no discovery of other sessions",
+      "causal_red": "no Channel transport or session map exists, so there is no authorization decision for any inbound event or outbound action to fail before dispatch",
+      "verify": "present an unauthenticated event and a session-missing send and require refusal before any dispatch record; absent -> PRODUCT_RED"
+    },
+    {
+      "id": "G4-WP013A-REPLAY-001",
+      "name": "outbound_replay_returns_the_existing_result_without_resend",
+      "kind": "channel_replay_idempotency",
+      "expected": "product_red",
+      "seam": "action_id is the outbound idempotency key; confirmed action replay returns the existing result; unknown sends are never auto-repeated",
+      "causal_red": "no outbound ledger or action_id identity exists, so confirmed replay cannot return a prior result and unknown-send quarantine cannot be proven",
+      "verify": "dispatch once, confirm, replay the same action_id and require the existing result with a single dispatch record; absent -> PRODUCT_RED"
+    },
+    {
+      "id": "G4-WP013A-UNKNOWN-PARTIAL-001",
+      "name": "unknown_and_partial_outcomes_are_explicit_and_non_retryable",
+      "kind": "channel_unknown_partial",
+      "expected": "product_red",
+      "seam": "timeout or crash after possible send yields outcome unknown; partial multi-piece send is terminal partial with result null, code CHANNEL_PARTIAL_DELIVERY, retryable false, outcome applied, per-piece ordinal details",
+      "causal_red": "no dispatch record or outcome envelope exists, so a lost send response has no unknown disposition and a partial send has no failed/applied ActionResult mapping",
+      "verify": "lose a send response and require outcome unknown; split a send and require terminal partial with the exact ActionResult mapping; absent -> PRODUCT_RED"
+    },
+    {
+      "id": "G4-WP013A-BACKPRESSURE-001",
+      "name": "outbound_rate_limits_use_bounded_queues_and_caller_deadlines",
+      "kind": "channel_backpressure",
+      "expected": "product_red",
+      "seam": "bounded outbound queues, configured rate/concurrency limits, caller deadlines, transport unavailability never blocks Core input state",
+      "causal_red": "there is no outbound transport queue or rate configuration, so no backpressure or deadline decision can be observed",
+      "verify": "surpass a rate limit and require bounded queuing with caller deadline failure rather than unbounded growth; absent -> PRODUCT_RED"
+    },
+    {
+      "id": "G4-WP013A-REDACTION-001",
+      "name": "credentials_paths_and_signed_urls_never_enter_metadata_or_logs",
+      "kind": "channel_redaction",
+      "expected": "product_red",
+      "seam": "inbound metadata omits transport credentials, cookies, local paths, signed attachment URLs; channel metadata is namespaced and content-free",
+      "causal_red": "the durable block today copies whatever JSON the caller submits, so a draft carrying credentials or a local path would be persisted verbatim with no redaction boundary",
+      "verify": "ingress a draft carrying a credential-shaped field and require it to be absent from the committed record; absent -> PRODUCT_RED"
+    },
+    {
+      "id": "G4-WP013A-NO-DIRECT-MUTATION-001",
+      "name": "channel_cannot_append_to_a_page_or_advance_a_cursor_directly",
+      "kind": "channel_no_direct_mutation",
+      "expected": "product_red",
+      "seam": "the Channel's only durable write route is host.ingress.submit; it must never append to a Page, mint a Block or Asset ID, or advance a Module cursor",
+      "causal_red": "a Channel implementation does not exist, so the negative route set cannot be exercised against it; the Core-side premise that there is no third-party direct-mutation command is covered by G4-CONTROL-NO-DIRECT-MUTATION-001",
+      "verify": "once the Channel seam exists, prove every Channel write lands in a committed Block through ingress and none mutates a Page or Module cursor directly; absent implementation -> PRODUCT_RED"
+    },
+    {
+      "id": "G4-WP013B-ASSET-SEND-SEAM-001",
+      "name": "asset_import_and_send_seam_binds_channel_parts_to_core_assets",
+      "kind": "channel_multimodal_seam",
+      "expected": "product_red",
+      "blocked": true,
+      "blocked_reason": "WP-010 Asset authority (G4-WP010-* product_red) and WP-013A Channel send contract (G4-WP013A-* product_red) are not frozen; this seam must not be executed against unstable interfaces",
+      "unblocked_when": [
+        "G4-WP010-IMPORT-BOUND-001 is green",
+        "G4-WP013A-ROUNDTRIP-001 is green"
+      ],
+      "seam": "org.dolly.channel.send carries Core Part AssetRefs; the Channel imports or pins through host.asset.import and never trusts action media_type",
+      "causal_red": "no AssetRef Part exists, so a Channel send cannot bind parts to committed hash-checked Assets"
+    },
+    {
+      "id": "G4-WP013B-MIME-LEASE-001",
+      "name": "mime_and_lease_round_trip_through_core_assets",
+      "kind": "channel_multimodal_mime_lease",
+      "expected": "product_red",
+      "blocked": true,
+      "blocked_reason": "depends on the WP-010 MIME/lease contract and the WP-013A send ActionContract; interfaces are not frozen; blocked with G4-WP013B-ASSET-SEND-SEAM-001",
+      "unblocked_when": [
+        "G4-WP010-MIME-SECURITY-001 is green",
+        "G4-WP010-LEASE-GC-001 is green"
+      ],
+      "seam": "outbound Asset parts read under a short Asset lease with authoritative detected media type",
+      "causal_red": "no lease or detected-media-type authority exists today"
+    },
+    {
+      "id": "G4-WP013B-MEDIA-ABUSE-001",
+      "name": "media_abuse_round_trip_refuses_unsafe_or_unowned_media",
+      "kind": "channel_multimodal_media_abuse",
+      "expected": "product_red",
+      "blocked": true,
+      "blocked_reason": "needs the WP-010 security/domain contract and WP-013A authorization; interfaces are not frozen; blocked with G4-WP013B-ASSET-SEND-SEAM-001",
+      "unblocked_when": [
+        "G4-WP010-MIME-SECURITY-001 is green",
+        "G4-WP010-DOMAIN-ISOLATION-001 is green",
+        "G4-WP013A-AUTHORIZATION-001 is green"
+      ],
+      "seam": "unsafe media, cross-domain AssetRefs, and forged media_type are refused before any send dispatch",
+      "causal_red": "no media or domain authority exists, so abuse cannot be refused"
+    },
+    {
+      "id": "G4-CONTROL-PREMISE-DIRECTION-001",
+      "name": "producer_premise_is_durable_explicit_and_never_reversible",
+      "kind": "fail_closed_control",
+      "expected": "pass",
+      "references": [
+        "crates/dolly-runtime/tests/g1_runtime_conformance.rs::g1_exec_001_valid_durable_activation_emits_exact_module_activate_premise_before_effect",
+        "crates/dolly-core-reducer/tests/contract.rs::result_and_replay_authority_require_exact_execution_bindings"
+      ],
+      "assertion": "identical ingress replay returns the prior mapping; a different digest under the same key is STORAGE_IDEMPOTENCY_CONFLICT, never an overwrite; the record survives a store reopen"
+    },
+    {
+      "id": "G4-CONTROL-SOURCE-SCOPED-001",
+      "name": "ingress_keys_are_producer_scoped_without_echo_collision",
+      "kind": "fail_closed_control",
+      "expected": "pass",
+      "references": [
+        "crates/dolly-core-reducer/tests/wp004_conformance.rs::ingress identity is scoped to the producer",
+        "crates/dolly-runtime/tests/g2_extension_host_sdk_conformance.rs::g2_minimum_fail_closed_controls_remain_referenced"
+      ],
+      "assertion": "two producer sources using the same ingress key yield independent durable records; replaying the first source returns only its prior mapping"
+    },
+    {
+      "id": "G4-CONTROL-ACTION-OWNER-001",
+      "name": "action_names_are_owner_fenced_against_cross_extension_forgery",
+      "kind": "fail_closed_control",
+      "expected": "pass",
+      "references": [
+        "crates/dolly-core-domain/src/identifiers.rs::ActionName::parse_for_owner requires the exact owner prefix",
+        "crates/dolly-core-reducer/tests/desc_neighbor_projection.rs::build_manifest_binds_neighbors_to_authoritative_graph"
+      ],
+      "assertion": "org.dolly.channel.send parses only for owner org.dolly.channel; any other owner or foreign-prefixed action name is rejected"
+    },
+    {
+      "id": "G4-CONTROL-NO-DIRECT-MUTATION-001",
+      "name": "core_transaction_catalog_has_no_third_party_page_or_cursor_mutation",
+      "kind": "fail_closed_control",
+      "expected": "pass",
+      "references": [
+        "crates/dolly-core-reducer/src/command.rs::CoreCommand catalog contains no page-append or cursor-advance variant",
+        "crates/dolly-local-daemon/tests/g3_operable_local_conformance.rs::g3_operable_local_001_uses_production_daemon_process_and_durable_g2_result"
+      ],
+      "assertion": "the exhaustive CoreCommand catalog publishes external drafts only through Ingress and RuntimeEvent; no variant appends a Page or advances a Module cursor; every durable write passes the Core transaction"
+    },
+    {
+      "id": "G4-CONTROL-ASSET-UNTRUSTED-001",
+      "name": "block_bytes_stay_untrusted_until_a_core_asset_authority_exists",
+      "kind": "fail_closed_control",
+      "expected": "pass",
+      "references": [
+        "crates/dolly-core-reducer/src/types.rs::CoreSnapshot carries no asset, lease, pin, or replica record",
+        "crates/dolly-core-reducer/src/command.rs::CoreCommand contains no asset-import or AssetRef-minting variant"
+      ],
+      "assertion": "an ingress draft carrying asset_input bytes is committed verbatim as untrusted Block content with no AssetId, content hash record, or availability claim; the Core transaction catalog mints no asset identity today"
+    }
+  ]
+}
