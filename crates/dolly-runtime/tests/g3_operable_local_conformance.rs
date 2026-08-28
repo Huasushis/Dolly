@@ -179,7 +179,7 @@ fn build_command(case: &Value) -> BuildManifestCommand {
     }
 }
 
-fn issue_command(case: &Value, token_digest: &str) -> LeaseRequest {
+fn issue_command(case: &Value, token_digest: &str, extension_generation: i64) -> LeaseRequest {
     LeaseRequest::new(
         "g2-exec-lease-001",
         case["activation_id"]
@@ -187,7 +187,7 @@ fn issue_command(case: &Value, token_digest: &str) -> LeaseRequest {
             .expect("G1 activation_id must be a string"),
         "g2-exec-lease-id-001",
         token_digest,
-        Some(7),
+        Some(extension_generation),
     )
 }
 
@@ -200,6 +200,10 @@ struct G1Dispatch {
 }
 
 fn dispatch_g1_case(case: &Value) -> G1Dispatch {
+    dispatch_g1_case_at_generation(case, 7)
+}
+
+fn dispatch_g1_case_at_generation(case: &Value, extension_generation: i64) -> G1Dispatch {
     let activation_id = case["activation_id"]
         .as_str()
         .expect("G1 activation_id must be a string");
@@ -227,7 +231,7 @@ fn dispatch_g1_case(case: &Value) -> G1Dispatch {
         .parse()
         .expect("fixture lease token is valid");
     let token_digest = Sha256Digest::compute(lease_token.expose_bytes()).to_canonical_string();
-    let issue = issue_command(case, &token_digest);
+    let issue = issue_command(case, &token_digest, extension_generation);
     let reservation = engine
         .allocate_request(&issue, &graph_input())
         .expect("allocated Host request reservation");
@@ -621,7 +625,7 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
     ));
     assert!(matches!(
         unauthenticated.state(),
-        DaemonState::Exited(_) | DaemonState::Quarantined(_)
+        DaemonState::Exited(_) | DaemonState::AwaitingAuthority(_) | DaemonState::Quarantined(_)
     ));
     assert!(matches!(
         unauthenticated.acquire_work_guard(initial_generation),
@@ -837,9 +841,13 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
             dolly_extension_host::InMemorySecretProvider::default(),
         )),
     );
-    let request =
-        dolly_extension_host::ExternalIoRequest::new("org.example.extension", "read", target, None)
-            .expect("external request");
+    let request = dolly_extension_host::ExternalIoRequest::new(
+        "org.example.extension",
+        "read",
+        target.clone(),
+        None,
+    )
+    .expect("external request");
     let stopped_permit = authority
         .authorize(&operational, request.clone())
         .expect("live premise must authorize");
@@ -859,9 +867,8 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
     ));
 
     let effect_executions = std::cell::Cell::new(0);
-    let stopped_result = stopped_permit.execute(|context| {
+    let stopped_result = stopped_permit.execute(|_| {
         effect_executions.set(effect_executions.get() + 1);
-        assert!(!context.is_cancelled());
         Ok::<_, ()>(())
     });
     assert!(matches!(
@@ -872,8 +879,38 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
         ))
     ));
 
-    let restarted_generation = supervisor.restart().expect("restart");
-    assert!(restarted_generation > daemon_generation);
+    let fresh_extension_generation = dispatch
+        .premise
+        .fence()
+        .extension_generation()
+        .checked_add(1)
+        .expect("fresh Extension generation");
+    let mut fresh_dispatch = dispatch_g1_case_at_generation(g1_case, fresh_extension_generation);
+    let fresh_fence = fresh_dispatch.premise.fence();
+    let fresh_identity = daemon_lifecycle_identity(
+        &fresh_dispatch,
+        "org.example.extension",
+        fresh_dispatch.premise.identity().module_id(),
+        fresh_fence.extension_connection_id(),
+        fresh_fence.incarnation_revision(),
+        fresh_fence.worker_epoch().clone(),
+        fresh_fence.worker_epoch_fence(),
+        fresh_fence.extension_connection_id(),
+    );
+    let restarted_generation = supervisor
+        .restart_with_identity(fresh_identity)
+        .expect("fresh upstream owner must authorize restart");
+    assert_eq!(
+        restarted_generation.value(),
+        fresh_extension_generation as u64
+    );
+    assert!(!work_guard.is_usable());
+    assert!(matches!(
+        authority.authorize(&escaped_premise, request.clone()),
+        Err(dolly_extension_host::ExternalIoError::Stopped)
+            | Err(dolly_extension_host::ExternalIoError::StaleGeneration)
+    ));
+
     let restarted_result = restarted_permit.execute(|_| {
         effect_executions.set(effect_executions.get() + 1);
         Ok::<_, ()>(())
@@ -888,9 +925,58 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
     assert_eq!(
         effect_executions.get(),
         0,
-        "escaped permits cannot invoke transport after stop or restart"
+        "old permits cannot invoke transport after stop or restart"
     );
-    supervisor.stop().expect("stop restarted child");
+
+    let fresh_guard = supervisor
+        .acquire_work_guard(restarted_generation)
+        .expect("fresh generation work guard");
+    let fresh_operational = {
+        let _fresh_work = supervisor
+            .begin_work(&fresh_guard)
+            .expect("fresh operational admission must be tracked");
+        let store = SqliteCoreStore::new(&mut fresh_dispatch.connection)
+            .expect("fresh core schema for operational admission");
+        dolly_extension_host::admit_operational_activation_with_lifecycle(
+            &fresh_dispatch.premise,
+            &fresh_dispatch.result,
+            &store,
+            FrameLimits::defaults(),
+            &fresh_guard,
+        )
+        .expect("fresh G2 owner must bind")
+    };
+    assert_operational_fences(&fresh_dispatch, &fresh_operational);
+    let mut fresh_policy = dolly_extension_host::ExternalIoPolicy::new(
+        "org.example.extension",
+        fresh_operational.config_revision(),
+        fresh_operational.extension_generation(),
+    )
+    .expect("fresh external policy");
+    fresh_policy
+        .allow_operation("read")
+        .expect("fresh operation");
+    fresh_policy.allow_target(target.clone());
+    let fresh_authority = dolly_extension_host::HostExternalIoAuthority::new(
+        fresh_policy,
+        dolly_extension_host::HostSecretAuthority::new(Arc::new(
+            dolly_extension_host::InMemorySecretProvider::default(),
+        )),
+    );
+    let fresh_request =
+        dolly_extension_host::ExternalIoRequest::new("org.example.extension", "read", target, None)
+            .expect("fresh external request");
+    let fresh_permit = fresh_authority
+        .authorize(&fresh_operational, fresh_request)
+        .expect("fresh premise must authorize");
+    let fresh_result = fresh_permit.execute(|context| {
+        assert!(!context.is_cancelled());
+        effect_executions.set(effect_executions.get() + 1);
+        Ok::<_, ()>(())
+    });
+    assert!(fresh_result.is_ok(), "fresh guarded callback must execute");
+    assert_eq!(effect_executions.get(), 1);
+    supervisor.stop().expect("stop fresh child");
 }
 
 #[test]

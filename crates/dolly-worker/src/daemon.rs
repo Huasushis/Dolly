@@ -3,9 +3,9 @@
 //! A spawned child is `Starting` until it returns an authenticated readiness
 //! line for the exact non-reusable generation, WorkerEpoch, control channel,
 //! ownership token, and required storage state. Only then is the generation
-//! `Running` and able to issue opaque work guards. Stop and restart close the
-//! admission gate before terminating the exact child, and every outstanding
-//! guard is fenced before the method returns.
+//! `Running` and able to issue opaque work guards. Stop revokes the current
+//! identity before terminating the exact child. Restart and crash recovery
+//! require fresh upstream owner authority; without it, work remains fenced.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -131,6 +131,16 @@ impl DaemonLifecycleIdentity {
             && self.worker_epoch == *worker_epoch
             && self.worker_epoch_fence == worker_epoch_fence
             && self.extension_generation == extension_generation
+    }
+
+    fn same_owner_except_generation(&self, other: &Self) -> bool {
+        self.extension_id == other.extension_id
+            && self.module_id == other.module_id
+            && self.extension_connection_id == other.extension_connection_id
+            && self.incarnation_revision == other.incarnation_revision
+            && self.worker_epoch == other.worker_epoch
+            && self.worker_epoch_fence == other.worker_epoch_fence
+            && self.control_channel_id == other.control_channel_id
     }
 }
 /// Finite restart timing and crash-loop bounds.
@@ -381,7 +391,7 @@ impl fmt::Debug for DaemonCommand {
     }
 }
 
-/// Whether an unexpected child exit should create a new generation.
+/// Whether an unexpected child exit is eligible for fresh-authority recovery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RestartPolicy {
     Never,
@@ -395,6 +405,7 @@ pub enum DaemonState {
     Starting(DaemonGeneration),
     Running(DaemonGeneration),
     Exited(DaemonGeneration),
+    AwaitingAuthority(DaemonGeneration),
     Quarantined(DaemonGeneration),
 }
 
@@ -414,6 +425,12 @@ pub enum DaemonError {
     Process(#[source] std::io::Error),
     #[error("daemon is not running")]
     NotRunning,
+    #[error("daemon needs a fresh lifecycle identity before restart")]
+    FreshLifecycleIdentityRequired,
+    #[error("daemon lifecycle identity was reused")]
+    LifecycleIdentityReused,
+    #[error("daemon lifecycle identity generation is not the next generation")]
+    NonMonotonicLifecycleIdentity,
     #[error("daemon generation is stale")]
     StaleGeneration {
         expected: DaemonGeneration,
@@ -746,6 +763,7 @@ pub struct LocalDaemonSupervisor {
     state: DaemonState,
     last_exit_status: Option<ExitStatus>,
     stop_requested: bool,
+    awaiting_authority: bool,
     lifecycle: Option<DaemonLifecycleToken>,
     failure_times: VecDeque<Instant>,
     last_failure: Option<(Instant, Duration)>,
@@ -813,11 +831,12 @@ impl LocalDaemonSupervisor {
             readiness,
             restart_policy,
             initial_generation,
+            state: DaemonState::Stopped,
             child: None,
             generation: None,
-            state: DaemonState::Stopped,
             last_exit_status: None,
             stop_requested: false,
+            awaiting_authority: false,
             lifecycle: None,
             failure_times: VecDeque::new(),
             last_failure: None,
@@ -874,6 +893,9 @@ impl LocalDaemonSupervisor {
         if let DaemonState::Starting(generation) = self.state {
             return Err(DaemonError::AlreadyRunning(generation));
         }
+        if self.awaiting_authority {
+            return Err(DaemonError::FreshLifecycleIdentityRequired);
+        }
         self.stop_requested = false;
         self.wait_for_backoff();
         self.spawn_next()
@@ -889,12 +911,14 @@ impl LocalDaemonSupervisor {
             .map(|mut child| self.terminate_child(&mut child));
 
         if let Err(error) = drain_result {
+            self.awaiting_authority = self.generation.is_some();
             self.quarantined = true;
             self.state =
                 DaemonState::Quarantined(self.generation.unwrap_or(self.initial_generation));
             return Err(error);
         }
         let Some(child_result) = child_result else {
+            self.awaiting_authority = self.generation.is_some();
             if self.quarantined {
                 self.state =
                     DaemonState::Quarantined(self.generation.unwrap_or(self.initial_generation));
@@ -906,6 +930,7 @@ impl LocalDaemonSupervisor {
         match child_result {
             Ok(status) => {
                 self.last_exit_status = Some(status);
+                self.awaiting_authority = self.generation.is_some();
                 if self.quarantined {
                     self.state = DaemonState::Quarantined(
                         self.generation.unwrap_or(self.initial_generation),
@@ -918,6 +943,7 @@ impl LocalDaemonSupervisor {
                 Ok(())
             }
             Err(error) => {
+                self.awaiting_authority = self.generation.is_some();
                 self.state =
                     DaemonState::Exited(self.generation.unwrap_or(self.initial_generation));
                 Err(error)
@@ -925,9 +951,49 @@ impl LocalDaemonSupervisor {
         }
     }
 
-    /// Stop the current process and start a fresh fenced generation.
+    /// A restart requires a fresh upstream lifecycle identity.
     pub fn restart(&mut self) -> Result<DaemonGeneration, DaemonError> {
+        Err(DaemonError::FreshLifecycleIdentityRequired)
+    }
+
+    /// Replace the current owner with the next accepted upstream generation.
+    pub fn restart_with_identity(
+        &mut self,
+        identity: DaemonLifecycleIdentity,
+    ) -> Result<DaemonGeneration, DaemonError> {
+        let current_generation = self.generation.ok_or(DaemonError::NotRunning)?;
+        let current_identity = self
+            .readiness
+            .lifecycle_identity
+            .as_ref()
+            .ok_or(DaemonError::FreshLifecycleIdentityRequired)?;
+        if self.quarantined {
+            return Err(DaemonError::CrashLoopQuarantined(current_generation));
+        }
+        if identity == *current_identity {
+            return Err(DaemonError::LifecycleIdentityReused);
+        }
+        if !identity.same_owner_except_generation(current_identity) {
+            return Err(DaemonError::LifecycleIdentityMismatch);
+        }
+        let expected_generation = current_generation
+            .value()
+            .checked_add(1)
+            .ok_or(DaemonError::GenerationExhausted)?;
+        let expected_extension_generation = current_identity
+            .extension_generation
+            .checked_add(1)
+            .ok_or(DaemonError::GenerationExhausted)?;
+        if identity.extension_generation != expected_extension_generation
+            || u64::try_from(identity.extension_generation).ok() != Some(expected_generation)
+            || identity.worker_epoch.to_string() != self.readiness.worker_epoch
+            || identity.control_channel_id != self.readiness.control_channel_id
+        {
+            return Err(DaemonError::NonMonotonicLifecycleIdentity);
+        }
         self.stop()?;
+        self.readiness.lifecycle_identity = Some(identity);
+        self.awaiting_authority = false;
         self.start()
     }
 
@@ -943,11 +1009,11 @@ impl LocalDaemonSupervisor {
         self.last_failure = None;
         self.next_backoff = self.readiness.restart_bounds.initial_backoff;
         self.lifecycle = None;
+        self.awaiting_authority = self.generation.is_some();
         self.state = DaemonState::Stopped;
         Ok(())
     }
-
-    /// Observe the child. Automatic restarts are bounded and quarantined.
+    /// Observe the child; unexpected exits fence work and await fresh authority.
     pub fn poll(&mut self) -> Result<DaemonState, DaemonError> {
         let status = match self.child.as_mut() {
             Some(child) => child.try_wait().map_err(DaemonError::Process)?,
@@ -961,18 +1027,14 @@ impl LocalDaemonSupervisor {
         self.last_exit_status = Some(status);
         let exited_generation = self.generation.ok_or(DaemonError::NotRunning)?;
         if let Err(error) = self.close_current_lifecycle() {
+            self.awaiting_authority = true;
             self.quarantined = true;
             self.state = DaemonState::Quarantined(exited_generation);
             return Err(error);
         }
-        self.state = DaemonState::Exited(exited_generation);
         self.record_failure(exited_generation);
-        if self.restart_policy == RestartPolicy::OnUnexpectedExit
-            && !self.stop_requested
-            && !self.quarantined
-        {
-            self.wait_for_backoff();
-            self.spawn_next()?;
+        if !self.quarantined {
+            self.state = DaemonState::AwaitingAuthority(exited_generation);
         }
         Ok(self.state)
     }
@@ -993,12 +1055,13 @@ impl LocalDaemonSupervisor {
                 expected,
                 actual: Some(actual),
             }),
-            DaemonState::Stopped | DaemonState::Exited(_) | DaemonState::Quarantined(_) => {
-                Err(DaemonError::StaleGeneration {
-                    expected,
-                    actual: self.generation,
-                })
-            }
+            DaemonState::Stopped
+            | DaemonState::Exited(_)
+            | DaemonState::AwaitingAuthority(_)
+            | DaemonState::Quarantined(_) => Err(DaemonError::StaleGeneration {
+                expected,
+                actual: self.generation,
+            }),
         }
     }
 
@@ -1045,12 +1108,15 @@ impl LocalDaemonSupervisor {
         self.last_exit_status = Some(status);
         let generation = self.generation.ok_or(DaemonError::NotRunning)?;
         if let Err(error) = self.close_current_lifecycle() {
+            self.awaiting_authority = true;
             self.quarantined = true;
             self.state = DaemonState::Quarantined(generation);
             return Err(error);
         }
-        self.state = DaemonState::Exited(generation);
         self.record_failure(generation);
+        if !self.quarantined {
+            self.state = DaemonState::AwaitingAuthority(generation);
+        }
         Ok(())
     }
 
@@ -1072,11 +1138,21 @@ impl LocalDaemonSupervisor {
             })
             .unwrap_or(Ok(self.initial_generation.value()))?;
         let generation = DaemonGeneration::new(next_value)?;
+        let identity = match (
+            self.generation.is_some(),
+            self.readiness.lifecycle_identity.as_ref(),
+        ) {
+            (true, None) => return Err(DaemonError::FreshLifecycleIdentityRequired),
+            (_, Some(identity))
+                if u64::try_from(identity.extension_generation).ok()
+                    != Some(generation.value()) =>
+            {
+                return Err(DaemonError::LifecycleIdentityMismatch);
+            }
+            (_, identity) => identity.cloned(),
+        };
         self.generation = Some(generation);
-        self.lifecycle = Some(DaemonLifecycleToken::new(
-            generation,
-            self.readiness.lifecycle_identity.clone(),
-        ));
+        self.lifecycle = Some(DaemonLifecycleToken::new(generation, identity));
         self.state = DaemonState::Starting(generation);
 
         let mut command = Command::new(&self.command.program);
@@ -1109,7 +1185,7 @@ impl LocalDaemonSupervisor {
                 let _ = self.close_current_lifecycle();
                 self.record_failure(generation);
                 if !self.quarantined {
-                    self.state = DaemonState::Exited(generation);
+                    self.state = DaemonState::AwaitingAuthority(generation);
                 }
                 return Err(DaemonError::Process(error));
             }
@@ -1120,6 +1196,7 @@ impl LocalDaemonSupervisor {
                 self.child = Some(child);
                 self.state = DaemonState::Running(generation);
                 self.open_admission(generation);
+                self.awaiting_authority = false;
                 self.last_failure = None;
                 self.next_backoff = self.readiness.restart_bounds.initial_backoff;
                 Ok(generation)
@@ -1131,7 +1208,7 @@ impl LocalDaemonSupervisor {
                 let _ = self.close_current_lifecycle();
                 self.record_failure(generation);
                 if !self.quarantined {
-                    self.state = DaemonState::Exited(generation);
+                    self.state = DaemonState::AwaitingAuthority(generation);
                 }
                 Err(error)
             }
@@ -1200,6 +1277,7 @@ impl LocalDaemonSupervisor {
         {
             self.failure_times.pop_front();
         }
+        self.awaiting_authority = true;
         self.failure_times.push_back(now);
         let delay = self.next_backoff;
         self.last_failure = Some((now, delay));
@@ -1317,20 +1395,39 @@ sleep 2
     }
 
     fn readiness() -> DaemonReadinessConfig {
-        DaemonReadinessConfig::new("worker-epoch-1", "control-channel-1", "owner-secret")
-            .expect("readiness")
-            .with_storage_ready(true)
-            .with_startup_timeout(Duration::from_millis(80))
-            .with_stop_timeout(Duration::from_millis(80))
-            .with_restart_bounds(
-                RestartBounds::new(
-                    Duration::from_millis(1),
-                    Duration::from_millis(8),
-                    Duration::from_secs(1),
-                    3,
-                )
-                .expect("restart bounds"),
+        let worker_epoch: WorkerEpoch = "0198ab31-6c44-7e8a-b2bb-000000000110"
+            .parse()
+            .expect("worker epoch");
+        let identity = DaemonLifecycleIdentity::new(
+            "org.example.extension",
+            "module-one",
+            "control-channel-1",
+            1,
+            worker_epoch.clone(),
+            17,
+            1,
+            "control-channel-1",
+        )
+        .expect("lifecycle identity");
+        DaemonReadinessConfig::new(
+            worker_epoch.to_string(),
+            "control-channel-1",
+            "owner-secret",
+        )
+        .expect("readiness")
+        .with_lifecycle_identity(identity)
+        .with_storage_ready(true)
+        .with_startup_timeout(Duration::from_millis(80))
+        .with_stop_timeout(Duration::from_millis(80))
+        .with_restart_bounds(
+            RestartBounds::new(
+                Duration::from_millis(1),
+                Duration::from_millis(8),
+                Duration::from_secs(1),
+                3,
             )
+            .expect("restart bounds"),
+        )
     }
 
     fn supervisor(mode: &str) -> LocalDaemonSupervisor {
@@ -1357,7 +1454,9 @@ sleep 2
         ));
         assert!(matches!(
             supervisor.state(),
-            DaemonState::Exited(_) | DaemonState::Quarantined(_)
+            DaemonState::Exited(_)
+                | DaemonState::AwaitingAuthority(_)
+                | DaemonState::Quarantined(_)
         ));
         assert_eq!(supervisor.active_work_count(), 0);
         supervisor.stop().expect("stop failed child");
@@ -1502,11 +1601,55 @@ sleep 2
     }
 
     #[test]
-    fn restart_closes_old_guard_before_new_generation() {
+    fn restart_requires_fresh_owner_and_fences_old_generation() {
         let mut supervisor = supervisor("ready");
         let first = supervisor.start().expect("first start");
         let old_guard = supervisor.acquire_work_guard(first).expect("old guard");
-        let second = supervisor.restart().expect("restart");
+        assert!(matches!(
+            supervisor.restart(),
+            Err(DaemonError::FreshLifecycleIdentityRequired)
+        ));
+        assert!(old_guard.is_usable());
+        let worker_epoch: WorkerEpoch = "0198ab31-6c44-7e8a-b2bb-000000000110"
+            .parse()
+            .expect("worker epoch");
+        let make_identity = |extension_id: &str, generation: i64| {
+            DaemonLifecycleIdentity::new(
+                extension_id,
+                "module-one",
+                "control-channel-1",
+                1,
+                worker_epoch.clone(),
+                17,
+                generation,
+                "control-channel-1",
+            )
+            .expect("lifecycle identity")
+        };
+        assert!(matches!(
+            supervisor.restart_with_identity(make_identity("org.example.extension", 1)),
+            Err(DaemonError::LifecycleIdentityReused)
+        ));
+        assert!(matches!(
+            supervisor.restart_with_identity(make_identity("org.other.extension", 2)),
+            Err(DaemonError::LifecycleIdentityMismatch)
+        ));
+
+        assert!(matches!(
+            supervisor.restart_with_identity(make_identity("org.example.extension", 3)),
+            Err(DaemonError::NonMonotonicLifecycleIdentity)
+        ));
+
+        supervisor.stop().expect("stop before explicit restart");
+        assert!(matches!(
+            supervisor.start(),
+            Err(DaemonError::FreshLifecycleIdentityRequired)
+        ));
+        assert!(!old_guard.is_usable());
+        let fresh_identity = make_identity("org.example.extension", 2);
+        let second = supervisor
+            .restart_with_identity(fresh_identity)
+            .expect("fresh owner restart");
         assert!(second > first);
         assert!(!old_guard.is_usable());
         assert!(matches!(
@@ -1519,26 +1662,31 @@ sleep 2
     }
 
     #[test]
-    fn crash_loop_uses_backoff_and_enters_quarantine_without_authority() {
+    fn automatic_crash_recovery_waits_for_fresh_owner_authority() {
         let mut supervisor = supervisor("ready-exit");
         let first = supervisor.start().expect("first readiness");
-        for _ in 0..32 {
+        let state = loop {
             std::thread::sleep(Duration::from_millis(2));
-            let _ = supervisor.poll().expect("poll");
-            if matches!(supervisor.state(), DaemonState::Quarantined(_)) {
-                break;
+            let state = supervisor.poll().expect("poll");
+            if !matches!(state, DaemonState::Running(_)) {
+                break state;
             }
-        }
-        assert!(matches!(
-            supervisor.state(),
-            DaemonState::Quarantined(generation) if generation > first
-        ));
+        };
+        assert_eq!(state, DaemonState::AwaitingAuthority(first));
+        assert_eq!(supervisor.generation(), Some(first));
         assert_eq!(supervisor.active_work_count(), 0);
         assert!(matches!(
             supervisor.acquire_work_guard(first),
             Err(DaemonError::StaleGeneration { .. }) | Err(DaemonError::WorkNotAdmissible)
         ));
-        assert!(matches!(supervisor.poll(), Ok(DaemonState::Quarantined(_))));
-        supervisor.stop().expect("stop quarantine");
+        assert!(matches!(
+            supervisor.start(),
+            Err(DaemonError::FreshLifecycleIdentityRequired)
+        ));
+        assert_eq!(
+            supervisor.poll().expect("awaiting authority poll"),
+            DaemonState::AwaitingAuthority(first)
+        );
+        supervisor.stop().expect("stop awaiting authority");
     }
 }
