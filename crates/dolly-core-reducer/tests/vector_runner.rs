@@ -520,6 +520,7 @@ fn execute(vector: &Value) -> (Value, Value, String, Vec<Value>) {
                     activation_id: "target".into(),
                     lease_id: "lease".into(),
                     dispatch_state: DispatchState::Started,
+                    frame_digest: None,
                 }),
                 |_| {},
             );
@@ -1146,6 +1147,7 @@ fn execute(vector: &Value) -> (Value, Value, String, Vec<Value>) {
                     activation_id: "a".into(),
                     lease_id: "l".into(),
                     dispatch_state: DispatchState::Started,
+                    frame_digest: None,
                 }),
                 |_| {},
             );

@@ -1215,21 +1215,37 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
             if rank(dispatch) < rank(object_str(lease, "dispatch_state").unwrap_or("prepared")) {
                 return failure(state, "DISPATCH_EVIDENCE_REGRESSION", false, None);
             }
-            next.leases
-                .get_mut(&c.lease_id)
-                .unwrap()
-                .as_object_mut()
-                .unwrap()
-                .insert("dispatch_state".into(), json!(dispatch));
+            if let Some(frame_digest) = c.frame_digest.as_deref() {
+                if frame_digest
+                    .parse::<dolly_canonical_json::Sha256Digest>()
+                    .is_err()
+                {
+                    return failure(state, "DISPATCH_FRAME_DIGEST_INVALID", false, None);
+                }
+                if let Some(existing) = object_str(lease, "frame_digest") {
+                    if existing != frame_digest {
+                        return failure(state, "DISPATCH_FRAME_DIGEST_CONFLICT", false, None);
+                    }
+                }
+            }
+            let lease = next.leases.get_mut(&c.lease_id).unwrap().as_object_mut().unwrap();
+            lease.insert("dispatch_state".into(), json!(dispatch));
+            if let Some(frame_digest) = c.frame_digest.as_deref() {
+                lease.insert("frame_digest".into(), json!(frame_digest));
+            }
             if c.dispatch_state != DispatchState::Prepared {
                 next.activations.get_mut(&c.activation_id).unwrap().state =
                     ActivationState::Dispatched;
+            }
+            let mut details = json!({"lease_id":c.lease_id,"dispatch_state":dispatch});
+            if let Some(frame_digest) = c.frame_digest.as_deref() {
+                details["frame_digest"] = json!(frame_digest);
             }
             events.push(append_event(
                 &mut next,
                 &c.command_id,
                 "LeaseDispatchRecorded",
-                Some(json!({"lease_id":c.lease_id,"dispatch_state":dispatch})),
+                Some(details),
             ));
             success(next, events, None, None)
         }

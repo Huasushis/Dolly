@@ -171,6 +171,7 @@ fn main() {
             activation_id: "activation-1".into(),
             lease_id: "lease-1".into(),
             dispatch_state: DispatchState::Started,
+            frame_digest: None,
         }),
         input(),
     );

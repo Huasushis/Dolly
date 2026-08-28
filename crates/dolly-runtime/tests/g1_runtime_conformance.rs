@@ -9,11 +9,13 @@
 //! intentionally referenced rather than repeated here. Their accepted
 //! reducer boundary is frozen by the cases named in the matrix fixture.
 
-use dolly_canonical_json::canonicalize;
+use dolly_canonical_json::{Sha256Digest, canonicalize};
+use dolly_core_domain::{LeaseToken, WorkerEpoch};
 use dolly_core_reducer::{
-    ActivationState, BuildManifestCommand, CoreCommand, DispatchLeaseCommand, DispatchState,
-    EnvironmentInput, InstallGraphCommand, IssueLeaseCommand, TransitionOutcome,
+    ActivationState, BuildManifestCommand, CoreCommand, EnvironmentInput, InstallConfigCommand,
+    InstallGraphCommand, IssueLeaseCommand, TransitionOutcome,
 };
+use dolly_runtime::RuntimeTransactionEngine;
 use dolly_storage::SqliteCoreStore;
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -56,16 +58,64 @@ fn graph_input() -> EnvironmentInput {
     }
 }
 
+fn descriptor(module_id: &str) -> Value {
+    json!({
+        "schema": "dolly.module-descriptor/v1",
+        "module_id": module_id,
+        "descriptor_revision": 1,
+        "display_name": module_id,
+        "accepts": {"summary":"input","part_kinds":["text"],"action_names":[]},
+        "emits": {"summary":"output","part_kinds":["text"],"action_names":[]},
+        "actions": [],
+        "activation_replay_contract": {
+            "mode":"fenced_replay",
+            "evidence":"pure_compute",
+            "ledger":null
+        },
+        "trust": "trusted",
+        "metadata": {}
+    })
+}
+
 fn graph_snapshot(module_id: &str) -> Value {
+    let descriptor = descriptor(module_id);
+    let mut descriptors = serde_json::Map::new();
+    descriptors.insert(
+        module_id.into(),
+        json!({
+            "module_id": module_id,
+            "descriptor_revision": 1,
+            "source_descriptor_digest": canonical_digest(&descriptor),
+            "value": descriptor
+        }),
+    );
     json!({
         "receiving_module": module_id,
         "input_pages": {},
         "output_pages": {},
         "subscriptions": {},
-        "descriptors": {},
+        "descriptors": descriptors,
         "authorized_metadata_namespaces": [],
         "authorized_action_names": []
     })
+}
+
+fn install_config(store: &mut SqliteCoreStore<'_>) {
+    let effective_config = json!({
+        "execution_timeout_ms": 120000,
+        "lease_grace_ms": 30000,
+        "fencing_grace_ms": 5000
+    });
+    let command = CoreCommand::InstallConfig(InstallConfigCommand {
+        command_id: "g1-exec-config-001".into(),
+        revision: 1,
+        digest: canonical_digest(&effective_config),
+        effective_config,
+    });
+    let transition = store
+        .transact(&command, &input())
+        .expect("configuration transaction must execute");
+    assert_eq!(transition.outcome, TransitionOutcome::Committed);
 }
 
 fn install_graph(store: &mut SqliteCoreStore<'_>, module_id: &str, command_id: &str) {
@@ -109,7 +159,7 @@ fn manifest(
         "lossy_gaps": [],
         "output_page_ids": [],
         "neighbor_descriptors": neighbors,
-        "required_frame_bytes": 1024,
+        "required_frame_bytes": 2048,
         "required_frame_nesting_depth": 10,
         "deadline": "2026-08-27T00:02:00.000000Z",
         "manifest_digest": null
@@ -144,22 +194,24 @@ fn build_command(
     })
 }
 
-fn issue_command(case: &Value, command_id: &str, lease_id: &str) -> CoreCommand {
-    CoreCommand::IssueLease(IssueLeaseCommand {
+fn issue_command(
+    case: &Value,
+    command_id: &str,
+    lease_id: &str,
+    token_digest: &str,
+) -> IssueLeaseCommand {
+    IssueLeaseCommand {
         command_id: command_id.into(),
         activation_id: case["activation_id"]
             .as_str()
             .expect("activation_id must be a string")
             .into(),
         lease_id: lease_id.into(),
-        token_digest: case["token_digest"]
-            .as_str()
-            .expect("token_digest must be a string")
-            .into(),
+        token_digest: token_digest.into(),
         extension_connection_id: "g1-extension-connection".into(),
         worker_epoch: 17,
         extension_generation: Some(7),
-    })
+    }
 }
 
 fn expected_module_activate(case: &Value, manifest: Value) -> Value {
@@ -174,46 +226,74 @@ fn g1_exec_001_valid_durable_activation_emits_exact_module_activate_premise_befo
     assert_eq!(case["expected"], "product_red");
     let activation_id = case["activation_id"].as_str().unwrap();
     let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
-    let mut store = SqliteCoreStore::new(&mut connection).expect("core schema");
-    install_graph(
-        &mut store,
-        case["module_id"].as_str().unwrap(),
-        "g1-exec-graph-001",
-    );
+    {
+        let mut store = SqliteCoreStore::new(&mut connection).expect("core schema");
+        install_config(&mut store);
+        install_graph(
+            &mut store,
+            case["module_id"].as_str().unwrap(),
+            "g1-exec-graph-001",
+        );
+    }
+    let mut engine = RuntimeTransactionEngine::new(&mut connection).expect("runtime engine");
 
     let build = build_command(&case, "g1-exec-build-001", json!([]), 1, 1);
     let manifest = match &build {
         CoreCommand::BuildManifest(command) => command.manifest.clone(),
         _ => unreachable!("build command shape"),
     };
-    let built = store
-        .transact(&build, &graph_input())
+    let built = engine
+        .accept_manifest(
+            match &build {
+                CoreCommand::BuildManifest(command) => command,
+                _ => unreachable!("build command shape"),
+            },
+            &graph_input(),
+        )
         .expect("accepted manifest transaction");
     assert_eq!(built.outcome, TransitionOutcome::Committed);
 
-    let issue = issue_command(&case, "g1-exec-lease-001", "g1-exec-lease-id-001");
-    let leased = store
-        .transact(&issue, &input())
+    let worker_epoch: WorkerEpoch = case["worker_epoch"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .expect("fixture worker epoch");
+    let lease_token: LeaseToken = case["lease_token"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .expect("fixture lease token");
+    let token_digest =
+        Sha256Digest::compute(lease_token.expose_bytes()).to_canonical_string();
+    let issue = issue_command(
+        &case,
+        "g1-exec-lease-001",
+        "g1-exec-lease-id-001",
+        &token_digest,
+    );
+    let premise = engine
+        .prepare_execution(&issue, &graph_input())
         .expect("accepted lease transaction");
-    assert_eq!(leased.outcome, TransitionOutcome::Committed);
+    let leased = engine.snapshot().expect("durable lease snapshot");
     assert_eq!(
-        leased.state.activations[activation_id].state,
+        leased.activations[activation_id].state,
         ActivationState::Leased
     );
     assert_eq!(
-        leased.state.activations[activation_id].extension_generation,
+        leased.activations[activation_id].extension_generation,
         Some(7)
     );
-
-    let dispatch = CoreCommand::DispatchLease(DispatchLeaseCommand {
-        command_id: "g1-exec-dispatch-001".into(),
-        activation_id: activation_id.into(),
-        lease_id: "g1-exec-lease-id-001".into(),
-        dispatch_state: DispatchState::Started,
-    });
-    let started = store
-        .transact(&dispatch, &input())
+    let dispatched = engine
+        .dispatch_execution(
+            &premise,
+            "g1-exec-dispatch-001",
+            &worker_epoch,
+            &lease_token,
+            case["rpc_id"].as_str().unwrap(),
+            &input(),
+        )
         .expect("accepted durable dispatch marker");
+    let started = dispatched.transition();
     assert_eq!(started.outcome, TransitionOutcome::Committed);
     assert_eq!(
         started.state.activations[activation_id].state,
@@ -224,16 +304,34 @@ fn g1_exec_001_valid_durable_activation_emits_exact_module_activate_premise_befo
         "started"
     );
 
+    let expected = expected_module_activate(&case, manifest);
+    let observed: Value =
+        serde_json::from_slice(dispatched.frame_bytes()).expect("canonical frame JSON");
+    assert_eq!(observed, expected);
+    let (canonical_frame, _) = canonicalize(&observed).expect("canonical frame");
+    assert_eq!(canonical_frame.as_bytes(), dispatched.frame_bytes());
+    assert_eq!(dispatched.frame_digest(), canonical_digest(&expected));
+    assert_eq!(
+        started.state.leases["g1-exec-lease-id-001"]["frame_digest"],
+        dispatched.frame_digest()
+    );
+    assert!(started.reply.is_none());
+    let durable = engine.snapshot().unwrap();
+    assert_eq!(
+        durable.leases["g1-exec-lease-id-001"]["frame_digest"],
+        dispatched.frame_digest()
+    );
+    let journal_event = durable
+        .journal
+        .iter()
+        .find(|event| event.command_id == "g1-exec-dispatch-001")
+        .expect("durable dispatch journal event");
+    assert_eq!(
+        journal_event.details.as_ref().unwrap()["frame_digest"],
+        dispatched.frame_digest()
+    );
+
     // The effect boundary is deliberately not entered by this matrix.
     let effect_consumer_calls = 0;
     assert_eq!(effect_consumer_calls, case["effect_consumer_calls"]);
-
-    // G1 requires the complete canonical request, not merely a lease or marker.
-    // The accepted WP base has no emitted request at this boundary; this exact
-    // assertion is the deterministic product RED for the missing capability.
-    assert_eq!(
-        started.reply,
-        Some(expected_module_activate(&case, manifest)),
-        "G1 dispatch must emit the exact module.activate execution premise"
-    );
 }

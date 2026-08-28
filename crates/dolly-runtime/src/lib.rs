@@ -2,19 +2,21 @@
 //!
 //! The engine is the narrow layer above the accepted WP-004 durable reducer
 //! transaction. It validates a frozen Activation Manifest, durably issues one
-//! lease, and returns an immutable execution premise. It deliberately stops
-//! before dispatch bytes, Extension code, or any external effect.
+//! lease, and exposes the canonical dispatch frame only after its started
+//! marker commits. It never invokes Extension code or any external effect.
 
 mod premise;
 mod validation;
 
+use dolly_canonical_json::{canonicalize, Sha256Digest};
+use dolly_core_domain::{LeaseToken, WorkerEpoch};
 use dolly_core_reducer::{
-    ActivationState, BuildManifestCommand, CoreCommand, EnvironmentInput, IssueLeaseCommand,
-    Transition, TransitionOutcome,
+    ActivationState, BuildManifestCommand, CoreCommand, DispatchLeaseCommand, DispatchState,
+    EnvironmentInput, IssueLeaseCommand, Transition, TransitionOutcome,
 };
 use dolly_storage::{SqliteCoreStore, StorageError};
 use rusqlite::Connection;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use thiserror::Error;
 
 pub use premise::{
@@ -42,6 +44,8 @@ pub enum RuntimeError {
     DirectionInvalid { detail: String },
     #[error("RUNTIME_ORDER_INVALID: {detail}")]
     OrderInvalid { detail: String },
+    #[error("RUNTIME_DISPATCH_INVALID: {detail}")]
+    DispatchInvalid { detail: String },
     #[error("RUNTIME_REPLAY_INVALID: {detail}")]
     ReplayInvalid { detail: String },
     #[error("RUNTIME_REPLAY_CONFLICT: {detail}")]
@@ -59,6 +63,33 @@ pub enum RuntimeError {
 }
 
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
+
+/// The canonical `module.activate` frame and its committed dispatch transition.
+///
+/// The frame bytes are returned only after the durable `started` marker commits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DispatchResult {
+    frame_bytes: Vec<u8>,
+    frame_digest: String,
+    transition: Transition,
+}
+
+impl DispatchResult {
+    /// Canonical JSON bytes eligible for the authenticated Extension transport.
+    pub fn frame_bytes(&self) -> &[u8] {
+        &self.frame_bytes
+    }
+
+    /// SHA-256 of the exact canonical frame bytes.
+    pub fn frame_digest(&self) -> &str {
+        &self.frame_digest
+    }
+
+    /// The committed Core transition that authorized the frame.
+    pub fn transition(&self) -> &Transition {
+        &self.transition
+    }
+}
 
 /// The production G1 transaction façade over one Core writer connection.
 ///
@@ -179,6 +210,176 @@ impl<'connection> RuntimeTransactionEngine<'connection> {
             .transact(&CoreCommand::IssueLease(command.clone()), input)?;
         require_committed(&transition)?;
         build_premise(&transition.state, command, validated)
+    }
+
+    /// Build the exact canonical `module.activate` frame and durably mark it
+    /// `started`. The frame is returned only after the marker commits.
+    ///
+    /// `premise` must be the result of `prepare_execution`. `worker_epoch` and
+    /// `lease_token` are Runtime-owned values; `request_id` is allocated by the
+    /// Host sender. This method never writes transport bytes or invokes
+    /// Extension code.
+    pub fn dispatch_execution(
+        &mut self,
+        premise: &ExecutionPremise,
+        dispatch_command_id: &str,
+        worker_epoch: &WorkerEpoch,
+        lease_token: &LeaseToken,
+        request_id: &str,
+        input: &EnvironmentInput,
+    ) -> RuntimeResult<DispatchResult> {
+        if dispatch_command_id.is_empty() || request_id.is_empty() {
+            return Err(RuntimeError::DispatchInvalid {
+                detail: "dispatch command_id and request_id are required".into(),
+            });
+        }
+
+        let snapshot = self.store.snapshot()?;
+        let manifest_value = retained_manifest_for_dispatch(&snapshot, premise, lease_token)?;
+        let (manifest, _) = validation::validate_manifest_for_replay(&manifest_value)?;
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "module.activate",
+            "params": {
+                "worker_epoch": worker_epoch,
+                "extension_generation": premise.fence().extension_generation(),
+                "lease_generation": premise.fence().lease_generation(),
+                "lease_token": lease_token.expose_base64url(),
+                "attempt": premise.fence().attempt(),
+                "manifest": manifest_value,
+            }
+        });
+        let (frame_bytes, frame_digest) = canonicalize(&frame)
+            .map_err(|error| RuntimeError::DispatchInvalid {
+                detail: format!("cannot canonicalize module.activate frame: {error}"),
+            })
+            .map(|(bytes, digest)| (bytes.into_vec(), digest.to_canonical_string()))?;
+        let frame_size =
+            u64::try_from(frame_bytes.len()).map_err(|_| RuntimeError::DispatchInvalid {
+                detail: "module.activate frame size exceeds u64".into(),
+            })?;
+        if frame_size > manifest.required_frame_bytes {
+            return Err(RuntimeError::DispatchInvalid {
+                detail: format!(
+                    "module.activate frame is {frame_size} bytes but Manifest permits {}",
+                    manifest.required_frame_bytes
+                ),
+            });
+        }
+        let frame_depth = frame_nesting_depth(&frame);
+        if frame_depth > manifest.required_frame_nesting_depth {
+            return Err(RuntimeError::DispatchInvalid {
+                detail: format!(
+                    "module.activate frame depth is {frame_depth} but Manifest permits {}",
+                    manifest.required_frame_nesting_depth
+                ),
+            });
+        }
+
+        let transition = self.store.transact(
+            &CoreCommand::DispatchLease(DispatchLeaseCommand {
+                command_id: dispatch_command_id.into(),
+                activation_id: premise.identity().activation_id().into(),
+                lease_id: premise.fence().lease_id().into(),
+                dispatch_state: DispatchState::Started,
+                frame_digest: Some(frame_digest.clone()),
+            }),
+            input,
+        )?;
+        require_committed(&transition)?;
+        let committed_digest = transition
+            .state
+            .leases
+            .get(premise.fence().lease_id())
+            .and_then(|lease| lease.get("frame_digest"))
+            .and_then(Value::as_str);
+        let committed_state = transition
+            .state
+            .activations
+            .get(premise.identity().activation_id())
+            .map(|activation| activation.state);
+        if committed_state != Some(ActivationState::Dispatched)
+            || committed_digest != Some(frame_digest.as_str())
+        {
+            return Err(RuntimeError::PremiseUnavailable {
+                detail: "committed dispatch does not retain the exact frame digest".into(),
+            });
+        }
+        Ok(DispatchResult {
+            frame_bytes,
+            frame_digest,
+            transition,
+        })
+    }
+}
+fn retained_manifest_for_dispatch(
+    snapshot: &dolly_core_reducer::CoreSnapshot,
+    premise: &ExecutionPremise,
+    lease_token: &LeaseToken,
+) -> RuntimeResult<Value> {
+    let activation = snapshot
+        .activations
+        .get(premise.identity().activation_id())
+        .ok_or_else(|| RuntimeError::PremiseUnavailable {
+            detail: "dispatch Activation is absent from durable state".into(),
+        })?;
+    if activation.state != ActivationState::Leased {
+        return Err(RuntimeError::PremiseUnavailable {
+            detail: "dispatch Activation is no longer leased".into(),
+        });
+    }
+    let manifest = activation
+        .manifest
+        .as_ref()
+        .or_else(|| snapshot.manifests.get(premise.identity().activation_id()))
+        .cloned()
+        .ok_or_else(|| RuntimeError::PremiseUnavailable {
+            detail: "dispatch Activation has no retained Manifest".into(),
+        })?;
+    let (typed_manifest, _) = validation::validate_manifest_for_replay(&manifest)?;
+    if typed_manifest.activation_id.to_string() != premise.identity().activation_id()
+        || typed_manifest.module_id.to_string() != premise.identity().module_id()
+        || typed_manifest.manifest_digest.to_string() != premise.digests().manifest_digest()
+    {
+        return Err(RuntimeError::ReplayConflict {
+            detail: "dispatch premise does not bind the retained Manifest".into(),
+        });
+    }
+    let lease = snapshot
+        .leases
+        .get(premise.fence().lease_id())
+        .ok_or_else(|| RuntimeError::PremiseUnavailable {
+            detail: "dispatch lease is absent from durable state".into(),
+        })?;
+    let token_digest = Sha256Digest::compute(lease_token.expose_bytes()).to_canonical_string();
+    if lease.get("activation_id").and_then(Value::as_str)
+        != Some(premise.identity().activation_id())
+        || lease.get("attempt").and_then(Value::as_i64) != Some(premise.fence().attempt())
+        || lease.get("worker_epoch").and_then(Value::as_i64) != Some(premise.fence().worker_epoch())
+        || lease.get("extension_generation").and_then(Value::as_i64)
+            != Some(premise.fence().extension_generation())
+        || lease.get("extension_connection_id").and_then(Value::as_str)
+            != Some(premise.fence().extension_connection_id())
+        || lease.get("token_digest").and_then(Value::as_str) != Some(token_digest.as_str())
+        || lease.get("dispatch_state").and_then(Value::as_str) != Some("prepared")
+    {
+        return Err(RuntimeError::PremiseUnavailable {
+            detail: "dispatch lease fences do not match the Runtime premise".into(),
+        });
+    }
+    Ok(manifest)
+}
+
+fn frame_nesting_depth(value: &Value) -> u16 {
+    match value {
+        Value::Array(values) => {
+            1u16.saturating_add(values.iter().map(frame_nesting_depth).max().unwrap_or(0))
+        }
+        Value::Object(values) => {
+            1u16.saturating_add(values.values().map(frame_nesting_depth).max().unwrap_or(0))
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => 0,
     }
 }
 

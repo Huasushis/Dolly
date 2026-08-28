@@ -148,6 +148,8 @@ pub struct DispatchLeaseCommand {
     pub activation_id: String,
     pub lease_id: String,
     pub dispatch_state: DispatchState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_digest: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReceiveResultCommand {
