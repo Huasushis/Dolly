@@ -913,13 +913,21 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
             ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
         configuration.current().expect("configuration after stop")
     };
-    let stopped_host_store =
-        SqliteCoreStore::new(&mut dispatch.connection).expect("Host state after stop");
-    assert!(
+    let before_stopped_issuance = durable_snapshot(&dispatch.connection);
+    let stopped_issuance = {
+        let stopped_host_store =
+            SqliteCoreStore::new(&mut dispatch.connection).expect("Host state after stop");
         operational
             .configuration_transaction_authority(&stopped_config_base, &stopped_host_store)
-            .is_err(),
+    };
+    assert!(
+        stopped_issuance.is_err(),
         "stopped lifecycle cannot issue configuration authority"
+    );
+    assert_eq!(
+        durable_snapshot(&dispatch.connection),
+        before_stopped_issuance,
+        "stopped issuance must not mutate durable rows"
     );
 
     let effect_executions = std::cell::Cell::new(0);

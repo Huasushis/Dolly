@@ -11,15 +11,97 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use dolly_core_domain::ExtensionId;
+use dolly_canonical_json::{Sha256Digest, canonicalize};
+use dolly_core_domain::{ExtensionId, WorkerEpoch};
 use dolly_storage::{
-    ConfigurationSnapshot, ConfigurationTransactionAuthority, SqliteCoreStore,
+    ConfigurationAuthority, ConfigurationSnapshot, HostCapabilityGrant,
+    HostConnectionAuthority, SqliteCoreStore, MAX_CONFIGURATION_REVISION,
 };
 
 use dolly_worker::daemon::{DaemonError, DaemonLifecycleToken, InFlightWork};
 
 use crate::FencedInvocationPremise;
 use crate::SecretRef;
+
+/// Opaque configuration authority issued only from a live operational premise.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ConfigurationTransactionAuthority {
+    authority_digest: Sha256Digest,
+    authority_jcs: Vec<u8>,
+}
+
+impl ConfigurationTransactionAuthority {
+    pub(crate) fn from_live(
+        extension_id: &str,
+        module_id: &str,
+        host: &HostConnectionAuthority,
+        grant: &HostCapabilityGrant,
+        base: &ConfigurationSnapshot,
+        lifecycle_generation: u64,
+    ) -> Result<Self, ExternalIoError> {
+        let worker_epoch: WorkerEpoch = grant
+            .worker_epoch()
+            .parse()
+            .map_err(|_| ExternalIoError::StaleGeneration)?;
+        let graph_revision = u64::try_from(grant.graph_revision())
+            .map_err(|_| ExternalIoError::StaleGeneration)?;
+        let extension_generation = grant.extension_generation();
+        let graph_digest: Sha256Digest = grant
+            .graph_digest()
+            .parse()
+            .map_err(|_| ExternalIoError::StaleGeneration)?;
+        if extension_id != grant.extension_id()
+            || module_id != grant.module_id()
+            || grant.extension_connection_id() != host.extension_connection_id()
+            || worker_epoch != *host.worker_epoch()
+            || grant.worker_epoch_fence() != host.worker_epoch_fence()
+            || grant.incarnation_revision() != host.incarnation_revision()
+            || extension_generation <= 0
+            || lifecycle_generation != extension_generation as u64
+            || base.revision() > MAX_CONFIGURATION_REVISION
+            || graph_revision == 0
+            || graph_revision > MAX_CONFIGURATION_REVISION
+        {
+            return Err(ExternalIoError::StaleGeneration);
+        }
+        let authority_value = serde_json::json!({
+            "extension_id": extension_id,
+            "module_id": module_id,
+            "extension_connection_id": host.extension_connection_id(),
+            "host_incarnation_revision": host.incarnation_revision(),
+            "worker_epoch": worker_epoch.to_string(),
+            "worker_epoch_fence": host.worker_epoch_fence(),
+            "daemon_generation": lifecycle_generation,
+            "extension_generation": extension_generation,
+            "base_config_revision": base.revision(),
+            "base_config_digest": base.digest().to_canonical_string(),
+            "graph_revision": graph_revision,
+            "graph_digest": graph_digest.to_canonical_string(),
+            "control_channel_id": host.extension_connection_id(),
+        });
+        let (authority_bytes, authority_digest) =
+            canonicalize(&authority_value).map_err(|_| ExternalIoError::StaleGeneration)?;
+        Ok(Self {
+            authority_digest,
+            authority_jcs: authority_bytes.into_vec(),
+        })
+    }
+
+    pub fn authority_digest(&self) -> &Sha256Digest {
+        &self.authority_digest
+    }
+}
+
+// Safety: this implementation is the only storage view of this private type.
+unsafe impl ConfigurationAuthority for ConfigurationTransactionAuthority {
+    fn authority_digest(&self) -> &Sha256Digest {
+        &self.authority_digest
+    }
+
+    fn authority_jcs(&self) -> &[u8] {
+        &self.authority_jcs
+    }
+}
 
 /// The explicit operational premise produced from one accepted G2 invocation.
 ///
@@ -39,7 +121,6 @@ impl OperationalPremise {
             lifecycle: None,
         }
     }
-
     pub(crate) fn bind_lifecycle(
         mut self,
         lifecycle: DaemonLifecycleToken,
@@ -119,8 +200,14 @@ impl OperationalPremise {
             )
             .map_err(|_| ExternalIoError::Unauthorized)?
             .ok_or(ExternalIoError::Unauthorized)?;
-        host.issue_configuration_transaction_authority(store, &grant, base)
-            .map_err(|_| ExternalIoError::StaleGeneration)
+        ConfigurationTransactionAuthority::from_live(
+            extension_id,
+            self.module_id(),
+            &host,
+            &grant,
+            base,
+            lifecycle.generation().value(),
+        )
     }
 }
 

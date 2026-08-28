@@ -9,10 +9,11 @@
 use dolly_canonical_json::{Sha256Digest, canonicalize};
 use dolly_core_domain::WorkerEpoch;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::transaction::{HostCapabilityGrant, HostConnectionAuthority};
+use crate::transaction::HostConnectionAuthority;
 
 /// Maximum configuration revision accepted by the safe integer contract.
 pub const MAX_CONFIGURATION_REVISION: u64 = 9_007_199_254_740_991;
@@ -138,14 +139,35 @@ pub enum ConfigurationChange {
     Rollback { target_revision: u64 },
 }
 
-/// Immutable authority for one configuration transaction generation.
+/// Opaque configuration authority supplied by the authenticated Host path.
 ///
-/// The Host creates this value only from a live lifecycle and an admitted
-/// OperationalPremise. Its private fields cover the exact Extension, Module,
-/// Host connection and incarnation, WorkerEpoch and fence, daemon and
-/// Extension generations, base configuration, graph, and control channel.
+/// Implementations must expose canonical authority bytes and the digest
+/// computed over those exact bytes. This is unsafe because storage cannot
+/// inspect the issuing Host and lifecycle objects across the crate boundary.
+pub unsafe trait ConfigurationAuthority {
+    fn authority_digest(&self) -> &Sha256Digest;
+    fn authority_jcs(&self) -> &[u8];
+}
+
+#[derive(Deserialize)]
+struct AuthorityRecord {
+    extension_id: String,
+    module_id: String,
+    extension_connection_id: String,
+    host_incarnation_revision: i64,
+    worker_epoch: String,
+    worker_epoch_fence: i64,
+    daemon_generation: u64,
+    extension_generation: i64,
+    base_config_revision: u64,
+    base_config_digest: String,
+    graph_revision: u64,
+    graph_digest: String,
+    control_channel_id: String,
+}
+
 #[derive(Debug, PartialEq, Eq)]
-pub struct ConfigurationTransactionAuthority {
+struct AuthorityFields {
     extension_id: String,
     module_id: String,
     extension_connection_id: String,
@@ -160,214 +182,115 @@ pub struct ConfigurationTransactionAuthority {
     graph_digest: Sha256Digest,
     control_channel_id: String,
     authority_digest: Sha256Digest,
-    authority_jcs: Vec<u8>,
 }
 
-impl ConfigurationTransactionAuthority {
-    /// Build authority from the current authenticated Host connection and
-    /// capability grant after the caller has checked its live lifecycle.
-    pub(crate) fn from_authenticated_host(
-        host: &HostConnectionAuthority,
-        grant: &HostCapabilityGrant,
-        base: &ConfigurationSnapshot,
-    ) -> Result<Self, ConfigurationError> {
-        let worker_epoch: WorkerEpoch = grant
-            .worker_epoch()
-            .parse()
-            .map_err(|_| ConfigurationError::InvalidAuthority)?;
-        let graph_revision = u64::try_from(grant.graph_revision())
-            .map_err(|_| ConfigurationError::InvalidAuthority)?;
-        let extension_generation = grant.extension_generation();
-        let daemon_generation = u64::try_from(extension_generation)
-            .map_err(|_| ConfigurationError::InvalidAuthority)?;
-        if grant.extension_connection_id() != host.extension_connection_id()
-            || worker_epoch != *host.worker_epoch()
-            || grant.worker_epoch_fence() != host.worker_epoch_fence()
-            || grant.incarnation_revision() != host.incarnation_revision()
-            || extension_generation <= 0
-        {
-            return Err(ConfigurationError::InvalidAuthority);
-        }
-        let graph_digest: Sha256Digest = grant
-            .graph_digest()
-            .parse()
-            .map_err(|_| ConfigurationError::InvalidAuthority)?;
-        Self::from_parts(
-            grant.extension_id(),
-            grant.module_id(),
-            host.extension_connection_id(),
-            host.incarnation_revision(),
-            worker_epoch,
-            host.worker_epoch_fence(),
-            daemon_generation,
-            extension_generation,
-            base.revision(),
-            base.digest().clone(),
-            graph_revision,
-            graph_digest,
-            host.extension_connection_id(),
-        )
+fn authority_fields<A: ConfigurationAuthority + ?Sized>(
+    authority: &A,
+) -> Result<AuthorityFields, ConfigurationError> {
+    let value: Value = serde_json::from_slice(authority.authority_jcs())
+        .map_err(|_| ConfigurationError::InvalidAuthority)?;
+    let object = value
+        .as_object()
+        .ok_or(ConfigurationError::InvalidAuthority)?;
+    const AUTHORITY_KEYS: &[&str] = &[
+        "extension_id",
+        "module_id",
+        "extension_connection_id",
+        "host_incarnation_revision",
+        "worker_epoch",
+        "worker_epoch_fence",
+        "daemon_generation",
+        "extension_generation",
+        "base_config_revision",
+        "base_config_digest",
+        "graph_revision",
+        "graph_digest",
+        "control_channel_id",
+    ];
+    if object.len() != AUTHORITY_KEYS.len()
+        || AUTHORITY_KEYS.iter().any(|key| !object.contains_key(*key))
+    {
+        return Err(ConfigurationError::InvalidAuthority);
     }
+    let (canonical, digest) =
+        canonicalize(&value).map_err(|_| ConfigurationError::InvalidAuthority)?;
+    if canonical.as_ref() != authority.authority_jcs() || digest != *authority.authority_digest()
+    {
+        return Err(ConfigurationError::InvalidAuthority);
+    }
+    let record: AuthorityRecord =
+        serde_json::from_value(value).map_err(|_| ConfigurationError::InvalidAuthority)?;
+    let worker_epoch: WorkerEpoch = record
+        .worker_epoch
+        .parse()
+        .map_err(|_| ConfigurationError::InvalidAuthority)?;
+    let base_config_digest: Sha256Digest = record
+        .base_config_digest
+        .parse()
+        .map_err(|_| ConfigurationError::InvalidAuthority)?;
+    let graph_digest: Sha256Digest = record
+        .graph_digest
+        .parse()
+        .map_err(|_| ConfigurationError::InvalidAuthority)?;
+    if !valid_authority_identifier(&record.extension_id)
+        || !valid_authority_identifier(&record.module_id)
+        || !valid_authority_identifier(&record.extension_connection_id)
+        || !valid_authority_identifier(&record.control_channel_id)
+        || record.extension_connection_id != record.control_channel_id
+        || record.host_incarnation_revision <= 0
+        || record.host_incarnation_revision > MAX_CONFIGURATION_REVISION as i64
+        || record.worker_epoch_fence <= 0
+        || record.worker_epoch_fence > MAX_CONFIGURATION_REVISION as i64
+        || record.daemon_generation == 0
+        || record.daemon_generation > MAX_CONFIGURATION_REVISION
+        || record.extension_generation <= 0
+        || record.extension_generation as u64 > MAX_CONFIGURATION_REVISION
+        || record.base_config_revision > MAX_CONFIGURATION_REVISION
+        || record.graph_revision == 0
+        || record.graph_revision > MAX_CONFIGURATION_REVISION
+    {
+        return Err(ConfigurationError::InvalidAuthority);
+    }
+    Ok(AuthorityFields {
+        extension_id: record.extension_id,
+        module_id: record.module_id,
+        extension_connection_id: record.extension_connection_id,
+        host_incarnation_revision: record.host_incarnation_revision,
+        worker_epoch,
+        worker_epoch_fence: record.worker_epoch_fence,
+        daemon_generation: record.daemon_generation,
+        extension_generation: record.extension_generation,
+        base_config_revision: record.base_config_revision,
+        base_config_digest,
+        graph_revision: record.graph_revision,
+        graph_digest,
+        control_channel_id: record.control_channel_id,
+        authority_digest: authority.authority_digest().clone(),
+    })
+}
 
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    fn from_test_parts(
-        extension_id: impl Into<String>,
-        module_id: impl Into<String>,
-        extension_connection_id: impl Into<String>,
-        host_incarnation_revision: i64,
-        worker_epoch: WorkerEpoch,
-        worker_epoch_fence: i64,
-        daemon_generation: u64,
-        extension_generation: i64,
-        base_config_revision: u64,
-        base_config_digest: Sha256Digest,
-        graph_revision: u64,
-        graph_digest: Sha256Digest,
-        control_channel_id: impl Into<String>,
-    ) -> Result<Self, ConfigurationError> {
-        Self::from_parts(
-            extension_id,
-            module_id,
-            extension_connection_id,
-            host_incarnation_revision,
-            worker_epoch,
-            worker_epoch_fence,
-            daemon_generation,
-            extension_generation,
-            base_config_revision,
-            base_config_digest,
-            graph_revision,
-            graph_digest,
-            control_channel_id,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn from_parts(
-        extension_id: impl Into<String>,
-        module_id: impl Into<String>,
-        extension_connection_id: impl Into<String>,
-        host_incarnation_revision: i64,
-        worker_epoch: WorkerEpoch,
-        worker_epoch_fence: i64,
-        daemon_generation: u64,
-        extension_generation: i64,
-        base_config_revision: u64,
-        base_config_digest: Sha256Digest,
-        graph_revision: u64,
-        graph_digest: Sha256Digest,
-        control_channel_id: impl Into<String>,
-    ) -> Result<Self, ConfigurationError> {
-        let extension_id = extension_id.into();
-        let module_id = module_id.into();
-        let extension_connection_id = extension_connection_id.into();
-        let control_channel_id = control_channel_id.into();
-        if !valid_authority_identifier(&extension_id)
-            || !valid_authority_identifier(&module_id)
-            || !valid_authority_identifier(&extension_connection_id)
-            || !valid_authority_identifier(&control_channel_id)
-            || extension_connection_id != control_channel_id
-            || host_incarnation_revision <= 0
-            || host_incarnation_revision > MAX_CONFIGURATION_REVISION as i64
-            || worker_epoch_fence <= 0
-            || worker_epoch_fence > MAX_CONFIGURATION_REVISION as i64
-            || daemon_generation == 0
-            || daemon_generation > MAX_CONFIGURATION_REVISION
-            || extension_generation <= 0
-            || extension_generation as u64 > MAX_CONFIGURATION_REVISION
-            || base_config_revision > MAX_CONFIGURATION_REVISION
-            || graph_revision == 0
-            || graph_revision > MAX_CONFIGURATION_REVISION
-        {
-            return Err(ConfigurationError::InvalidAuthority);
-        }
-        let authority_value = json!({
-            "extension_id": extension_id,
-            "module_id": module_id,
-            "extension_connection_id": extension_connection_id,
-            "host_incarnation_revision": host_incarnation_revision,
-            "worker_epoch": worker_epoch.to_string(),
-            "worker_epoch_fence": worker_epoch_fence,
-            "daemon_generation": daemon_generation,
-            "extension_generation": extension_generation,
-            "base_config_revision": base_config_revision,
-            "base_config_digest": base_config_digest.to_canonical_string(),
-            "graph_revision": graph_revision,
-            "graph_digest": graph_digest.to_canonical_string(),
-            "control_channel_id": control_channel_id,
-        });
-        let (authority_bytes, authority_digest) =
-            canonicalize(&authority_value).map_err(|_| ConfigurationError::InvalidAuthority)?;
-        Ok(Self {
-            extension_id,
-            module_id,
-            extension_connection_id,
-            host_incarnation_revision,
-            worker_epoch,
-            worker_epoch_fence,
-            daemon_generation,
-            extension_generation,
-            base_config_revision,
-            base_config_digest,
-            graph_revision,
-            graph_digest,
-            control_channel_id,
-            authority_digest,
-            authority_jcs: authority_bytes.into_vec(),
-        })
-    }
-
-    pub(crate) fn matches_capability_grant(&self, grant: &HostCapabilityGrant) -> bool {
-        let worker_epoch: WorkerEpoch = match grant.worker_epoch().parse() {
-            Ok(epoch) => epoch,
-            Err(_) => return false,
-        };
-        let graph_digest: Sha256Digest = match grant.graph_digest().parse() {
-            Ok(digest) => digest,
-            Err(_) => return false,
-        };
-        self.extension_id == grant.extension_id()
-            && self.module_id == grant.module_id()
-            && self.extension_connection_id == grant.extension_connection_id()
-            && self.worker_epoch == worker_epoch
-            && self.worker_epoch_fence == grant.worker_epoch_fence()
-            && self.host_incarnation_revision == grant.incarnation_revision()
-            && self.extension_generation == grant.extension_generation()
-            && self.graph_revision == grant.graph_revision() as u64
-            && self.graph_digest == graph_digest
-    }
-
-    pub fn authority_digest(&self) -> &Sha256Digest {
-        &self.authority_digest
-    }
-
-    fn same_owner_except_generation(&self, other: &Self) -> bool {
-        self.extension_id == other.extension_id
-            && self.module_id == other.module_id
-            && self.extension_connection_id == other.extension_connection_id
-            && self.host_incarnation_revision == other.host_incarnation_revision
-            && self.worker_epoch == other.worker_epoch
-            && self.worker_epoch_fence == other.worker_epoch_fence
-            && self.control_channel_id == other.control_channel_id
-    }
-
-    fn is_next_generation_of(&self, previous: &Self) -> bool {
-        self.same_owner_except_generation(previous)
-            && self.daemon_generation == previous.daemon_generation.saturating_add(1)
-            && self.extension_generation == previous.extension_generation.saturating_add(1)
-    }
+fn next_generation(previous: &AuthorityFields, next: &AuthorityFields) -> bool {
+    previous.extension_id == next.extension_id
+        && previous.module_id == next.module_id
+        && previous.extension_connection_id == next.extension_connection_id
+        && previous.host_incarnation_revision == next.host_incarnation_revision
+        && previous.worker_epoch == next.worker_epoch
+        && previous.worker_epoch_fence == next.worker_epoch_fence
+        && previous.control_channel_id == next.control_channel_id
+        && next.daemon_generation == previous.daemon_generation.saturating_add(1)
+        && next.extension_generation == previous.extension_generation.saturating_add(1)
 }
 
 fn valid_authority_identifier(value: &str) -> bool {
     !value.is_empty() && value.len() <= 255 && !value.chars().any(char::is_whitespace)
 }
 
-fn verify_current_host_authority(
+fn verify_current_host_authority<A: ConfigurationAuthority + ?Sized>(
     connection: &Connection,
     host: &HostConnectionAuthority,
-    authority: &ConfigurationTransactionAuthority,
-) -> Result<(), ConfigurationError> {
+    authority: &A,
+) -> Result<AuthorityFields, ConfigurationError> {
+    let authority = authority_fields(authority)?;
     let row: Option<(String, Vec<u8>)> = connection
         .query_row(
             "SELECT state_hash, state_jcs FROM core_state WHERE singleton = 1",
@@ -487,12 +410,12 @@ fn verify_current_host_authority(
     {
         return Err(ConfigurationError::AuthorityConflict);
     }
-    Ok(())
+    Ok(authority)
 }
 
 fn verify_current_configuration_base(
     transaction: &Transaction<'_>,
-    authority: &ConfigurationTransactionAuthority,
+    authority: &AuthorityFields,
 ) -> Result<(), ConfigurationError> {
     let current = load_state(transaction)?;
     if current.revision != authority.base_config_revision
@@ -714,58 +637,63 @@ impl<'connection> ConfigurationStore<'connection> {
     }
 
     /// Establish the first sealed authority for this configuration ledger.
-    pub(crate) fn bind_authority(
+    pub(crate) fn bind_authority<A: ConfigurationAuthority + ?Sized>(
         &mut self,
         host: &HostConnectionAuthority,
-        authority: &ConfigurationTransactionAuthority,
+        authority: &A,
     ) -> Result<(), ConfigurationError> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(ConfigurationError::Storage)?;
-        verify_current_host_authority(&transaction, host, authority)?;
-        verify_current_configuration_base(&transaction, authority)?;
+        let authority_fields = verify_current_host_authority(&transaction, host, authority)?;
+        verify_current_configuration_base(&transaction, &authority_fields)?;
         if let Some(current) = load_authority_digest(&transaction)? {
-            if current != *authority.authority_digest() {
+            if current != authority_fields.authority_digest {
                 return Err(ConfigurationError::AuthorityConflict);
             }
             transaction.commit().map_err(ConfigurationError::Storage)?;
             return Ok(());
         }
-        write_authority(&transaction, authority)?;
+        write_authority(&transaction, authority, &authority_fields)?;
         transaction.commit().map_err(ConfigurationError::Storage)?;
         Ok(())
     }
 
     /// Replace the current authority only with the exact next generation.
-    pub(crate) fn rotate_authority(
+    pub(crate) fn rotate_authority<
+        A: ConfigurationAuthority + ?Sized,
+        B: ConfigurationAuthority + ?Sized,
+    >(
         &mut self,
         host: &HostConnectionAuthority,
-        previous: &ConfigurationTransactionAuthority,
-        next: &ConfigurationTransactionAuthority,
+        previous: &A,
+        next: &B,
     ) -> Result<(), ConfigurationError> {
-        if !next.is_next_generation_of(previous) {
+        let previous_fields = authority_fields(previous)?;
+        let next_fields = authority_fields(next)?;
+        if !next_generation(&previous_fields, &next_fields) {
             return Err(ConfigurationError::AuthorityConflict);
         }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(ConfigurationError::Storage)?;
-        verify_current_host_authority(&transaction, host, next)?;
-        verify_current_configuration_base(&transaction, next)?;
+        let current_next = verify_current_host_authority(&transaction, host, next)?;
+        verify_current_configuration_base(&transaction, &current_next)?;
         let current = load_authority_digest(&transaction)?
             .ok_or(ConfigurationError::AuthorityUnavailable)?;
-        if current != *previous.authority_digest() {
+        if current != previous_fields.authority_digest {
             return Err(ConfigurationError::AuthorityConflict);
         }
-        write_authority(&transaction, next)?;
+        write_authority(&transaction, next, &current_next)?;
         transaction.commit().map_err(ConfigurationError::Storage)?;
         Ok(())
     }
     /// Atomically apply a replacement or rollback under the exact authority.
-    pub fn apply(
+    pub fn apply<A: ConfigurationAuthority + ?Sized>(
         &mut self,
-        authority: &ConfigurationTransactionAuthority,
+        authority: &A,
         request: &ConfigurationTransaction,
     ) -> Result<ConfigurationReceipt, ConfigurationError> {
         request.validate()?;
@@ -1065,9 +993,10 @@ fn load_authority_digest(
         .transpose()
 }
 
-fn write_authority(
+fn write_authority<A: ConfigurationAuthority + ?Sized>(
     transaction: &Transaction<'_>,
-    authority: &ConfigurationTransactionAuthority,
+    authority: &A,
+    fields: &AuthorityFields,
 ) -> Result<(), ConfigurationError> {
     transaction
         .execute(
@@ -1095,21 +1024,21 @@ fn write_authority(
               authority_digest = excluded.authority_digest,
               authority_jcs = excluded.authority_jcs",
             params![
-                &authority.extension_id,
-                &authority.module_id,
-                &authority.extension_connection_id,
-                authority.host_incarnation_revision,
-                authority.worker_epoch.to_string(),
-                authority.worker_epoch_fence,
-                authority.daemon_generation as i64,
-                authority.extension_generation,
-                authority.base_config_revision as i64,
-                authority.base_config_digest.to_canonical_string(),
-                authority.graph_revision as i64,
-                authority.graph_digest.to_canonical_string(),
-                &authority.control_channel_id,
-                authority.authority_digest.to_canonical_string(),
-                authority.authority_jcs.as_slice(),
+                &fields.extension_id,
+                &fields.module_id,
+                &fields.extension_connection_id,
+                fields.host_incarnation_revision,
+                fields.worker_epoch.to_string(),
+                fields.worker_epoch_fence,
+                fields.daemon_generation as i64,
+                fields.extension_generation,
+                fields.base_config_revision as i64,
+                fields.base_config_digest.to_canonical_string(),
+                fields.graph_revision as i64,
+                fields.graph_digest.to_canonical_string(),
+                &fields.control_channel_id,
+                fields.authority_digest.to_canonical_string(),
+                authority.authority_jcs(),
             ],
         )
         .map_err(ConfigurationError::Storage)?;
@@ -1182,10 +1111,9 @@ fn canonical_configuration(
         canonicalize(configuration).map_err(|_| ConfigurationError::InvalidConfiguration)?;
     Ok((bytes.into_vec(), digest))
 }
-
-fn request_identity(
+fn request_identity<A: ConfigurationAuthority + ?Sized>(
     request: &ConfigurationTransaction,
-    authority: &ConfigurationTransactionAuthority,
+    authority: &A,
 ) -> Result<(Vec<u8>, Sha256Digest), ConfigurationError> {
     let change = match request.change() {
         ConfigurationChange::Replace(configuration) => json!({
@@ -1197,7 +1125,7 @@ fn request_identity(
             "target_revision": target_revision,
         }),
     };
-    let authority_value: Value = serde_json::from_slice(&authority.authority_jcs)
+    let authority_value: Value = serde_json::from_slice(authority.authority_jcs())
         .map_err(|_| ConfigurationError::Corrupt)?;
     let request_value = json!({
         "transaction_id": request.transaction_id(),
@@ -1427,6 +1355,23 @@ mod tests {
         ConfigurationStore::new(connection).expect("schema")
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct TestAuthority {
+        digest: Sha256Digest,
+        jcs: Vec<u8>,
+    }
+
+
+    unsafe impl ConfigurationAuthority for TestAuthority {
+        fn authority_digest(&self) -> &Sha256Digest {
+            &self.digest
+        }
+
+        fn authority_jcs(&self) -> &[u8] {
+            &self.jcs
+        }
+    }
+
     fn authority(
         daemon_generation: u64,
         extension_generation: i64,
@@ -1434,32 +1379,34 @@ mod tests {
         base_digest: Sha256Digest,
         graph_revision: u64,
         graph_digest: Sha256Digest,
-    ) -> ConfigurationTransactionAuthority {
-        ConfigurationTransactionAuthority::from_test_parts(
-            "org.example.extension",
-            "module-one",
-            "connection-one",
-            1,
-            "018f0f00-0000-7000-8000-000000000001"
-                .parse()
-                .expect("worker epoch"),
-            1,
-            daemon_generation,
-            extension_generation,
-            base_revision,
-            base_digest,
-            graph_revision,
-            graph_digest,
-            "connection-one",
-        )
-        .expect("authority")
+    ) -> TestAuthority {
+        let value = json!({
+            "extension_id": "org.example.extension",
+            "module_id": "module-one",
+            "extension_connection_id": "connection-one",
+            "host_incarnation_revision": 1,
+            "worker_epoch": "018f0f00-0000-7000-8000-000000000001",
+            "worker_epoch_fence": 1,
+            "daemon_generation": daemon_generation,
+            "extension_generation": extension_generation,
+            "base_config_revision": base_revision,
+            "base_config_digest": base_digest.to_canonical_string(),
+            "graph_revision": graph_revision,
+            "graph_digest": graph_digest.to_canonical_string(),
+            "control_channel_id": "connection-one",
+        });
+        let (bytes, digest) = canonicalize(&value).expect("authority");
+        TestAuthority {
+            digest,
+            jcs: bytes.into_vec(),
+        }
     }
 
     fn authority_for(
         store: &ConfigurationStore<'_>,
         daemon_generation: u64,
         extension_generation: i64,
-    ) -> ConfigurationTransactionAuthority {
+    ) -> TestAuthority {
         let base = store.current().expect("current");
         authority(
             daemon_generation,
@@ -1470,6 +1417,7 @@ mod tests {
             Sha256Digest::compute(b"graph-v1"),
         )
     }
+
 
     fn database_rows(store: &ConfigurationStore<'_>) -> Vec<(String, Vec<Vec<SqlValue>>)> {
         [

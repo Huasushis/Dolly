@@ -635,45 +635,24 @@ impl HostConnectionAuthority {
     pub fn incarnation_revision(&self) -> i64 {
         self.incarnation_revision
     }
-    /// Issue configuration authority after the current Host grant was
-    /// rechecked in an immediate transaction.
-    pub fn issue_configuration_transaction_authority(
-        &self,
-        store: &SqliteCoreStore<'_>,
-        grant: &HostCapabilityGrant,
-        base: &crate::ConfigurationSnapshot,
-    ) -> Result<crate::ConfigurationTransactionAuthority, crate::ConfigurationError> {
-        let current = store
-            .verify_host_capability_grant(
-                self,
-                grant.extension_id(),
-                grant.module_id(),
-                grant.grant_revision(),
-                grant.grant_digest(),
-            )
-            .map_err(|_| crate::ConfigurationError::AuthorityConflict)?
-            .ok_or(crate::ConfigurationError::AuthorityUnavailable)?;
-        if current != *grant {
-            return Err(crate::ConfigurationError::AuthorityConflict);
-        }
-        crate::ConfigurationTransactionAuthority::from_authenticated_host(self, grant, base)
-    }
-
     /// Bind an opaque configuration authority to this authenticated Host.
-    pub fn bind_configuration_authority(
+    pub fn bind_configuration_authority<A: crate::ConfigurationAuthority + ?Sized>(
         &self,
         store: &mut crate::ConfigurationStore<'_>,
-        authority: &crate::ConfigurationTransactionAuthority,
+        authority: &A,
     ) -> Result<(), crate::ConfigurationError> {
         store.bind_authority(self, authority)
     }
 
     /// Rotate an opaque configuration authority for this authenticated Host.
-    pub fn rotate_configuration_authority(
+    pub fn rotate_configuration_authority<
+        A: crate::ConfigurationAuthority + ?Sized,
+        B: crate::ConfigurationAuthority + ?Sized,
+    >(
         &self,
         store: &mut crate::ConfigurationStore<'_>,
-        previous: &crate::ConfigurationTransactionAuthority,
-        next: &crate::ConfigurationTransactionAuthority,
+        previous: &A,
+        next: &B,
     ) -> Result<(), crate::ConfigurationError> {
         store.rotate_authority(self, previous, next)
     }

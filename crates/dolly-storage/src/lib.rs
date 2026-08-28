@@ -32,10 +32,9 @@ pub use restore_identity::{
     RestoreIdentityPlannerErrorCode, evaluate_restore_identity_modes,
 };
 pub use config_transaction::{
-    CONFIGURATION_SCHEMA_SQL, CONFIGURATION_SCHEMA_VERSION, ConfigurationChange,
-    ConfigurationDisposition, ConfigurationError, ConfigurationReceipt,
-    ConfigurationSnapshot, ConfigurationStore, ConfigurationTransaction,
-    ConfigurationTransactionAuthority, MAX_CONFIGURATION_REVISION,
+    CONFIGURATION_SCHEMA_SQL, CONFIGURATION_SCHEMA_VERSION, ConfigurationAuthority,
+    ConfigurationChange, ConfigurationDisposition, ConfigurationError, ConfigurationReceipt,
+    ConfigurationSnapshot, ConfigurationStore, ConfigurationTransaction, MAX_CONFIGURATION_REVISION,
 };
 pub use transaction::{
     CoreTransaction, HostCapabilityGrant, HostConnectionAuthority,

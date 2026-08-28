@@ -31,10 +31,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 pub use dolly_core_domain::SecretRef;
 pub use operability::{
-    ExternalIoContext, ExternalIoError, ExternalIoExecutionError, ExternalIoPermit,
-    ExternalIoPolicy, ExternalIoRequest, ExternalTarget, HostExternalIoAuthority,
-    HostSecretAuthority, InMemorySecretProvider, IoPolicyError, OperationalPremise, SecretError,
-    SecretMaterial, SecretProvider,
+    ConfigurationTransactionAuthority, ExternalIoContext, ExternalIoError,
+    ExternalIoExecutionError, ExternalIoPermit, ExternalIoPolicy, ExternalIoRequest,
+    ExternalTarget, HostExternalIoAuthority, HostSecretAuthority, InMemorySecretProvider,
+    IoPolicyError, OperationalPremise, SecretError, SecretMaterial, SecretProvider,
 };
 
 use thiserror::Error;
