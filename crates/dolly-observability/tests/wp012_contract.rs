@@ -4,9 +4,9 @@ use dolly_core_reducer::{
     CoreCommand, EnvironmentInput, InstallConfigCommand, InstallGraphCommand, TransitionOutcome,
 };
 use dolly_observability::{
-    BackupError, BoundedLogBuffer, LogError, LogLevel, LogLimits, LogPushOutcome, ModuleBackup,
-    ModuleRestoreRequest, ModuleStateProjection, PayloadAuthorization, ReplayError, ReplayLimits,
-    ReplayMode, ReplayRecorder, StructuredLogEvent,
+    BackupError, BoundedLogBuffer, HostLogContext, HostLogEvent, LogError, LogLevel, LogLimits,
+    LogPushOutcome, ModuleBackup, ModuleRestoreRequest, ModuleStateProjection, ReplayError,
+    ReplayLimits, ReplayMode, ReplayRecorder, StructuredLogEvent,
 };
 use dolly_storage::{HostConnectionAuthority, SqliteCoreStore};
 use rusqlite::Connection;
@@ -134,123 +134,150 @@ fn timestamp(value: &str) -> Timestamp {
     Timestamp::from_str(value).unwrap()
 }
 
-fn log_event(level: LogLevel, sequence: u64, message: &str) -> StructuredLogEvent {
-    let mut fields = BTreeMap::new();
-    fields.insert("message".to_owned(), Value::String(message.to_owned()));
-    if level == LogLevel::Error {
-        fields.insert("error_code".to_owned(), json!("TEST_ERROR"));
-        fields.insert("phase".to_owned(), json!("testing"));
-        fields.insert("retryable".to_owned(), json!(false));
-        fields.insert("outcome".to_owned(), json!("failed"));
-    }
+fn log_event(context: &HostLogContext, event: HostLogEvent, sequence: u64) -> StructuredLogEvent {
     StructuredLogEvent::new(
-        "test.event",
-        1,
-        level,
+        context,
+        event,
         timestamp("2026-08-28T12:00:00.000000Z"),
         sequence,
-        "test-producer",
-        fields,
     )
     .unwrap()
 }
 
-#[test]
-fn logs_redact_secrets_drop_host_authority_and_stay_structured() {
-    let mut fields = BTreeMap::new();
-    fields.insert("api_key".to_owned(), json!("plain-secret"));
-    fields.insert("reservation_id".to_owned(), json!("host-reservation"));
-    fields.insert("message".to_owned(), json!("safe"));
-    let event = StructuredLogEvent::new(
-        "request.finished",
-        1,
-        LogLevel::Info,
-        timestamp("2026-08-28T12:00:00.000000Z"),
-        1,
-        "test-producer",
-        fields,
-    )
-    .unwrap();
-
-    assert_eq!(event.fields()["api_key"], json!("[REDACTED]"));
-    assert!(!event.fields().contains_key("reservation_id"));
-    let bytes = event.canonical_bytes().unwrap();
-    let text = std::str::from_utf8(bytes.as_bytes()).unwrap();
-    assert!(!text.contains("plain-secret"));
-    assert!(!text.contains("host-reservation"));
-    assert!(text.contains("request.finished"));
+fn allowed_host_callback_event(context: &HostLogContext, sequence: u64) -> StructuredLogEvent {
+    let actual_secret_bytes = b"g3-secret";
+    let actual_secret = std::str::from_utf8(actual_secret_bytes).unwrap();
+    assert_eq!(actual_secret, "g3-secret");
+    log_event(context, HostLogEvent::RequestAccepted, sequence)
 }
 
 #[test]
-fn bounded_logs_evict_in_specified_priority_order_and_account_loss() {
+fn logs_use_fixed_host_catalog_and_export_no_callback_secret() {
+    let (_connection, _authority, projection) = storage_projection();
+    let context = HostLogContext::from_storage_projection(&projection);
+    let event = allowed_host_callback_event(&context, 1);
+    assert_eq!(event.event(), HostLogEvent::RequestAccepted);
+    assert_eq!(event.context().module_id(), projection.module_id());
+    assert_eq!(
+        event.context().storage_scope_id(),
+        projection.storage_scope_id()
+    );
+
+    let bytes = event.canonical_bytes().unwrap();
+    assert!(!bytes
+        .as_bytes()
+        .windows(b"g3-secret".len())
+        .any(|window| { window == b"g3-secret" }));
+    let mut buffer = BoundedLogBuffer::new(LogLimits::default());
+    buffer.push(event).unwrap();
+    let exported = buffer.drain();
+    let exported_bytes = exported[0].canonical_bytes().unwrap();
+    assert!(!exported_bytes
+        .as_bytes()
+        .windows(b"g3-secret".len())
+        .any(|window| window == b"g3-secret"));
+
+    let untyped_document = json!({
+        "event_name": "request.finished",
+        "schema_version": 1,
+        "severity": "info",
+        "event_time": "2026-08-28T12:00:00.000000Z",
+        "sequence": 1,
+        "module_id": projection.module_id(),
+        "storage_scope_id": projection.storage_scope_id(),
+        "revision": projection.revision(),
+        "event": "request-accepted",
+        "fields": {"note": "g3-secret"},
+        "truncated": false
+    });
+    let untyped_bytes = canonicalize(&untyped_document).unwrap().0.into_vec();
+    assert!(matches!(
+        StructuredLogEvent::recover_from_bytes(&untyped_bytes),
+        Err(LogError::InvalidEvent(_))
+    ));
+}
+
+#[test]
+fn bounded_logs_evict_in_fixed_catalog_priority_order_and_account_loss() {
+    let (_connection, _authority, projection) = storage_projection();
+    let context = HostLogContext::from_storage_projection(&projection);
     let limits = LogLimits::new(3, 4096, 4096).unwrap();
     let mut buffer = BoundedLogBuffer::new(limits);
-    buffer.push(log_event(LogLevel::Trace, 1, "trace")).unwrap();
-    buffer.push(log_event(LogLevel::Debug, 2, "debug")).unwrap();
-    buffer.push(log_event(LogLevel::Info, 3, "info")).unwrap();
-    buffer.push(log_event(LogLevel::Warn, 4, "warn")).unwrap();
+    buffer
+        .push(log_event(&context, HostLogEvent::TraceCheckpoint, 1))
+        .unwrap();
+    buffer
+        .push(log_event(&context, HostLogEvent::Diagnostic, 2))
+        .unwrap();
+    buffer
+        .push(log_event(&context, HostLogEvent::RequestAccepted, 3))
+        .unwrap();
+    buffer
+        .push(log_event(&context, HostLogEvent::RequestRejected, 4))
+        .unwrap();
 
-    let messages: Vec<_> = buffer
-        .entries()
-        .map(|event| event.fields()["message"].as_str().unwrap())
-        .collect();
-    assert_eq!(messages, ["debug", "info", "warn"]);
+    let events: Vec<_> = buffer.entries().map(StructuredLogEvent::event).collect();
+    assert_eq!(
+        events,
+        [
+            HostLogEvent::Diagnostic,
+            HostLogEvent::RequestAccepted,
+            HostLogEvent::RequestRejected
+        ]
+    );
     assert_eq!(buffer.dropped_events(), 1);
 
-    let error = log_event(LogLevel::Error, 5, "error");
+    let error = log_event(&context, HostLogEvent::Error, 5);
     assert_eq!(
         buffer.push(error).unwrap(),
         LogPushOutcome::Stored { truncated: false }
     );
-    let levels: Vec<_> = buffer.entries().map(StructuredLogEvent::severity).collect();
-    assert_eq!(levels, [LogLevel::Info, LogLevel::Warn, LogLevel::Error]);
+    let events: Vec<_> = buffer.entries().map(StructuredLogEvent::event).collect();
+    assert_eq!(
+        events,
+        [
+            HostLogEvent::RequestAccepted,
+            HostLogEvent::RequestRejected,
+            HostLogEvent::Error
+        ]
+    );
     assert_eq!(buffer.dropped_events(), 2);
 }
 
 #[test]
-fn payload_logs_require_authorization_and_are_deterministically_truncated() {
-    let event = {
-        let mut fields = BTreeMap::new();
-        fields.insert("payload".to_owned(), json!("abcdefghij".repeat(200)));
-        StructuredLogEvent::new(
-            "payload.capture",
-            1,
-            LogLevel::Payload,
-            timestamp("2026-08-28T12:00:00.000000Z"),
-            1,
-            "test-producer",
-            fields,
-        )
-        .unwrap()
-    };
-    let limits = LogLimits::new(4, 256, 1024).unwrap();
-    let mut disabled = BoundedLogBuffer::new(limits);
-    assert_eq!(disabled.push(event.clone()), Err(LogError::PayloadDisabled));
+fn fixed_events_obey_event_bounds_without_payload_or_truncation() {
+    let (_connection, _authority, projection) = storage_projection();
+    let context = HostLogContext::from_storage_projection(&projection);
+    let event = log_event(&context, HostLogEvent::RequestAccepted, 1);
+    let too_small = LogLimits::new(4, 1, 1024).unwrap();
+    let mut buffer = BoundedLogBuffer::new(too_small);
+    assert!(matches!(
+        buffer.push(event.clone()),
+        Err(LogError::EventTooLarge { .. })
+    ));
 
-    let authorization = PayloadAuthorization::new(
-        "incident-123",
-        timestamp("2026-12-31T23:59:59.000000Z"),
-        256,
-        60,
-        true,
-    )
-    .unwrap();
-    let mut buffer = BoundedLogBuffer::with_payload_authorization(limits, authorization).unwrap();
+    let limits = LogLimits::new(4, 4096, 4096).unwrap();
+    let mut buffer = BoundedLogBuffer::new(limits);
     assert_eq!(
         buffer.push(event).unwrap(),
-        LogPushOutcome::Stored { truncated: true }
+        LogPushOutcome::Stored { truncated: false }
     );
     let stored = buffer.entries().next().unwrap();
-    assert!(stored.is_truncated());
-    assert!(stored.canonical_bytes().unwrap().as_bytes().len() <= 256);
+    assert!(!stored.is_truncated());
+    assert!(stored.canonical_bytes().unwrap().as_bytes().len() <= 4096);
+    assert_eq!(buffer.drain().len(), 1);
 }
 
 #[test]
-fn log_sequences_are_monotonic_per_producer() {
+fn log_sequences_are_monotonic_per_host_context() {
+    let (_connection, _authority, projection) = storage_projection();
+    let context = HostLogContext::from_storage_projection(&projection);
     let mut buffer = BoundedLogBuffer::new(LogLimits::default());
-    buffer.push(log_event(LogLevel::Info, 2, "second")).unwrap();
+    buffer
+        .push(log_event(&context, HostLogEvent::RequestAccepted, 2))
+        .unwrap();
     assert!(matches!(
-        buffer.push(log_event(LogLevel::Info, 1, "first")),
+        buffer.push(log_event(&context, HostLogEvent::RequestAccepted, 1)),
         Err(LogError::SequenceRegression { .. })
     ));
 }

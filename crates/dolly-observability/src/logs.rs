@@ -1,9 +1,7 @@
-use crate::security::redact_log_value;
-use dolly_canonical_json::{CanonicalBytes, ParseLimits, canonicalize, deserialize_core_json};
-use dolly_core_domain::Timestamp;
-use serde::de::{self, Deserializer};
+use dolly_canonical_json::{canonicalize, deserialize_core_json, CanonicalBytes, ParseLimits};
+use dolly_core_domain::{ModuleId, ModuleStorageScopeId, Timestamp};
+use dolly_storage::ModuleStateProjection;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
 use std::collections::{BTreeMap, VecDeque};
 use thiserror::Error;
 
@@ -13,7 +11,10 @@ pub const MAX_LOG_EVENTS: usize = 4_096;
 pub const MAX_LOG_EVENT_BYTES: usize = 64 * 1024;
 pub const MAX_LOG_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 
-/// The finite structured-log classes defined by the observability contract.
+const LOG_SCHEMA_VERSION: u16 = 1;
+const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+
+/// The finite severity classes used by the fixed Host event catalog.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
@@ -22,7 +23,6 @@ pub enum LogLevel {
     Info,
     Debug,
     Trace,
-    Payload,
 }
 
 impl LogLevel {
@@ -35,8 +35,265 @@ impl LogLevel {
             Self::Trace => Some(0),
             Self::Debug => Some(1),
             Self::Info => Some(2),
-            Self::Error | Self::Warn | Self::Payload => None,
+            Self::Error | Self::Warn => None,
         }
+    }
+}
+
+/// Fixed event meanings accepted from an admitted Host context.
+///
+/// This catalog deliberately has no caller-supplied text, JSON, maps, bytes,
+/// premises, authority material, or external-I/O payloads.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HostLogEvent {
+    ModuleStarted,
+    ModuleStopped,
+    RequestAccepted,
+    RequestRejected,
+    Diagnostic,
+    TraceCheckpoint,
+    Error,
+}
+
+impl HostLogEvent {
+    const fn event_name(self) -> &'static str {
+        match self {
+            Self::ModuleStarted => "module.started",
+            Self::ModuleStopped => "module.stopped",
+            Self::RequestAccepted => "request.accepted",
+            Self::RequestRejected => "request.rejected",
+            Self::Diagnostic => "diagnostic",
+            Self::TraceCheckpoint => "trace.checkpoint",
+            Self::Error => "error",
+        }
+    }
+
+    const fn severity(self) -> LogLevel {
+        match self {
+            Self::ModuleStarted | Self::ModuleStopped | Self::RequestAccepted => LogLevel::Info,
+            Self::RequestRejected => LogLevel::Warn,
+            Self::Diagnostic => LogLevel::Debug,
+            Self::TraceCheckpoint => LogLevel::Trace,
+            Self::Error => LogLevel::Error,
+        }
+    }
+}
+
+/// A Host-owned identity for one admitted Module log stream.
+///
+/// The only public constructor consumes the sealed projection issued by Host
+/// storage, so callers cannot relabel a Module, storage scope, or revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostLogContext {
+    module_id: ModuleId,
+    storage_scope_id: ModuleStorageScopeId,
+    revision: u64,
+}
+
+impl HostLogContext {
+    pub fn from_storage_projection(projection: &ModuleStateProjection) -> Self {
+        Self {
+            module_id: projection.module_id().clone(),
+            storage_scope_id: projection.storage_scope_id().clone(),
+            revision: projection.revision(),
+        }
+    }
+
+    pub fn module_id(&self) -> &ModuleId {
+        &self.module_id
+    }
+
+    pub fn storage_scope_id(&self) -> &ModuleStorageScopeId {
+        &self.storage_scope_id
+    }
+
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn from_parts(
+        module_id: ModuleId,
+        storage_scope_id: ModuleStorageScopeId,
+        revision: u64,
+    ) -> Result<Self, LogError> {
+        if revision == 0 || revision > MAX_SAFE_JSON_INTEGER {
+            return Err(LogError::InvalidEvent(
+                "log context revision must be in the safe positive integer range".to_owned(),
+            ));
+        }
+        Ok(Self {
+            module_id,
+            storage_scope_id,
+            revision,
+        })
+    }
+
+    fn producer_key(&self) -> String {
+        format!("{}@{}", self.module_id, self.storage_scope_id)
+    }
+}
+
+/// One structured log object from the fixed Host event catalog.
+///
+/// ```compile_fail
+/// use dolly_observability::StructuredLogEvent;
+/// use std::collections::BTreeMap;
+///
+/// let mut fields = BTreeMap::new();
+/// fields.insert("note".to_owned(), "g3-secret".to_owned());
+/// let _event = StructuredLogEvent::new("request.finished", 1, fields);
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StructuredLogEvent {
+    context: HostLogContext,
+    event: HostLogEvent,
+    event_time: Timestamp,
+    sequence: u64,
+    truncated: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StructuredLogEventWire {
+    event_name: String,
+    schema_version: u16,
+    severity: LogLevel,
+    event_time: Timestamp,
+    sequence: u64,
+    module_id: ModuleId,
+    storage_scope_id: ModuleStorageScopeId,
+    revision: u64,
+    event: HostLogEvent,
+    #[serde(default)]
+    truncated: bool,
+}
+
+#[derive(Serialize)]
+struct StructuredLogEventDocument<'a> {
+    event_name: &'static str,
+    schema_version: u16,
+    severity: LogLevel,
+    event_time: &'a Timestamp,
+    sequence: u64,
+    module_id: &'a ModuleId,
+    storage_scope_id: &'a ModuleStorageScopeId,
+    revision: u64,
+    event: HostLogEvent,
+    truncated: bool,
+}
+
+impl StructuredLogEvent {
+    fn from_wire(wire: StructuredLogEventWire) -> Result<Self, LogError> {
+        let context =
+            HostLogContext::from_parts(wire.module_id, wire.storage_scope_id, wire.revision)?;
+        let mut event = Self::new(&context, wire.event, wire.event_time, wire.sequence)?;
+        if wire.event_name != event.event_name()
+            || wire.schema_version != LOG_SCHEMA_VERSION
+            || wire.severity != event.severity()
+        {
+            return Err(LogError::InvalidEvent(
+                "structured log catalog metadata mismatch".to_owned(),
+            ));
+        }
+        event.truncated = wire.truncated;
+        Ok(event)
+    }
+    /// Construct one catalog event from exact Host storage context.
+    pub fn new(
+        context: &HostLogContext,
+        event: HostLogEvent,
+        event_time: Timestamp,
+        sequence: u64,
+    ) -> Result<Self, LogError> {
+        if context.revision == 0 || context.revision > MAX_SAFE_JSON_INTEGER {
+            return Err(LogError::InvalidEvent(
+                "log context revision must be in the safe positive integer range".to_owned(),
+            ));
+        }
+        if sequence == 0 || sequence > MAX_SAFE_JSON_INTEGER {
+            return Err(LogError::InvalidEvent(
+                "sequence must be in the safe positive integer range".to_owned(),
+            ));
+        }
+        Ok(Self {
+            context: context.clone(),
+            event,
+            event_time,
+            sequence,
+            truncated: false,
+        })
+    }
+
+    pub fn event_name(&self) -> &'static str {
+        self.event.event_name()
+    }
+
+    pub const fn schema_version(&self) -> u16 {
+        LOG_SCHEMA_VERSION
+    }
+
+    pub const fn severity(&self) -> LogLevel {
+        self.event.severity()
+    }
+
+    pub fn event(&self) -> HostLogEvent {
+        self.event
+    }
+
+    pub fn context(&self) -> &HostLogContext {
+        &self.context
+    }
+
+    pub fn event_time(&self) -> &Timestamp {
+        &self.event_time
+    }
+
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub const fn is_truncated(&self) -> bool {
+        self.truncated
+    }
+
+    pub fn canonical_bytes(&self) -> Result<CanonicalBytes, LogError> {
+        let document = StructuredLogEventDocument {
+            event_name: self.event_name(),
+            schema_version: self.schema_version(),
+            severity: self.severity(),
+            event_time: &self.event_time,
+            sequence: self.sequence,
+            module_id: &self.context.module_id,
+            storage_scope_id: &self.context.storage_scope_id,
+            revision: self.context.revision,
+            event: self.event,
+            truncated: self.truncated,
+        };
+        canonicalize(&document)
+            .map(|(bytes, _)| bytes)
+            .map_err(|error| LogError::Canonical(error.to_string()))
+    }
+
+    /// Recover one complete canonical catalog event. Unknown event fields are
+    /// rejected before any event can reach the buffer or export path.
+    pub fn recover_from_bytes(input: &[u8]) -> Result<Self, LogError> {
+        if input.is_empty() || input.len() > MAX_LOG_EVENT_BYTES {
+            return Err(LogError::InvalidEvent(
+                "log event bytes exceed the finite recovery limit".to_owned(),
+            ));
+        }
+        let wire: StructuredLogEventWire =
+            deserialize_core_json(input, ParseLimits::new(64).expect("64 is valid"))
+                .map_err(|_| LogError::InvalidEvent("invalid structured log bytes".to_owned()))?;
+        let event = Self::from_wire(wire)?;
+        let canonical = event.canonical_bytes()?;
+        if canonical.as_bytes() != input {
+            return Err(LogError::InvalidEvent(
+                "log event bytes are not canonical JSON".to_owned(),
+            ));
+        }
+        Ok(event)
     }
 }
 
@@ -93,315 +350,6 @@ impl Default for LogLimits {
     }
 }
 
-/// Authorization required before a `payload` log can be accepted.
-///
-/// Payload logs are disabled unless this value supplies a non-empty scope,
-/// future expiry, finite byte limit, positive retention, and an explicit
-/// operator warning. The authorization is a policy value, not a capability.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PayloadAuthorization {
-    scope: String,
-    expires_at: Timestamp,
-    max_bytes: usize,
-    retention_seconds: u64,
-    operator_warning: bool,
-}
-
-impl PayloadAuthorization {
-    pub fn new(
-        scope: impl Into<String>,
-        expires_at: Timestamp,
-        max_bytes: usize,
-        retention_seconds: u64,
-        operator_warning: bool,
-    ) -> Result<Self, LogError> {
-        let scope = scope.into();
-        if scope.is_empty() || scope.len() > 255 {
-            return Err(LogError::InvalidPayloadAuthorization(
-                "payload scope must be 1..=255 UTF-8 bytes",
-            ));
-        }
-        if max_bytes == 0 {
-            return Err(LogError::InvalidPayloadAuthorization(
-                "payload max_bytes must be positive",
-            ));
-        }
-        if retention_seconds == 0 {
-            return Err(LogError::InvalidPayloadAuthorization(
-                "payload retention must be positive",
-            ));
-        }
-        if !operator_warning {
-            return Err(LogError::InvalidPayloadAuthorization(
-                "payload authorization requires an operator warning",
-            ));
-        }
-        Ok(Self {
-            scope,
-            expires_at,
-            max_bytes,
-            retention_seconds,
-            operator_warning,
-        })
-    }
-
-    pub fn scope(&self) -> &str {
-        &self.scope
-    }
-
-    pub fn expires_at(&self) -> &Timestamp {
-        &self.expires_at
-    }
-
-    pub const fn max_bytes(&self) -> usize {
-        self.max_bytes
-    }
-
-    pub const fn retention_seconds(&self) -> u64 {
-        self.retention_seconds
-    }
-
-    pub const fn operator_warning(&self) -> bool {
-        self.operator_warning
-    }
-}
-
-/// One structured log object. The fields are data only; they cannot carry a
-/// Host capability, grant, reservation, execution premise, or effect handle.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct StructuredLogEvent {
-    event_name: String,
-    schema_version: u16,
-    severity: LogLevel,
-    event_time: Timestamp,
-    sequence: u64,
-    producer_identity: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    fields: BTreeMap<String, Value>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    truncated: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StructuredLogEventWire {
-    event_name: String,
-    schema_version: u16,
-    severity: LogLevel,
-    event_time: Timestamp,
-    sequence: u64,
-    producer_identity: String,
-    #[serde(default)]
-    fields: BTreeMap<String, Value>,
-    #[serde(default)]
-    truncated: bool,
-}
-
-impl<'de> Deserialize<'de> for StructuredLogEvent {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let wire = StructuredLogEventWire::deserialize(deserializer)?;
-        let mut event = Self::new(
-            wire.event_name,
-            wire.schema_version,
-            wire.severity,
-            wire.event_time,
-            wire.sequence,
-            wire.producer_identity,
-            wire.fields,
-        )
-        .map_err(de::Error::custom)?;
-        event.truncated = wire.truncated;
-        Ok(event)
-    }
-}
-impl StructuredLogEvent {
-    pub fn new(
-        event_name: impl Into<String>,
-        schema_version: u16,
-        severity: LogLevel,
-        event_time: Timestamp,
-        sequence: u64,
-        producer_identity: impl Into<String>,
-        fields: BTreeMap<String, Value>,
-    ) -> Result<Self, LogError> {
-        let event_name = event_name.into();
-        let producer_identity = producer_identity.into();
-        validate_text(&event_name, "event_name")?;
-        validate_text(&producer_identity, "producer_identity")?;
-        if schema_version == 0 {
-            return Err(LogError::InvalidEvent(
-                "schema_version must be positive".to_owned(),
-            ));
-        }
-        if sequence == 0 || sequence > MAX_SAFE_JSON_INTEGER {
-            return Err(LogError::InvalidEvent(
-                "sequence must be in the safe positive integer range".to_owned(),
-            ));
-        }
-
-        let mut raw_fields = Map::with_capacity(fields.len());
-        for (key, value) in fields {
-            validate_text(&key, "field name")?;
-            raw_fields.insert(key, value);
-        }
-        let safe_fields = match redact_log_value(&Value::Object(raw_fields)) {
-            Some(Value::Object(object)) => object.into_iter().collect(),
-            _ => unreachable!("a structured object remains an object after redaction"),
-        };
-        let event = Self {
-            event_name,
-            schema_version,
-            severity,
-            event_time,
-            sequence,
-            producer_identity,
-            fields: safe_fields,
-            truncated: false,
-        };
-        event.validate_error_fields()?;
-        Ok(event)
-    }
-
-    pub fn event_name(&self) -> &str {
-        &self.event_name
-    }
-
-    pub const fn schema_version(&self) -> u16 {
-        self.schema_version
-    }
-
-    pub const fn severity(&self) -> LogLevel {
-        self.severity
-    }
-
-    pub fn event_time(&self) -> &Timestamp {
-        &self.event_time
-    }
-
-    pub const fn sequence(&self) -> u64 {
-        self.sequence
-    }
-
-    pub fn producer_identity(&self) -> &str {
-        &self.producer_identity
-    }
-
-    pub fn fields(&self) -> &BTreeMap<String, Value> {
-        &self.fields
-    }
-
-    pub const fn is_truncated(&self) -> bool {
-        self.truncated
-    }
-
-    pub fn canonical_bytes(&self) -> Result<CanonicalBytes, LogError> {
-        canonicalize(self)
-            .map(|(bytes, _)| bytes)
-            .map_err(|error| LogError::Canonical(error.to_string()))
-    }
-
-    /// Recover one complete canonical event after applying the same
-    /// constructor redaction rules. Partial or non-canonical bytes are not
-    /// accepted as a log event.
-    pub fn recover_from_bytes(input: &[u8]) -> Result<Self, LogError> {
-        if input.is_empty() || input.len() > MAX_LOG_EVENT_BYTES {
-            return Err(LogError::InvalidEvent(
-                "log event bytes exceed the finite recovery limit".to_owned(),
-            ));
-        }
-        let event: Self = deserialize_core_json(input, ParseLimits::new(64).expect("64 is valid"))
-            .map_err(|error| LogError::InvalidEvent(error.to_string()))?;
-        let canonical = event.canonical_bytes()?;
-        if canonical.as_bytes() != input {
-            return Err(LogError::InvalidEvent(
-                "log event bytes are not canonical JSON".to_owned(),
-            ));
-        }
-        Ok(event)
-    }
-
-    fn validate_error_fields(&self) -> Result<(), LogError> {
-        if self.severity != LogLevel::Error {
-            return Ok(());
-        }
-        for required in ["error_code", "phase", "retryable", "outcome"] {
-            if !self.fields.contains_key(required) {
-                return Err(LogError::InvalidEvent(format!(
-                    "error events require field '{required}'"
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    fn truncated_to(&self, max_bytes: usize) -> Result<Self, LogError> {
-        let mut candidate = self.clone();
-        candidate.truncated = true;
-        let original_fields = candidate.fields.clone();
-
-        let mut low = 0usize;
-        let mut high = max_bytes;
-        let mut best: Option<Self> = None;
-        while low <= high {
-            let limit = low + (high - low) / 2;
-            candidate.fields = truncate_fields(&original_fields, limit);
-            if candidate.canonical_bytes()?.as_bytes().len() <= max_bytes {
-                best = Some(candidate.clone());
-                low = limit.saturating_add(1);
-            } else if limit == 0 {
-                break;
-            } else {
-                high = limit - 1;
-            }
-        }
-
-        if let Some(candidate) = best {
-            return Ok(candidate);
-        }
-
-        candidate.fields = BTreeMap::new();
-        if candidate.canonical_bytes()?.as_bytes().len() <= max_bytes {
-            Ok(candidate)
-        } else {
-            Err(LogError::EventTooLarge {
-                actual: self.canonical_bytes()?.as_bytes().len(),
-                limit: max_bytes,
-            })
-        }
-    }
-}
-
-fn truncate_fields(
-    fields: &BTreeMap<String, Value>,
-    max_string_chars: usize,
-) -> BTreeMap<String, Value> {
-    fields
-        .iter()
-        .map(|(key, value)| (key.clone(), truncate_value(value, max_string_chars)))
-        .collect()
-}
-
-fn truncate_value(value: &Value, max_string_chars: usize) -> Value {
-    match value {
-        Value::String(string) => Value::String(string.chars().take(max_string_chars).collect()),
-        Value::Array(values) => Value::Array(
-            values
-                .iter()
-                .map(|value| truncate_value(value, max_string_chars))
-                .collect(),
-        ),
-        Value::Object(object) => {
-            let mut truncated = Map::with_capacity(object.len());
-            for (key, value) in object {
-                truncated.insert(key.clone(), truncate_value(value, max_string_chars));
-            }
-            Value::Object(truncated)
-        }
-        _ => value.clone(),
-    }
-}
-
 /// Result of attempting to append one event to a bounded buffer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogPushOutcome {
@@ -418,7 +366,6 @@ pub struct BoundedLogBuffer {
     total_bytes: usize,
     dropped_events: u64,
     last_sequence_by_producer: BTreeMap<String, u64>,
-    payload_authorization: Option<PayloadAuthorization>,
 }
 
 #[derive(Clone, Debug)]
@@ -435,22 +382,7 @@ impl BoundedLogBuffer {
             total_bytes: 0,
             dropped_events: 0,
             last_sequence_by_producer: BTreeMap::new(),
-            payload_authorization: None,
         }
-    }
-
-    pub fn with_payload_authorization(
-        limits: LogLimits,
-        authorization: PayloadAuthorization,
-    ) -> Result<Self, LogError> {
-        if authorization.max_bytes() > limits.max_event_bytes() {
-            return Err(LogError::InvalidPayloadAuthorization(
-                "payload max_bytes cannot exceed max_event_bytes",
-            ));
-        }
-        let mut buffer = Self::new(limits);
-        buffer.payload_authorization = Some(authorization);
-        Ok(buffer)
     }
 
     pub fn limits(&self) -> LogLimits {
@@ -458,58 +390,35 @@ impl BoundedLogBuffer {
     }
 
     pub fn push(&mut self, event: StructuredLogEvent) -> Result<LogPushOutcome, LogError> {
-        if let Some(last) = self
-            .last_sequence_by_producer
-            .get(event.producer_identity())
-            .copied()
-        {
+        let producer = event.context.producer_key();
+        if let Some(last) = self.last_sequence_by_producer.get(&producer).copied() {
             if event.sequence() <= last {
                 return Err(LogError::SequenceRegression {
-                    producer: event.producer_identity().to_owned(),
+                    producer,
                     previous: last,
                     current: event.sequence(),
                 });
             }
         }
 
-        let mut event = event;
-        let mut bytes = event.canonical_bytes()?;
-        let event_limit = if event.severity() == LogLevel::Payload {
-            let Some(authorization) = self.payload_authorization.as_ref() else {
-                return Err(LogError::PayloadDisabled);
-            };
-            if event.event_time() > authorization.expires_at() {
-                return Err(LogError::PayloadExpired);
-            }
-            self.limits.max_event_bytes().min(authorization.max_bytes())
-        } else {
-            self.limits.max_event_bytes()
-        };
-
-        if bytes.as_bytes().len() > event_limit {
-            if event.severity() != LogLevel::Payload {
-                return Err(LogError::EventTooLarge {
-                    actual: bytes.as_bytes().len(),
-                    limit: event_limit,
-                });
-            }
-            event = event.truncated_to(event_limit)?;
-            bytes = event.canonical_bytes()?;
+        let bytes = event.canonical_bytes()?;
+        if bytes.as_bytes().len() > self.limits.max_event_bytes() {
+            return Err(LogError::EventTooLarge {
+                actual: bytes.as_bytes().len(),
+                limit: self.limits.max_event_bytes(),
+            });
         }
 
-        let stored = StoredLogEvent {
-            event: event.clone(),
-            bytes,
-        };
+        let stored = StoredLogEvent { event, bytes };
         let incoming_bytes = stored.bytes.as_bytes().len();
         while self.entries.len() >= self.limits.max_events()
             || self.total_bytes.saturating_add(incoming_bytes) > self.limits.max_total_bytes()
         {
             let Some(index) = self.oldest_evictable_index() else {
-                if event.severity().is_evictable() {
+                if stored.event.severity().is_evictable() {
                     self.dropped_events = self.dropped_events.saturating_add(1);
                     self.last_sequence_by_producer
-                        .insert(event.producer_identity().to_owned(), event.sequence());
+                        .insert(producer, stored.event.sequence());
                     return Ok(LogPushOutcome::Dropped {
                         dropped_events: self.dropped_events,
                     });
@@ -526,11 +435,11 @@ impl BoundedLogBuffer {
             self.dropped_events = self.dropped_events.saturating_add(1);
         }
 
-        let truncated = event.is_truncated();
+        let truncated = stored.event.is_truncated();
         self.total_bytes = self.total_bytes.saturating_add(incoming_bytes);
+        let sequence = stored.event.sequence();
         self.entries.push_back(stored);
-        self.last_sequence_by_producer
-            .insert(event.producer_identity().to_owned(), event.sequence());
+        self.last_sequence_by_producer.insert(producer, sequence);
         Ok(LogPushOutcome::Stored { truncated })
     }
 
@@ -572,38 +481,18 @@ impl BoundedLogBuffer {
         self.total_bytes = 0;
         self.entries.drain(..).map(|stored| stored.event).collect()
     }
+
     pub const fn is_authoritative(&self) -> bool {
         false
     }
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
-const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
-
-fn validate_text(value: &str, label: &str) -> Result<(), LogError> {
-    if value.is_empty() || value.len() > 255 {
-        return Err(LogError::InvalidEvent(format!(
-            "{label} must be 1..=255 UTF-8 bytes"
-        )));
-    }
-    Ok(())
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum LogError {
     #[error("invalid log limits")]
     InvalidLimits,
-    #[error("invalid payload authorization: {0}")]
-    InvalidPayloadAuthorization(&'static str),
     #[error("invalid structured log event: {0}")]
     InvalidEvent(String),
-    #[error("payload logging is disabled")]
-    PayloadDisabled,
-    #[error("payload logging authorization has expired")]
-    PayloadExpired,
     #[error("log event is {actual} bytes, over the {limit}-byte limit")]
     EventTooLarge { actual: usize, limit: usize },
     #[error("log buffer is full of non-evictable events")]

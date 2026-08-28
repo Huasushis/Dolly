@@ -17,7 +17,7 @@ pub mod replay;
 pub use backup::{BackupError, ModuleBackup, ModuleRestoreRequest, RestoredModuleState};
 pub use dolly_storage::ModuleStateProjection;
 pub use logs::{
-    BoundedLogBuffer, LogError, LogLevel, LogLimits, LogPushOutcome, PayloadAuthorization,
+    BoundedLogBuffer, HostLogContext, HostLogEvent, LogError, LogLevel, LogLimits, LogPushOutcome,
     StructuredLogEvent,
 };
 pub use replay::{

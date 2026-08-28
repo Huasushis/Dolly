@@ -1,4 +1,4 @@
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::fmt;
 
 /// Data that must never cross an observability or Module-backup boundary.
@@ -71,73 +71,6 @@ fn validate_value(value: &Value, path: &str) -> Result<(), UnsafeData> {
     }
 }
 
-/// Redact a log value before canonicalization. Sensitive values are replaced;
-/// opaque Host authority, upstream premises, and cross-Extension values are
-/// omitted. Returning `None` removes an unsafe object member or array item.
-pub(crate) fn redact_log_value(value: &Value) -> Option<Value> {
-    match value {
-        Value::Object(object) => {
-            let mut redacted = Map::with_capacity(object.len());
-            for (key, child) in object {
-                match classify_log_key(key) {
-                    Some(UnsafeDataKind::Secret) => {
-                        redacted.insert(key.clone(), Value::String("[REDACTED]".to_owned()));
-                    }
-                    Some(
-                        UnsafeDataKind::HostAuthority
-                        | UnsafeDataKind::UpstreamPremise
-                        | UnsafeDataKind::CrossExtension,
-                    ) => {}
-                    None => {
-                        if let Some(child) = redact_log_value(child) {
-                            redacted.insert(key.clone(), child);
-                        }
-                    }
-                }
-            }
-            Some(Value::Object(redacted))
-        }
-        Value::Array(values) => Some(Value::Array(
-            values.iter().filter_map(redact_log_value).collect(),
-        )),
-        Value::String(string) if looks_like_secret(string) => {
-            Some(Value::String("[REDACTED]".to_owned()))
-        }
-        _ => Some(value.clone()),
-    }
-}
-
-fn classify_log_key(key: &str) -> Option<UnsafeDataKind> {
-    let normalized = key
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .map(|character| character.to_ascii_lowercase())
-        .collect::<String>();
-    if matches!(
-        normalized.as_str(),
-        "instanceid"
-            | "runtimeid"
-            | "moduleid"
-            | "storagescopeid"
-            | "extensionid"
-            | "extensionalias"
-            | "extensionversion"
-            | "packagedigest"
-            | "activationid"
-            | "attempt"
-            | "blockid"
-            | "pageid"
-            | "configrevision"
-            | "traceid"
-            | "spanid"
-            | "modelprofilerevision"
-            | "providerrequestid"
-    ) {
-        None
-    } else {
-        classify_key(key)
-    }
-}
 fn classify_key(key: &str) -> Option<UnsafeDataKind> {
     let normalized = key
         .chars()
