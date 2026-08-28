@@ -14,7 +14,7 @@ use std::{
     io::{BufRead, BufReader},
     path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Condvar, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -341,71 +341,272 @@ pub enum DaemonError {
     CrashLoopQuarantined(DaemonGeneration),
     #[error("daemon work is not admitted")]
     WorkNotAdmissible,
+    #[error("daemon work was cancelled")]
+    WorkCancelled,
+    #[error("daemon could not drain in-flight work before its deadline")]
+    DrainDeadlineExceeded,
     #[error("daemon work guard is stale")]
     StaleWorkGuard,
 }
 
-struct WorkLedger {
-    ready_generation: Option<DaemonGeneration>,
+struct LifecycleStatus {
+    admission_open: bool,
+    cancelled: bool,
+    active_guards: BTreeMap<u64, ()>,
+    active_in_flight: usize,
     next_guard_id: u64,
-    active: BTreeMap<u64, DaemonGeneration>,
 }
 
-impl Default for WorkLedger {
-    fn default() -> Self {
+struct LifecycleInner {
+    generation: DaemonGeneration,
+    status: Mutex<LifecycleStatus>,
+    drained: Condvar,
+}
+
+impl LifecycleInner {
+    fn new(generation: DaemonGeneration) -> Self {
         Self {
-            ready_generation: None,
-            next_guard_id: 1,
-            active: BTreeMap::new(),
+            generation,
+            status: Mutex::new(LifecycleStatus {
+                admission_open: false,
+                cancelled: true,
+                active_guards: BTreeMap::new(),
+                active_in_flight: 0,
+                next_guard_id: 1,
+            }),
+            drained: Condvar::new(),
         }
     }
 }
 
-/// Opaque work permission bound to one authenticated daemon generation.
-pub struct DaemonWorkGuard {
-    ledger: Arc<Mutex<WorkLedger>>,
-    id: u64,
-    generation: DaemonGeneration,
+/// Opaque shared state for one authenticated daemon generation.
+#[derive(Clone)]
+pub struct DaemonLifecycleToken {
+    inner: Arc<LifecycleInner>,
+    guard_id: u64,
 }
 
-impl fmt::Debug for DaemonWorkGuard {
+impl fmt::Debug for DaemonLifecycleToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("DaemonWorkGuard")
-            .field("generation", &self.generation)
+            .debug_struct("DaemonLifecycleToken")
+            .field("generation", &self.inner.generation)
             .finish()
     }
 }
 
-impl DaemonWorkGuard {
+impl DaemonLifecycleToken {
+    fn new(generation: DaemonGeneration) -> Self {
+        Self {
+            inner: Arc::new(LifecycleInner::new(generation)),
+            guard_id: 0,
+        }
+    }
     pub fn generation(&self) -> DaemonGeneration {
-        self.generation
+        self.inner.generation
     }
 
     pub fn check(&self) -> Result<(), DaemonError> {
-        let ledger = self
-            .ledger
+        let status = self
+            .inner
+            .status
             .lock()
             .map_err(|_| DaemonError::StaleWorkGuard)?;
-        if ledger.ready_generation == Some(self.generation)
-            && ledger.active.get(&self.id) == Some(&self.generation)
-        {
+        if status.cancelled {
+            Err(DaemonError::WorkCancelled)
+        } else if status.admission_open && status.active_guards.contains_key(&self.guard_id) {
             Ok(())
         } else {
             Err(DaemonError::StaleWorkGuard)
         }
     }
 
+    pub fn is_cancelled(&self) -> bool {
+        self.inner
+            .status
+            .lock()
+            .map(|status| status.cancelled)
+            .unwrap_or(true)
+    }
+
+    pub fn begin_in_flight(&self) -> Result<InFlightWork, DaemonError> {
+        let mut status = self
+            .inner
+            .status
+            .lock()
+            .map_err(|_| DaemonError::StaleWorkGuard)?;
+        if status.cancelled {
+            return Err(DaemonError::WorkCancelled);
+        }
+        if !status.admission_open || !status.active_guards.contains_key(&self.guard_id) {
+            return Err(DaemonError::StaleWorkGuard);
+        }
+        status.active_in_flight = status
+            .active_in_flight
+            .checked_add(1)
+            .ok_or(DaemonError::GenerationExhausted)?;
+        Ok(InFlightWork {
+            lifecycle: self.clone(),
+        })
+    }
+
+    fn open(&self) {
+        if let Ok(mut status) = self.inner.status.lock() {
+            status.admission_open = true;
+            status.cancelled = false;
+        }
+    }
+
+    fn issue_guard(&self) -> Result<DaemonWorkGuard, DaemonError> {
+        let mut status = self
+            .inner
+            .status
+            .lock()
+            .map_err(|_| DaemonError::WorkNotAdmissible)?;
+        if status.cancelled || !status.admission_open {
+            return Err(DaemonError::WorkNotAdmissible);
+        }
+        let guard_id = status.next_guard_id;
+        status.next_guard_id = guard_id
+            .checked_add(1)
+            .ok_or(DaemonError::GenerationExhausted)?;
+        status.active_guards.insert(guard_id, ());
+        Ok(DaemonWorkGuard {
+            lifecycle: DaemonLifecycleToken {
+                inner: Arc::clone(&self.inner),
+                guard_id,
+            },
+        })
+    }
+
+    fn active_guard_count(&self) -> usize {
+        self.inner
+            .status
+            .lock()
+            .map(|status| status.active_guards.len())
+            .unwrap_or(0)
+    }
+
+    fn active_in_flight_count(&self) -> usize {
+        self.inner
+            .status
+            .lock()
+            .map(|status| status.active_in_flight)
+            .unwrap_or(0)
+    }
+
+    fn revoke_and_drain(&self, timeout: Duration) -> Result<(), DaemonError> {
+        let deadline = Instant::now() + timeout;
+        let mut status = self
+            .inner
+            .status
+            .lock()
+            .map_err(|_| DaemonError::DrainDeadlineExceeded)?;
+        status.admission_open = false;
+        status.cancelled = true;
+        status.active_guards.clear();
+        while status.active_in_flight != 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(DaemonError::DrainDeadlineExceeded);
+            }
+            let (next_status, wait) = self
+                .inner
+                .drained
+                .wait_timeout(status, remaining)
+                .map_err(|_| DaemonError::DrainDeadlineExceeded)?;
+            status = next_status;
+            if wait.timed_out() && status.active_in_flight != 0 {
+                return Err(DaemonError::DrainDeadlineExceeded);
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_guard(&self, guard_id: u64) {
+        if let Ok(mut status) = self.inner.status.lock() {
+            status.active_guards.remove(&guard_id);
+        }
+    }
+}
+
+/// Tracked in-flight work scope. Dropping it decrements the shared drain count.
+pub struct InFlightWork {
+    lifecycle: DaemonLifecycleToken,
+}
+
+impl fmt::Debug for InFlightWork {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InFlightWork")
+            .field("generation", &self.lifecycle.generation())
+            .finish()
+    }
+}
+
+impl InFlightWork {
+    pub fn check(&self) -> Result<(), DaemonError> {
+        self.lifecycle.check()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.lifecycle.is_cancelled()
+    }
+
+    pub fn lifecycle(&self) -> DaemonLifecycleToken {
+        self.lifecycle.clone()
+    }
+}
+
+impl Drop for InFlightWork {
+    fn drop(&mut self) {
+        if let Ok(mut status) = self.lifecycle.inner.status.lock() {
+            status.active_in_flight = status.active_in_flight.saturating_sub(1);
+            self.lifecycle.inner.drained.notify_all();
+        }
+    }
+}
+
+/// Opaque work permission bound to one authenticated daemon generation.
+pub struct DaemonWorkGuard {
+    lifecycle: DaemonLifecycleToken,
+}
+
+impl fmt::Debug for DaemonWorkGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DaemonWorkGuard")
+            .field("generation", &self.lifecycle.generation())
+            .finish()
+    }
+}
+
+impl DaemonWorkGuard {
+    pub fn generation(&self) -> DaemonGeneration {
+        self.lifecycle.generation()
+    }
+
+    pub fn check(&self) -> Result<(), DaemonError> {
+        self.lifecycle.check()
+    }
+
     pub fn is_usable(&self) -> bool {
         self.check().is_ok()
+    }
+
+    pub fn lifecycle_token(&self) -> Result<DaemonLifecycleToken, DaemonError> {
+        self.check()?;
+        Ok(self.lifecycle.clone())
+    }
+
+    pub fn begin_in_flight(&self) -> Result<InFlightWork, DaemonError> {
+        self.lifecycle.begin_in_flight()
     }
 }
 
 impl Drop for DaemonWorkGuard {
     fn drop(&mut self) {
-        if let Ok(mut ledger) = self.ledger.lock() {
-            ledger.active.remove(&self.id);
-        }
+        self.lifecycle.remove_guard(self.lifecycle.guard_id);
     }
 }
 
@@ -414,12 +615,13 @@ pub struct LocalDaemonSupervisor {
     command: DaemonCommand,
     readiness: DaemonReadinessConfig,
     restart_policy: RestartPolicy,
+    initial_generation: DaemonGeneration,
     child: Option<Child>,
     generation: Option<DaemonGeneration>,
     state: DaemonState,
     last_exit_status: Option<ExitStatus>,
     stop_requested: bool,
-    work: Arc<Mutex<WorkLedger>>,
+    lifecycle: Option<DaemonLifecycleToken>,
     failure_times: VecDeque<Instant>,
     last_failure: Option<(Instant, Duration)>,
     next_backoff: Duration,
@@ -448,24 +650,53 @@ impl LocalDaemonSupervisor {
         Self::with_config(command, RestartPolicy::OnUnexpectedExit, readiness)
     }
 
+    pub fn with_readiness_at_generation(
+        command: DaemonCommand,
+        readiness: DaemonReadinessConfig,
+        initial_generation: DaemonGeneration,
+    ) -> Self {
+        Self::with_config_at_generation(
+            command,
+            RestartPolicy::OnUnexpectedExit,
+            readiness,
+            initial_generation,
+        )
+    }
+
     pub fn with_config(
         command: DaemonCommand,
         restart_policy: RestartPolicy,
         readiness: DaemonReadinessConfig,
     ) -> Self {
+        Self::with_config_at_generation(
+            command,
+            restart_policy,
+            readiness,
+            DaemonGeneration::new(1).expect("constant generation"),
+        )
+    }
+
+    fn with_config_at_generation(
+        command: DaemonCommand,
+        restart_policy: RestartPolicy,
+        readiness: DaemonReadinessConfig,
+        initial_generation: DaemonGeneration,
+    ) -> Self {
+        let next_backoff = readiness.restart_bounds.initial_backoff;
         Self {
-            next_backoff: readiness.restart_bounds.initial_backoff,
             command,
             readiness,
             restart_policy,
+            initial_generation,
             child: None,
             generation: None,
             state: DaemonState::Stopped,
             last_exit_status: None,
             stop_requested: false,
-            work: Arc::new(Mutex::new(WorkLedger::default())),
+            lifecycle: None,
             failure_times: VecDeque::new(),
             last_failure: None,
+            next_backoff,
             quarantined: false,
         }
     }
@@ -491,9 +722,16 @@ impl LocalDaemonSupervisor {
     }
 
     pub fn active_work_count(&self) -> usize {
-        self.work
-            .lock()
-            .map(|ledger| ledger.active.len())
+        self.lifecycle
+            .as_ref()
+            .map(DaemonLifecycleToken::active_guard_count)
+            .unwrap_or(0)
+    }
+
+    pub fn active_in_flight_count(&self) -> usize {
+        self.lifecycle
+            .as_ref()
+            .map(DaemonLifecycleToken::active_in_flight_count)
             .unwrap_or(0)
     }
 
@@ -516,19 +754,50 @@ impl LocalDaemonSupervisor {
         self.spawn_next()
     }
 
-    /// Close admission, revoke guards, and terminate the exact child.
+    /// Close admission, cancel and drain work, then terminate the exact child.
     pub fn stop(&mut self) -> Result<(), DaemonError> {
         self.stop_requested = true;
-        self.close_admission();
-        let Some(mut child) = self.child.take() else {
+        let drain_result = self.close_current_lifecycle();
+        let child_result = self
+            .child
+            .take()
+            .map(|mut child| self.terminate_child(&mut child));
+
+        if let Err(error) = drain_result {
+            self.quarantined = true;
+            self.state =
+                DaemonState::Quarantined(self.generation.unwrap_or(self.initial_generation));
+            return Err(error);
+        }
+        let Some(child_result) = child_result else {
+            if self.quarantined {
+                self.state =
+                    DaemonState::Quarantined(self.generation.unwrap_or(self.initial_generation));
+                return Ok(());
+            }
             self.state = DaemonState::Stopped;
             return Ok(());
         };
-
-        let status = self.terminate_child(&mut child)?;
-        self.last_exit_status = Some(status);
-        self.state = DaemonState::Stopped;
-        Ok(())
+        match child_result {
+            Ok(status) => {
+                self.last_exit_status = Some(status);
+                if self.quarantined {
+                    self.state = DaemonState::Quarantined(
+                        self.generation.unwrap_or(self.initial_generation),
+                    );
+                    return Err(DaemonError::CrashLoopQuarantined(
+                        self.generation.unwrap_or(self.initial_generation),
+                    ));
+                }
+                self.state = DaemonState::Stopped;
+                Ok(())
+            }
+            Err(error) => {
+                self.state =
+                    DaemonState::Exited(self.generation.unwrap_or(self.initial_generation));
+                Err(error)
+            }
+        }
     }
 
     /// Stop the current process and start a fresh fenced generation.
@@ -539,15 +808,16 @@ impl LocalDaemonSupervisor {
 
     /// Explicit operator action required to leave crash-loop quarantine.
     pub fn clear_quarantine(&mut self) -> Result<(), DaemonError> {
-        if self.child.is_some() {
+        if self.child.is_some() || self.active_in_flight_count() != 0 {
             return Err(DaemonError::AlreadyRunning(
-                self.generation.expect("child has a generation"),
+                self.generation.unwrap_or(self.initial_generation),
             ));
         }
         self.quarantined = false;
         self.failure_times.clear();
         self.last_failure = None;
         self.next_backoff = self.readiness.restart_bounds.initial_backoff;
+        self.lifecycle = None;
         self.state = DaemonState::Stopped;
         Ok(())
     }
@@ -563,9 +833,13 @@ impl LocalDaemonSupervisor {
         };
 
         self.child.take();
-        self.close_admission();
         self.last_exit_status = Some(status);
         let exited_generation = self.generation.ok_or(DaemonError::NotRunning)?;
+        if let Err(error) = self.close_current_lifecycle() {
+            self.quarantined = true;
+            self.state = DaemonState::Quarantined(exited_generation);
+            return Err(error);
+        }
         self.state = DaemonState::Exited(exited_generation);
         self.record_failure(exited_generation);
         if self.restart_policy == RestartPolicy::OnUnexpectedExit
@@ -609,39 +883,22 @@ impl LocalDaemonSupervisor {
         expected: DaemonGeneration,
     ) -> Result<DaemonWorkGuard, DaemonError> {
         self.require_current_generation(expected)?;
-        let mut ledger = self
-            .work
-            .lock()
-            .map_err(|_| DaemonError::WorkNotAdmissible)?;
-        if ledger.ready_generation != Some(expected) {
-            return Err(DaemonError::WorkNotAdmissible);
-        }
-        let id = ledger.next_guard_id;
-        ledger.next_guard_id = id.checked_add(1).ok_or(DaemonError::GenerationExhausted)?;
-        ledger.active.insert(id, expected);
-        Ok(DaemonWorkGuard {
-            ledger: Arc::clone(&self.work),
-            id,
-            generation: expected,
-        })
+        self.lifecycle
+            .as_ref()
+            .ok_or(DaemonError::WorkNotAdmissible)?
+            .issue_guard()
     }
 
     pub fn require_work_guard(&mut self, guard: &DaemonWorkGuard) -> Result<(), DaemonError> {
         guard.check()?;
-        self.require_current_generation(guard.generation)?;
+        self.require_current_generation(guard.generation())?;
         guard.check()
     }
 
-    /// Run one synchronous operation only while its generation guard is live.
-    pub fn with_work_guard<T>(
-        &mut self,
-        guard: &DaemonWorkGuard,
-        work: impl FnOnce() -> T,
-    ) -> Result<T, DaemonError> {
+    /// Begin one tracked operation under a ready generation guard.
+    pub fn begin_work(&mut self, guard: &DaemonWorkGuard) -> Result<InFlightWork, DaemonError> {
         self.require_work_guard(guard)?;
-        let result = work();
-        self.require_work_guard(guard)?;
-        Ok(result)
+        guard.begin_in_flight()
     }
 
     fn live_generation(&self) -> Option<DaemonGeneration> {
@@ -660,9 +917,13 @@ impl LocalDaemonSupervisor {
             return Ok(());
         };
         self.child.take();
-        self.close_admission();
         self.last_exit_status = Some(status);
         let generation = self.generation.ok_or(DaemonError::NotRunning)?;
+        if let Err(error) = self.close_current_lifecycle() {
+            self.quarantined = true;
+            self.state = DaemonState::Quarantined(generation);
+            return Err(error);
+        }
         self.state = DaemonState::Exited(generation);
         self.record_failure(generation);
         Ok(())
@@ -675,15 +936,19 @@ impl LocalDaemonSupervisor {
             ));
         }
         self.readiness.validate()?;
+        self.close_current_lifecycle()?;
         let next_value = self
             .generation
-            .map(|generation| generation.value())
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or(DaemonError::GenerationExhausted)?;
+            .map(|generation| {
+                generation
+                    .value()
+                    .checked_add(1)
+                    .ok_or(DaemonError::GenerationExhausted)
+            })
+            .unwrap_or(Ok(self.initial_generation.value()))?;
         let generation = DaemonGeneration::new(next_value)?;
         self.generation = Some(generation);
-        self.close_admission();
+        self.lifecycle = Some(DaemonLifecycleToken::new(generation));
         self.state = DaemonState::Starting(generation);
 
         let mut command = Command::new(&self.command.program);
@@ -713,6 +978,7 @@ impl LocalDaemonSupervisor {
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
+                let _ = self.close_current_lifecycle();
                 self.record_failure(generation);
                 if !self.quarantined {
                     self.state = DaemonState::Exited(generation);
@@ -734,6 +1000,7 @@ impl LocalDaemonSupervisor {
                 if let Ok(status) = self.terminate_child(&mut child) {
                     self.last_exit_status = Some(status);
                 }
+                let _ = self.close_current_lifecycle();
                 self.record_failure(generation);
                 if !self.quarantined {
                     self.state = DaemonState::Exited(generation);
@@ -815,7 +1082,7 @@ impl LocalDaemonSupervisor {
             .unwrap_or(self.readiness.restart_bounds.max_backoff);
         if self.failure_times.len() >= self.readiness.restart_bounds.crash_threshold as usize {
             self.quarantined = true;
-            self.close_admission();
+            let _ = self.close_current_lifecycle();
             self.state = DaemonState::Quarantined(generation);
         }
     }
@@ -830,20 +1097,27 @@ impl LocalDaemonSupervisor {
         }
     }
 
-    fn close_admission(&self) {
-        if let Ok(mut ledger) = self.work.lock() {
-            ledger.ready_generation = None;
-            ledger.active.clear();
-        }
+    fn close_current_lifecycle(&mut self) -> Result<(), DaemonError> {
+        let Some(lifecycle) = self.lifecycle.as_ref() else {
+            return Ok(());
+        };
+        lifecycle.revoke_and_drain(self.readiness.stop_timeout())?;
+        self.lifecycle = None;
+        Ok(())
     }
 
     fn open_admission(&self, generation: DaemonGeneration) {
-        if let Ok(mut ledger) = self.work.lock() {
-            ledger.ready_generation = Some(generation);
+        if self
+            .lifecycle
+            .as_ref()
+            .is_some_and(|lifecycle| lifecycle.generation() == generation)
+        {
+            if let Some(lifecycle) = &self.lifecycle {
+                lifecycle.open();
+            }
         }
     }
 }
-
 impl Drop for LocalDaemonSupervisor {
     fn drop(&mut self) {
         let _ = self.stop();
@@ -1003,17 +1277,100 @@ sleep 2
         assert!(guard.is_usable());
         assert_eq!(supervisor.active_work_count(), 1);
         let mut work_calls = 0;
-        supervisor
-            .with_work_guard(&guard, || work_calls += 1)
-            .expect("guarded work");
+        {
+            let _work = supervisor
+                .begin_work(&guard)
+                .expect("guarded work must be tracked");
+            work_calls += 1;
+        }
         assert_eq!(work_calls, 1);
+        assert_eq!(supervisor.active_in_flight_count(), 0);
         supervisor.stop().expect("stop");
         assert!(!guard.is_usable());
         assert!(matches!(
             supervisor.require_work_guard(&guard),
-            Err(DaemonError::StaleWorkGuard)
+            Err(DaemonError::StaleWorkGuard) | Err(DaemonError::WorkCancelled)
         ));
         assert_eq!(supervisor.active_work_count(), 0);
+        assert_eq!(supervisor.active_in_flight_count(), 0);
+    }
+
+    #[test]
+    fn stop_cancels_and_waits_for_tracked_work_before_terminating_child() {
+        let mut supervisor = supervisor("ready");
+        let generation = supervisor.start().expect("authenticated readiness");
+        let guard = supervisor
+            .acquire_work_guard(generation)
+            .expect("work guard");
+        let in_flight = supervisor.begin_work(&guard).expect("tracked work");
+        let (cancelled_sender, cancelled_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            while !in_flight.is_cancelled() {
+                thread::yield_now();
+            }
+            cancelled_sender
+                .send(())
+                .expect("cancellation notification");
+            release_receiver.recv().expect("drain release");
+            assert!(in_flight.is_cancelled());
+        });
+
+        let (finished_sender, finished_receiver) = mpsc::channel();
+        let stopper = thread::spawn(move || {
+            let result = supervisor.stop();
+            finished_sender.send(result).expect("stop result");
+            supervisor
+        });
+        cancelled_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stop must cancel tracked work");
+        assert!(matches!(
+            finished_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        release_sender.send(()).expect("release tracked work");
+        worker.join().expect("tracked work thread");
+        assert!(
+            finished_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("stop completion")
+                .is_ok()
+        );
+        let supervisor = stopper.join().expect("stopper thread");
+        assert_eq!(supervisor.state(), DaemonState::Stopped);
+        assert_eq!(supervisor.active_work_count(), 0);
+        assert_eq!(supervisor.active_in_flight_count(), 0);
+        assert!(!guard.is_usable());
+    }
+
+    #[test]
+    fn stop_deadline_quarantines_with_live_work_and_never_reports_stopped() {
+        let mut supervisor = supervisor("ready");
+        let generation = supervisor.start().expect("authenticated readiness");
+        let guard = supervisor
+            .acquire_work_guard(generation)
+            .expect("work guard");
+        let in_flight = supervisor.begin_work(&guard).expect("tracked work");
+
+        assert!(matches!(
+            supervisor.stop(),
+            Err(DaemonError::DrainDeadlineExceeded)
+        ));
+        assert!(matches!(
+            supervisor.state(),
+            DaemonState::Quarantined(actual) if actual == generation
+        ));
+        assert!(!guard.is_usable());
+        assert_eq!(supervisor.active_in_flight_count(), 1);
+
+        drop(in_flight);
+        assert_eq!(supervisor.active_in_flight_count(), 0);
+        assert!(supervisor.stop().is_ok());
+        assert!(matches!(
+            supervisor.state(),
+            DaemonState::Quarantined(actual) if actual == generation
+        ));
     }
 
     #[test]

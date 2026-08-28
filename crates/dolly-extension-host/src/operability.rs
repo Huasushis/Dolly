@@ -13,6 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use dolly_core_domain::ExtensionId;
 
+use dolly_worker::daemon::{DaemonError, DaemonLifecycleToken, DaemonWorkGuard, InFlightWork};
+
 use crate::FencedInvocationPremise;
 use crate::SecretRef;
 
@@ -24,11 +26,29 @@ use crate::SecretRef;
 #[derive(Clone, Debug)]
 pub struct OperationalPremise {
     invocation: FencedInvocationPremise,
+    lifecycle: Option<DaemonLifecycleToken>,
 }
 
 impl OperationalPremise {
     pub(crate) fn from_admitted(invocation: FencedInvocationPremise) -> Self {
-        Self { invocation }
+        Self {
+            invocation,
+            lifecycle: None,
+        }
+    }
+
+    /// Bind the premise to the exact live daemon generation that admitted it.
+    ///
+    /// The guard remains private to the Host boundary; the shared lifecycle
+    /// state is rechecked whenever a later authority operation is attempted.
+    pub fn bind_work_guard(mut self, guard: &DaemonWorkGuard) -> Result<Self, ExternalIoError> {
+        let lifecycle = guard.lifecycle_token().map_err(map_lifecycle_error)?;
+        let expected_generation = u64::try_from(self.extension_generation()).ok();
+        if expected_generation != Some(lifecycle.generation().value()) {
+            return Err(ExternalIoError::StaleGeneration);
+        }
+        self.lifecycle = Some(lifecycle);
+        Ok(self)
     }
 
     pub fn invocation(&self) -> &FencedInvocationPremise {
@@ -270,6 +290,14 @@ pub enum ExternalIoError {
     TargetNotAllowed,
 }
 
+fn map_lifecycle_error(error: DaemonError) -> ExternalIoError {
+    match error {
+        DaemonError::WorkCancelled => ExternalIoError::Stopped,
+        DaemonError::StaleWorkGuard => ExternalIoError::StaleGeneration,
+        _ => ExternalIoError::AuthorityUnavailable,
+    }
+}
+
 /// An execution error that distinguishes denial, unresolved secrets, and the
 /// caller's effect error. The effect is called only after all checks pass.
 #[derive(Debug)]
@@ -333,7 +361,7 @@ impl HostSecretAuthority {
         Self { provider }
     }
 
-    pub fn with_secret<T>(
+    fn with_secret<T>(
         &self,
         reference: &SecretRef,
         callback: impl FnOnce(&[u8]) -> T,
@@ -438,14 +466,21 @@ impl HostExternalIoAuthority {
         premise: &OperationalPremise,
         request: ExternalIoRequest,
     ) -> Result<ExternalIoPermit, ExternalIoError> {
-        self.authorize_claims(
+        let lifecycle = premise
+            .lifecycle
+            .as_ref()
+            .ok_or(ExternalIoError::StaleGeneration)?;
+        lifecycle.check().map_err(map_lifecycle_error)?;
+        self.authorize_claims_with_lifecycle(
             premise.extension_id(),
             premise.config_revision(),
             premise.extension_generation(),
             request,
+            Some(lifecycle.clone()),
         )
     }
 
+    #[cfg(test)]
     fn authorize_claims(
         &self,
         premise_extension: Option<&str>,
@@ -453,6 +488,29 @@ impl HostExternalIoAuthority {
         generation: i64,
         request: ExternalIoRequest,
     ) -> Result<ExternalIoPermit, ExternalIoError> {
+        self.authorize_claims_with_lifecycle(
+            premise_extension,
+            config_revision,
+            generation,
+            request,
+            None,
+        )
+    }
+
+    fn authorize_claims_with_lifecycle(
+        &self,
+        premise_extension: Option<&str>,
+        config_revision: u64,
+        generation: i64,
+        request: ExternalIoRequest,
+        lifecycle: Option<DaemonLifecycleToken>,
+    ) -> Result<ExternalIoPermit, ExternalIoError> {
+        if let Some(lifecycle) = &lifecycle {
+            lifecycle.check().map_err(map_lifecycle_error)?;
+            if u64::try_from(generation).ok() != Some(lifecycle.generation().value()) {
+                return Err(ExternalIoError::StaleGeneration);
+            }
+        }
         let gate = self
             .gate
             .lock()
@@ -481,12 +539,23 @@ impl HostExternalIoAuthority {
         if !self.policy.allows_target(request.target()) {
             return Err(ExternalIoError::TargetNotAllowed);
         }
+        if let Some(lifecycle) = &lifecycle {
+            lifecycle.check().map_err(map_lifecycle_error)?;
+        }
         Ok(ExternalIoPermit {
             authority: self.clone(),
             request,
             generation,
+            lifecycle,
         })
     }
+}
+/// A one-shot permit returned only after policy, premise, and lifecycle checks.
+pub struct ExternalIoPermit {
+    authority: HostExternalIoAuthority,
+    request: ExternalIoRequest,
+    generation: i64,
+    lifecycle: Option<DaemonLifecycleToken>,
 }
 
 impl fmt::Debug for HostExternalIoAuthority {
@@ -497,13 +566,6 @@ impl fmt::Debug for HostExternalIoAuthority {
             .field("secrets", &self.secrets)
             .finish()
     }
-}
-
-/// A one-shot permit returned only after policy and premise checks.
-pub struct ExternalIoPermit {
-    authority: HostExternalIoAuthority,
-    request: ExternalIoRequest,
-    generation: i64,
 }
 
 impl fmt::Debug for ExternalIoPermit {
@@ -522,6 +584,7 @@ impl fmt::Debug for ExternalIoPermit {
 pub struct ExternalIoContext<'a> {
     request: &'a ExternalIoRequest,
     secret: Option<&'a [u8]>,
+    cancellation: Option<&'a InFlightWork>,
 }
 
 impl<'a> ExternalIoContext<'a> {
@@ -536,6 +599,13 @@ impl<'a> ExternalIoContext<'a> {
     pub fn secret_bytes(&self) -> Option<&[u8]> {
         self.secret
     }
+
+    /// Observe cancellation requested by the supervising daemon lifecycle.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation
+            .map(InFlightWork::is_cancelled)
+            .unwrap_or(false)
+    }
 }
 
 impl fmt::Debug for ExternalIoContext<'_> {
@@ -545,17 +615,30 @@ impl fmt::Debug for ExternalIoContext<'_> {
             .field("operation", &self.request.operation)
             .field("target", &self.request.target)
             .field("has_secret", &self.secret.is_some())
+            .field("cancelled", &self.is_cancelled())
             .finish()
     }
 }
 
 impl ExternalIoPermit {
-    /// Resolve the `SecretRef`, re-check stop/generation, and only then invoke
-    /// the external/business effect. The stop gate remains held throughout.
+    /// Resolve the `SecretRef`, re-check stop/generation and cancellation, and
+    /// only then invoke the external/business effect. The stop lifecycle
+    /// remains tracked until the callback returns.
     pub fn execute<T, E>(
         self,
         effect: impl FnOnce(ExternalIoContext<'_>) -> Result<T, E>,
     ) -> Result<T, ExternalIoExecutionError<E>> {
+        let in_flight = self
+            .lifecycle
+            .as_ref()
+            .map(DaemonLifecycleToken::begin_in_flight)
+            .transpose()
+            .map_err(|error| ExternalIoExecutionError::Denied(map_lifecycle_error(error)))?;
+        if let Some(scope) = &in_flight {
+            scope
+                .check()
+                .map_err(|error| ExternalIoExecutionError::Denied(map_lifecycle_error(error)))?;
+        }
         let gate =
             self.authority.gate.lock().map_err(|_| {
                 ExternalIoExecutionError::Denied(ExternalIoError::AuthorityUnavailable)
@@ -570,23 +653,47 @@ impl ExternalIoPermit {
                 ExternalIoError::StaleGeneration,
             ));
         }
+        if let Some(scope) = &in_flight {
+            scope
+                .check()
+                .map_err(|error| ExternalIoExecutionError::Denied(map_lifecycle_error(error)))?;
+        }
+
         let result = match self.request.secret_ref() {
-            Some(reference) => self
-                .authority
-                .secrets
-                .with_secret(reference, |secret| {
+            Some(reference) => {
+                let resolved = self.authority.secrets.with_secret(reference, |secret| {
+                    if let Some(scope) = &in_flight {
+                        scope.check().map_err(|error| {
+                            ExternalIoExecutionError::Denied(map_lifecycle_error(error))
+                        })?;
+                    }
                     effect(ExternalIoContext {
                         request: &self.request,
                         secret: Some(secret),
+                        cancellation: in_flight.as_ref(),
                     })
+                    .map_err(ExternalIoExecutionError::Effect)
+                });
+                match resolved {
+                    Ok(result) => result,
+                    Err(_) => return Err(ExternalIoExecutionError::SecretUnavailable),
+                }
+            }
+            None => {
+                if let Some(scope) = &in_flight {
+                    scope.check().map_err(|error| {
+                        ExternalIoExecutionError::Denied(map_lifecycle_error(error))
+                    })?;
+                }
+                effect(ExternalIoContext {
+                    request: &self.request,
+                    secret: None,
+                    cancellation: in_flight.as_ref(),
                 })
-                .map_err(|_| ExternalIoExecutionError::SecretUnavailable)?,
-            None => effect(ExternalIoContext {
-                request: &self.request,
-                secret: None,
-            }),
+                .map_err(ExternalIoExecutionError::Effect)
+            }
         };
-        result.map_err(ExternalIoExecutionError::Effect)
+        result
     }
 }
 

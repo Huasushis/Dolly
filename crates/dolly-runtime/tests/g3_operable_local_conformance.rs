@@ -21,6 +21,7 @@ use dolly_worker::daemon::{
 };
 use rusqlite::{Connection, types::Value as SqlValue};
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::time::Duration;
 
 fn canonical_digest(value: &Value) -> String {
@@ -437,6 +438,7 @@ fn case<'a>(document: &'a Value, id: &str, label: &str) -> &'a Value {
         .find(|candidate| candidate["id"] == id)
         .unwrap_or_else(|| panic!("{label} matrix case {id} is missing"))
 }
+
 const DAEMON_HANDSHAKE_SCRIPT: &str = r#"
 mode="$DOLLY_G3_DAEMON_MODE"
 if [ "$mode" = ready ]; then
@@ -554,8 +556,16 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
     );
     let readiness = daemon_readiness(&dispatch);
 
-    let mut unauthenticated =
-        LocalDaemonSupervisor::with_readiness(daemon_command("silent"), readiness.clone());
+    let initial_generation = DaemonGeneration::new(
+        u64::try_from(dispatch.premise.fence().extension_generation())
+            .expect("positive Extension generation"),
+    )
+    .expect("initial daemon generation");
+    let mut unauthenticated = LocalDaemonSupervisor::with_readiness_at_generation(
+        daemon_command("silent"),
+        readiness.clone(),
+        initial_generation,
+    );
     assert!(matches!(
         unauthenticated.start(),
         Err(DaemonError::ReadinessTimeout)
@@ -564,14 +574,17 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
         unauthenticated.state(),
         DaemonState::Exited(_) | DaemonState::Quarantined(_)
     ));
-    let first_generation = DaemonGeneration::new(1).expect("first daemon generation");
     assert!(matches!(
-        unauthenticated.acquire_work_guard(first_generation),
+        unauthenticated.acquire_work_guard(initial_generation),
         Err(DaemonError::StaleGeneration { .. })
     ));
     unauthenticated.stop().expect("stop unauthenticated child");
 
-    let mut supervisor = LocalDaemonSupervisor::with_readiness(daemon_command("ready"), readiness);
+    let mut supervisor = LocalDaemonSupervisor::with_readiness_at_generation(
+        daemon_command("ready"),
+        readiness,
+        initial_generation,
+    );
     let daemon_generation = supervisor
         .start()
         .expect("authenticated readiness must pass");
@@ -583,19 +596,22 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
     assert!(work_guard.is_usable());
     assert_eq!(supervisor.active_work_count(), 1);
 
-    let operational = supervisor
-        .with_work_guard(&work_guard, || {
-            let store = SqliteCoreStore::new(&mut dispatch.connection)
-                .expect("core schema for operational admission");
-            dolly_extension_host::admit_operational_activation(
-                &dispatch.premise,
-                &dispatch.result,
-                &store,
-                FrameLimits::defaults(),
-            )
-        })
-        .expect("operational admission must remain inside the work guard")
-        .expect("accepted G2 invocation must reach operational premise");
+    let operational = {
+        let _admission_work = supervisor
+            .begin_work(&work_guard)
+            .expect("operational admission must be tracked");
+        let store = SqliteCoreStore::new(&mut dispatch.connection)
+            .expect("core schema for operational admission");
+        dolly_extension_host::admit_operational_activation(
+            &dispatch.premise,
+            &dispatch.result,
+            &store,
+            FrameLimits::defaults(),
+        )
+        .expect("accepted G2 invocation must reach operational premise")
+        .bind_work_guard(&work_guard)
+        .expect("operational premise must bind the daemon generation")
+    };
     let after_core = {
         let store = SqliteCoreStore::new(&mut dispatch.connection)
             .expect("core schema after operational admission");
@@ -613,17 +629,77 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
     assert_eq!(before_core.pages, after_core.pages);
     assert_eq!(before_core.blocks, after_core.blocks);
     assert_operational_fences(&dispatch, &operational);
+    let target =
+        dolly_extension_host::ExternalTarget::new("https", "api.example.test", 443, "/v1/data")
+            .expect("external target");
+    let mut policy = dolly_extension_host::ExternalIoPolicy::new(
+        "org.example.extension",
+        operational.config_revision(),
+        operational.extension_generation(),
+    )
+    .expect("external policy");
+    policy.allow_operation("read").expect("operation");
+    policy.allow_target(target.clone());
+    let authority = dolly_extension_host::HostExternalIoAuthority::new(
+        policy,
+        dolly_extension_host::HostSecretAuthority::new(Arc::new(
+            dolly_extension_host::InMemorySecretProvider::default(),
+        )),
+    );
+    let request =
+        dolly_extension_host::ExternalIoRequest::new("org.example.extension", "read", target, None)
+            .expect("external request");
+    let stopped_permit = authority
+        .authorize(&operational, request.clone())
+        .expect("live premise must authorize");
+    let restarted_permit = authority
+        .authorize(&operational, request.clone())
+        .expect("live premise must authorize a second one-shot permit");
+    let escaped_premise = operational.clone();
 
     supervisor.stop().expect("stop authenticated child");
     assert!(!work_guard.is_usable());
     assert_eq!(supervisor.active_work_count(), 0);
-    let mut effect_executions = 0;
-    assert!(
-        supervisor
-            .with_work_guard(&work_guard, || effect_executions += 1)
-            .is_err()
+    assert_eq!(supervisor.active_in_flight_count(), 0);
+    assert!(matches!(
+        authority.authorize(&escaped_premise, request.clone()),
+        Err(dolly_extension_host::ExternalIoError::Stopped)
+            | Err(dolly_extension_host::ExternalIoError::StaleGeneration)
+    ));
+
+    let effect_executions = std::cell::Cell::new(0);
+    let stopped_result = stopped_permit.execute(|context| {
+        effect_executions.set(effect_executions.get() + 1);
+        assert!(!context.is_cancelled());
+        Ok::<_, ()>(())
+    });
+    assert!(matches!(
+        stopped_result,
+        Err(dolly_extension_host::ExternalIoExecutionError::Denied(
+            dolly_extension_host::ExternalIoError::Stopped
+                | dolly_extension_host::ExternalIoError::StaleGeneration
+        ))
+    ));
+
+    let restarted_generation = supervisor.restart().expect("restart");
+    assert!(restarted_generation > daemon_generation);
+    let restarted_result = restarted_permit.execute(|_| {
+        effect_executions.set(effect_executions.get() + 1);
+        Ok::<_, ()>(())
+    });
+    assert!(matches!(
+        restarted_result,
+        Err(dolly_extension_host::ExternalIoExecutionError::Denied(
+            dolly_extension_host::ExternalIoError::Stopped
+                | dolly_extension_host::ExternalIoError::StaleGeneration
+        ))
+    ));
+    assert_eq!(
+        effect_executions.get(),
+        0,
+        "escaped permits cannot invoke transport after stop or restart"
     );
-    assert_eq!(effect_executions, 0, "fenced work cannot execute an effect");
+    supervisor.stop().expect("stop restarted child");
 }
 
 #[test]
