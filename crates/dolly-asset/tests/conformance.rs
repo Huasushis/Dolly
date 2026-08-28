@@ -1281,3 +1281,111 @@ fn real_available_emission_matches_the_authoritative_asset_object_shape() {
     assert!(absent_json.get("asset").unwrap().is_null());
     assert!(absent_json.get("error").unwrap().is_null());
 }
+
+#[test]
+fn byte_identical_replay_across_domains_fails_closed_without_disclosure() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut service, _clock) = service_at(dir.path(), TestClock::new(T0));
+    let png = png_bytes(4, 2);
+    // Same module and instance, two security domains.
+    let domain_a = service.issue_capability("personal", "instance-a", "module-a");
+    let domain_b = service.issue_capability("work", "instance-a", "module-a");
+
+    let first = service
+        .import(
+            &domain_a,
+            &request(701, Source::InlineBase64 { base64: base64(&png) }, Some("image/png"), false),
+        )
+        .unwrap();
+    assert_eq!(first.state, "available");
+    assert!(first.asset.is_some());
+
+    // Byte-identical import-ID/request replayed by the same module+instance
+    // in a different security domain: must fail closed and non-disclosing.
+    let replay = request(
+        701,
+        Source::InlineBase64 { base64: base64(&png) },
+        Some("image/png"),
+        false,
+    );
+    let err = service.import(&domain_b, &replay).unwrap_err();
+    assert_eq!(
+        err.code,
+        AssetErrorCode::ImportIdConflict,
+        "a cross-domain replay must be refused, never answered with the first domain's record"
+    );
+    assert!(
+        err.asset_id.is_none(),
+        "the refusal must carry no identifier into the first domain's asset"
+    );
+    assert_eq!(
+        service.store_import_count(),
+        1,
+        "the cross-domain replay must not create or mutate any record"
+    );
+
+    // The first domain's record is untouched and still authoritative.
+    let status_a = service.status(&domain_a, &import_id(701)).unwrap();
+    assert_eq!(status_a.state, "available");
+    assert!(status_a.asset.is_some());
+
+    // The second domain sees only the closed absent status for the same
+    // import id: no AssetRef, no state, no partial authority.
+    let status_b = service.status(&domain_b, &import_id(701)).unwrap();
+    assert_eq!(status_b.state, "absent");
+    assert!(status_b.asset.is_none());
+    assert_eq!(service.store_import_count(), 1);
+}
+
+#[test]
+fn facade_end_to_end_available_emission_is_live() {
+    use dolly_asset::facade::AssetHostFacade;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut facade = AssetHostFacade::open(config_at(dir.path())).unwrap();
+    let capability = facade.issue_capability("personal", "instance-a", "module-a");
+    let png = png_bytes(4, 2);
+
+    // Obtain a real AVAILABLE response through the public façade boundary.
+    let result = facade
+        .import(
+            &capability,
+            &request(702, Source::InlineBase64 { base64: base64(&png) }, Some("image/png"), false),
+        )
+        .unwrap();
+    assert_eq!(result.state, "available");
+    assert!(result.terminal);
+    assert!(result.asset.is_some());
+
+    // Serialize that actual response and persist it as the authoritative
+    // emission artifact the schema conformance guard validates. The artifact
+    // is the live bytes, never a manually re-typed object.
+    let emission = serde_json::to_string_pretty(&result).unwrap();
+    let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../dolly-spec/examples/host-asset-status-available.json");
+    std::fs::write(&artifact, emission.as_bytes()).expect("persist the live AVAILABLE emission");
+
+    // The artifact round-trips to the identical live response and its asset
+    // object is exactly the canonical schema field set, no second wire shape.
+    let back: dolly_asset::StatusResult = serde_json::from_str(&emission).unwrap();
+    assert_eq!(back, result);
+    let asset = serde_json::to_value(result.asset.as_ref().unwrap()).unwrap();
+    let obj = asset.as_object().unwrap();
+    let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+    keys.sort_unstable();
+    assert!(
+        keys.iter().all(|k| matches!(
+            *k,
+            "asset_id" | "media_type" | "byte_length" | "orientation"
+                | "encoded_width" | "encoded_height" | "display_width" | "display_height"
+        )),
+        "the live emission asset carries only the canonical schema fields: {keys:?}"
+    );
+    for k in ["asset_id", "media_type", "byte_length"] {
+        assert!(obj.contains_key(k), "required asset field {k} is present");
+    }
+    let bytes = obj["byte_length"].as_u64().unwrap();
+    assert!(bytes <= AssetRef::MAX_WIRE_SAFE_INTEGER);
+    assert_eq!(obj["encoded_width"].as_u64(), Some(4));
+    assert_eq!(obj["encoded_height"].as_u64(), Some(2));
+}

@@ -207,6 +207,19 @@ impl<'a> ImportPipeline<'a> {
                     )
                     .with_import_id(&request.import_id));
                 }
+                // The security domain is supplied by the caller's capability,
+                // not by the request, so it never enters the digest. A
+                // byte-identical replay from another domain must fail closed
+                // here rather than disclose or reuse the first domain's
+                // record and its AssetRef.
+                if record.security_domain != security_domain {
+                    return Err(AssetError::new(
+                        AssetErrorCode::ImportIdConflict,
+                        ErrorPhase::Validate,
+                        "ImportId is already in use by another security domain".to_string(),
+                    )
+                    .with_import_id(&request.import_id));
+                }
                 return Ok(StatusResult::from_record(&record));
             }
         }
