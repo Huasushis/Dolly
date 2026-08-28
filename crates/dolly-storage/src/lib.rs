@@ -10,6 +10,7 @@ pub mod database;
 pub mod effect_journal;
 pub mod error;
 pub mod host_authority;
+pub mod config_transaction;
 pub mod linux_host_verification;
 pub mod mcp_readiness;
 pub mod restore_identity;
@@ -29,6 +30,11 @@ pub use restore_identity::{
     MAX_SAFE_JSON_INTEGER, RestoreIdentityAuditEvent, RestoreIdentityBackupEntry,
     RestoreIdentityMode, RestoreIdentityModesPlan, RestoreIdentityPlannerError,
     RestoreIdentityPlannerErrorCode, evaluate_restore_identity_modes,
+};
+pub use config_transaction::{
+    CONFIGURATION_SCHEMA_SQL, CONFIGURATION_SCHEMA_VERSION, ConfigurationChange,
+    ConfigurationDisposition, ConfigurationError, ConfigurationReceipt, ConfigurationSnapshot,
+    ConfigurationStore, ConfigurationTransaction, MAX_CONFIGURATION_REVISION,
 };
 pub use transaction::{
     CoreTransaction, HostCapabilityGrant, HostConnectionAuthority,

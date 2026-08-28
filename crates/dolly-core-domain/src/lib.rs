@@ -15,8 +15,8 @@ pub use error_envelope::{
 };
 pub use identifiers::{
     ActionId, ActionName, ActivationId, BlockId, DaemonInstallationId, ExtensionId, IngressId,
-    InstanceId, LeaseToken, ModuleId, ModuleStorageScopeId, PageId, RuntimeEventId, TraceId,
-    UuidV7, WorkerEpoch,
+    InstanceId, LeaseToken, ModuleId, ModuleStorageScopeId, PageId, RuntimeEventId, SecretRef,
+    TraceId, UuidV7, WorkerEpoch,
 };
 pub use numbers::{
     Attempt, CommitSeq, ConfigRevision, DescriptorRevision, ExtensionGeneration, GraphRevision,
