@@ -58,12 +58,12 @@ use dolly_core_domain::{
 use dolly_core_reducer::{
     CoreCommand, CoreSnapshot, EnvironmentInput, HostIngressPremiseError, IngressCommand,
     IngressIdentity, Transition, TransitionOutcome, build_ingress_command,
-    derive_ingress_identity, derive_ingress_key,
+    derive_ingress_identity, derive_ingress_key, hash_core_state, project_core_state,
     validate_ingress_request,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::database::map_sqlite_error;
 use crate::error::{StorageError, StorageResult};
@@ -862,8 +862,10 @@ fn verify_graph_direction(
     };
     // Grant-to-descriptor binding: the activating grant pins one descriptor
     // digest, and the pinned graph admits its own descriptor source digest.
-    // A live grant under any other Extension pins a different descriptor and
-    // cannot reuse this Module's authorized output Pages.
+    // A live grant under any other Extension (even one that copied the
+    // byte-identical descriptor) cannot reuse this Module's authorized output
+    // Pages unless the graph's authoritative admission names the grant's
+    // Extension as the owner.
     let source_descriptor_digest = admitted
         .get("source_descriptor_digest")
         .and_then(Value::as_str);
@@ -875,6 +877,20 @@ fn verify_graph_direction(
                 grant.descriptor_digest(),
                 source_descriptor_digest,
                 facts.module_id
+            ),
+        ));
+    }
+    let owner_extension_id = admitted
+        .get("owner_extension_id")
+        .and_then(Value::as_str);
+    if owner_extension_id != Some(&facts.extension_id) {
+        return Err(HostIngressError::new(
+            HostIngressErrorCode::NotAuthorized,
+            format!(
+                "the graph admits module {} under Extension {:?}, not the grant's Extension {:?}",
+                facts.module_id,
+                owner_extension_id,
+                facts.extension_id
             ),
         ));
     }
@@ -1037,11 +1053,60 @@ fn verify_mapping(
     let (_, computed_transition_digest) = canonical_digest(&transition)?;
     if computed_transition_digest != stored_transition_digest
         || transition.outcome != TransitionOutcome::Committed
-        || !transition
-            .events
-            .iter()
-            .any(|event| event.command_id == expected_command_id)
     {
+        return Err(StorageError::Corrupt);
+    }
+
+    // Immutable canonical invariants of the committed transition: the state
+    // hash and projection must match its own state, a committed Ingress
+    // transition carries exactly one IngressCommitted event for the expected
+    // command/block, no error, no safety stop, and the fresh-commit reply.
+    let computed_state_hash =
+        hash_core_state(&transition.state).map_err(|_| StorageError::Corrupt)?;
+    if transition.state_hash != computed_state_hash
+        || project_core_state(&transition.state) != transition.projection
+        || transition.error.is_some()
+        || transition.safety_stop.is_some()
+        || transition.events.len() != 1
+    {
+        return Err(StorageError::Corrupt);
+    }
+    let event = &transition.events[0];
+    if event.event != "IngressCommitted"
+        || event.command_id != expected_command_id
+        || event
+            .details
+            .as_ref()
+            .and_then(|details| details.get("block_id"))
+            .and_then(Value::as_str)
+            != Some(mapping.block_id.as_str())
+    {
+        return Err(StorageError::Corrupt);
+    }
+    let expected_reply = json!({"block_id": mapping.block_id, "idempotent": false});
+    if transition.reply.as_ref() != Some(&expected_reply) {
+        return Err(StorageError::Corrupt);
+    }
+
+    // Immutable journal anchor: the reducer event of the committed transition
+    // MUST be the current journal entry. core_journal is re-decoded and
+    // re-verified against the hash-protected snapshot on every load, so this
+    // binds the mapping identity to the authoritative immutable Core effect;
+    // a fully self-consistent rewrite of the mutable mapping/operation
+    // rows cannot forge a matching journal entry.
+    let (event_bytes, event_digest) = canonical_digest(event)?;
+    let journal: Option<(i64, Vec<u8>)> = connection
+        .query_row(
+            "SELECT journal_seq, event_jcs FROM core_journal WHERE event_digest = ?1",
+            [&event_digest],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(map_sqlite_error)?;
+    let Some((journal_seq, journal_bytes)) = journal else {
+        return Err(StorageError::Corrupt);
+    };
+    if journal_seq <= 0 || journal_bytes != event_bytes {
         return Err(StorageError::Corrupt);
     }
 
