@@ -213,12 +213,9 @@ impl<'a> ImportPipeline<'a> {
                 // here rather than disclose or reuse the first domain's
                 // record and its AssetRef.
                 if record.security_domain != security_domain {
-                    return Err(AssetError::new(
-                        AssetErrorCode::ImportIdConflict,
-                        ErrorPhase::Validate,
-                        "ImportId is already in use by another security domain".to_string(),
-                    )
-                    .with_import_id(&request.import_id));
+                    // Cause-neutral: never reveal that another domain owns the
+                    // identifier, so absence stays indistinguishable.
+                    return Err(import_id_in_use(&request.import_id));
                 }
                 return Ok(StatusResult::from_record(&record));
             }
@@ -272,8 +269,12 @@ impl<'a> ImportPipeline<'a> {
             let inserted = tx.insert_import_if_absent(&record).map_err(store_error)?;
             tx.commit().map_err(store_error)?;
             if !inserted {
-                // A concurrent mover created the same ImportId; replay it.
-                return self.return_current(&request.import_id);
+                // A concurrent importer (another service instance over the
+                // same store, or a Host restart) created the same ImportId
+                // between this caller's replay read and this insert. Only a
+                // record owned by this security domain may be replayed; a
+                // foreign-domain winner is refused without revealing it.
+                return self.return_current_owned(security_domain, &request.import_id);
             }
         }
 
@@ -290,8 +291,10 @@ impl<'a> ImportPipeline<'a> {
             );
             tx.commit().map_err(store_error)?;
             if result.is_err() {
-                // State already moved (recovery or another writer).
-                return self.return_current(&request.import_id);
+                // State already moved (recovery or another writer). Only this
+                // caller's record can have moved, because the insert above
+                // won the identifier; the owner check still runs for safety.
+                return self.return_current_owned(security_domain, &request.import_id);
             }
         }
 
@@ -362,7 +365,7 @@ impl<'a> ImportPipeline<'a> {
             );
             tx.commit().map_err(store_error)?;
             if result.is_err() {
-                return self.return_current(&request.import_id);
+                return self.return_current_owned(security_domain, &request.import_id);
             }
         }
 
@@ -406,7 +409,7 @@ impl<'a> ImportPipeline<'a> {
         if state == ImportState::Replicating {
             let _ = self.replicate(&request.import_id, &asset_id, byte_length, content_hash, now);
         }
-        self.return_current(&request.import_id)
+        self.return_current_owned(security_domain, &request.import_id)
     }
 
     /// The VERIFYING body: length, media probe, declared-type check.
@@ -959,6 +962,8 @@ impl<'a> ImportPipeline<'a> {
         Ok(())
     }
 
+    /// Read-only replay of the current record for callers already bound to
+    /// its owner at the service boundary (`cancel`, `status`, recovery).
     fn return_current(&mut self, import_id: &str) -> Result<StatusResult, AssetError> {
         let tx = self.store.transaction().map_err(store_error)?;
         let record = tx.load_import(import_id).map_err(store_error)?;
@@ -973,6 +978,46 @@ impl<'a> ImportPipeline<'a> {
             .with_import_id(import_id)),
         }
     }
+
+    /// Read-only replay of the current record, refusing when it is not owned
+    /// by `security_domain`. Every import path that returns an existing
+    /// record goes through here, so a foreign-domain winner — a concurrent
+    /// importer who created the ImportId, or the loser of an
+    /// `insert_import_if_absent` race — is never disclosed or reused.
+    fn return_current_owned(
+        &mut self,
+        security_domain: &str,
+        import_id: &str,
+    ) -> Result<StatusResult, AssetError> {
+        let tx = self.store.transaction().map_err(store_error)?;
+        let record = tx.load_import(import_id).map_err(store_error)?;
+        tx.commit().map_err(store_error)?;
+        let Some(record) = record else {
+            return Err(AssetError::new(
+                AssetErrorCode::NotFound,
+                ErrorPhase::Accept,
+                "no such import".to_string(),
+            )
+            .with_import_id(import_id));
+        };
+        if record.security_domain != security_domain {
+            return Err(import_id_in_use(import_id));
+        }
+        Ok(StatusResult::from_record(&record))
+    }
+}
+
+/// The nondisclosing refusal for an ImportId owned by another importer. The
+/// message never reveals who owns the identifier — only that it is not
+/// reusable by this caller — so a foreign security domain cannot learn that
+/// its domain-specific absence is hiding another domain's record.
+fn import_id_in_use(import_id: &str) -> AssetError {
+    AssetError::new(
+        AssetErrorCode::ImportIdConflict,
+        ErrorPhase::Validate,
+        "ImportId is already in use".to_string(),
+    )
+    .with_import_id(import_id)
 }
 
 fn display_swap(
