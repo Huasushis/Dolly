@@ -319,8 +319,8 @@ impl<'a> StoreTransaction<'a> {
                 error_outcome = ?15,
                 error_details_json = ?16,
                 replica_state = ?17,
-                replica_attempt = ?18,
-                retry_at_ms = ?19
+                replica_attempt = COALESCE(?18, replica_attempt),
+                retry_at_ms = COALESCE(?19, retry_at_ms)
             WHERE import_id = ?20 AND state = ?21"#,
             params![
                 wire_state(to),
@@ -406,7 +406,10 @@ impl<'a> StoreTransaction<'a> {
                 |r| r.get(0),
             )
             .optional()?;
-        Ok(max.unwrap_or(-1) as u64 + 1)
+        match max {
+            Some(value) => Ok(value.max(0) as u64 + 1),
+            None => Ok(0),
+        }
     }
 
     pub fn insert_asset(&self, record: &AssetRecord, now: ClockTime) -> StoreResult<()> {

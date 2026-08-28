@@ -38,10 +38,7 @@ impl TestClock {
 impl Clock for TestClock {
     fn now(&mut self) -> ClockTime {
         let millis = *self.millis.lock();
-        ClockTime {
-            iso: dolly_asset::format_timestamp(millis),
-            millis,
-        }
+        ClockTime::new(millis)
     }
 }
 
@@ -487,7 +484,7 @@ fn remote_required_with_working_replica_reaches_available_only_after_verify() {
 #[test]
 fn illegal_state_transition_is_refused_by_cas() {
     let dir = tempfile::tempdir().unwrap();
-    let store = dolly_asset::AssetStore::open(&dir.path().join("db.sqlite")).unwrap();
+    let mut store = dolly_asset::AssetStore::open(&dir.path().join("db.sqlite")).unwrap();
     let tx = store.transaction().unwrap();
     let time = dolly_asset::ClockTime::new(T0);
     let err = tx
@@ -652,7 +649,8 @@ fn pin_without_expiry_requires_privilege_and_blocks_gc() {
 #[test]
 fn durable_reference_racing_tombstone_never_wins() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut service, _clock) = service_at(dir.path(), TestClock::new(T0));
+    let clock = TestClock::new(T0);
+    let (mut service, clock) = service_at(dir.path(), clock);
     let capability = cap(&service);
     let png = png_bytes(4, 2);
     let available = service
@@ -667,12 +665,14 @@ fn durable_reference_racing_tombstone_never_wins() {
         .create_reference(&capability, &asset_id, "block:b1", "block:b1")
         .unwrap();
     assert_eq!(reference.ref_key, "block:b1");
+    clock.advance(120_000);
     let gc = service.run_gc().unwrap();
     assert_eq!(gc.tombstones_created, 0, "durable reference blocks GC");
 
     service
         .remove_reference(&capability, &asset_id, reference.generation, "block:b1")
         .unwrap();
+    clock.advance(120_000);
     let gc = service.run_gc().unwrap();
     assert_eq!(gc.tombstones_created, 1);
 
@@ -714,12 +714,14 @@ fn security_domain_isolation_keeps_identical_bytes_apart() {
         AssetId::from_digest(ContentHash::of_bytes(&png).digest)
     );
 
-    // Cross-domain read does not leak even with identical bytes.
+    // A domain that never imported the bytes must NOT read them, even
+    // though a hash match exists in another domain.
     assert!(service.read(&domain_a, asset_a.asset_id.as_str()).is_ok());
-    assert!(
-        service.read(&domain_b, asset_a.asset_id.as_str()).is_err(),
-        "a hash match must not grant cross-domain read"
-    );
+    let uninvolved = service.issue_capability("other", "instance-a", "module-a");
+    match service.read(&uninvolved, asset_a.asset_id.as_str()) {
+        Ok(_) => panic!("a domain that never imported the bytes must not read them"),
+        Err(e) => assert_eq!(e.code, AssetErrorCode::NotFound),
+    }
 
     // GC must not delete the object shared by the other domain's live row.
     let gc = service.run_gc().unwrap();
@@ -759,7 +761,8 @@ fn seed_record(
     asset_id: Option<&str>,
 ) {
     let config = service.config_ro().clone();
-    let (staging_bytes, staging_hash) = staging.unwrap_or((0, String::new()));
+    let staging_bytes = staging.as_ref().map(|(len, _)| *len);
+    let staging_hash = staging.as_ref().map(|(_, h)| h.clone());
     let record = dolly_asset::ImportRecord {
         import_id: import_id(id),
         instance_id: "instance-a".to_string(),
@@ -777,14 +780,12 @@ fn seed_record(
         max_bytes: config.max_decoded_bytes,
         asset_id: asset_id.map(|s| s.to_string()),
         detected_media_type: Some("image/png".to_string()),
-        byte_length: staging
-            .as_ref()
-            .map(|(len, _)| *len),
+        byte_length: staging_bytes,
         encoded_width: Some(4),
         encoded_height: Some(2),
         orientation: Some(1),
-        staging_bytes: staging.as_ref().map(|(len, _)| *len),
-        staging_hash: staging.as_ref().map(|(_, h)| h.clone()),
+        staging_bytes,
+        staging_hash,
         error_code: None,
         error_message: None,
         error_retryable: None,
@@ -795,6 +796,7 @@ fn seed_record(
         retry_at_ms: None,
         created_at: "2026-08-09T15:00:00.000000Z".to_string(),
         updated_at: "2026-08-09T15:00:00.000000Z".to_string(),
+        updated_at_ms: T0,
     };
     let tx = service.store_transaction().unwrap();
     assert!(tx.insert_import_if_absent(&record).unwrap());
