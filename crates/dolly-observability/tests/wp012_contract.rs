@@ -2,8 +2,8 @@ use dolly_canonical_json::Sha256Digest;
 use dolly_core_domain::{ModuleId, ModuleStorageScopeId, Timestamp};
 use dolly_observability::{
     BackupError, BoundedLogBuffer, LogError, LogLevel, LogLimits, LogPushOutcome, ModuleBackup,
-    ModuleRestoreRequest, PayloadAuthorization, ReplayError, ReplayLimits, ReplayMode,
-    ReplayRecorder, StructuredLogEvent,
+    ModuleRestoreRequest, ModuleState, ModuleStateProjection, PayloadAuthorization, ReplayError,
+    ReplayLimits, ReplayMode, ReplayRecorder, StructuredLogEvent,
 };
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -15,6 +15,15 @@ fn module_id() -> ModuleId {
 
 fn scope_id() -> ModuleStorageScopeId {
     ModuleStorageScopeId::from_uuid_v7("0198ab31-6c44-7e8a-b2bb-000000000154".parse().unwrap())
+}
+
+fn module_state_projection(
+    module: ModuleId,
+    scope: ModuleStorageScopeId,
+    revision: u64,
+    values: Vec<u64>,
+) -> ModuleStateProjection {
+    ModuleStateProjection::new(module, scope, revision, ModuleState::new(values)).unwrap()
 }
 
 fn timestamp(value: &str) -> Timestamp {
@@ -221,14 +230,9 @@ fn replay_recovery_rejects_truncated_evidence() {
 }
 
 #[test]
-fn module_backup_is_canonical_scope_bound_and_restores_data_only() {
-    let backup = ModuleBackup::new(
-        module_id(),
-        scope_id(),
-        7,
-        json!({"items": [1, 2], "name": "memory"}),
-    )
-    .unwrap();
+fn module_backup_is_canonical_scope_bound_and_restores_typed_data() {
+    let projection = module_state_projection(module_id(), scope_id(), 7, vec![1, 2]);
+    let backup = ModuleBackup::capture(&projection).unwrap();
     let bytes = backup.canonical_bytes().unwrap().into_vec();
     let recovered = ModuleBackup::recover_from_bytes(&bytes).unwrap();
     assert_eq!(recovered, backup);
@@ -237,6 +241,8 @@ fn module_backup_is_canonical_scope_bound_and_restores_data_only() {
         ModuleRestoreRequest::new(module_id(), scope_id(), 7, backup.backup_digest().clone())
             .unwrap();
     let restored = backup.restore(&request).unwrap();
+    assert_eq!(restored.state(), backup.state());
+    assert_eq!(restored.state().values(), &[1, 2]);
     assert_eq!(restored.state_bytes(), backup.state_bytes());
     assert_eq!(restored.module_id(), backup.module_id());
     assert_eq!(restored.storage_scope_id(), backup.storage_scope_id());
@@ -244,11 +250,19 @@ fn module_backup_is_canonical_scope_bound_and_restores_data_only() {
 }
 
 #[test]
-fn module_backup_restore_validates_identity_revision_and_digest() {
-    let backup = ModuleBackup::new(module_id(), scope_id(), 7, json!({"safe": true})).unwrap();
+fn module_backup_rejects_cross_module_restore_and_validates_revision_and_digest() {
+    let projection = module_state_projection(module_id(), scope_id(), 7, vec![9]);
+    let backup = ModuleBackup::capture(&projection).unwrap();
     let wrong_module = ModuleId::from_string("memory-other".to_owned()).unwrap();
     let request =
         ModuleRestoreRequest::new(wrong_module, scope_id(), 7, backup.backup_digest().clone())
+            .unwrap();
+    assert_eq!(backup.restore(&request), Err(BackupError::IdentityMismatch));
+
+    let wrong_scope =
+        ModuleStorageScopeId::from_uuid_v7("0198ab31-6c44-7e8a-b2bb-000000000155".parse().unwrap());
+    let request =
+        ModuleRestoreRequest::new(module_id(), wrong_scope, 7, backup.backup_digest().clone())
             .unwrap();
     assert_eq!(backup.restore(&request), Err(BackupError::IdentityMismatch));
 
@@ -274,27 +288,33 @@ fn module_backup_restore_validates_identity_revision_and_digest() {
 }
 
 #[test]
-fn module_backup_rejects_secrets_authority_and_partial_bytes() {
+fn module_backup_public_api_has_no_untyped_secret_capture_path() {
+    let projection = module_state_projection(module_id(), scope_id(), 1, vec![42]);
+    let backup = ModuleBackup::capture(&projection).unwrap();
+    let bytes = backup.canonical_bytes().unwrap();
+    let text = std::str::from_utf8(bytes.as_bytes()).unwrap();
+    assert!(!text.contains("g3-secret"));
+    assert!(!text.contains("\"note\""));
+    let untyped_state = json!({"values": [42], "note": "g3-secret"});
+
+    let untyped_document = json!({
+        "schema": "dolly.module-backup/v1",
+        "module_id": "memory-main",
+        "storage_scope_id": "0198ab31-6c44-7e8a-b2bb-000000000154",
+        "revision": 1,
+        "state": untyped_state,
+        "state_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "backup_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    });
+    let untyped_bytes = dolly_canonical_json::canonicalize(&untyped_document)
+        .unwrap()
+        .0
+        .into_vec();
     assert!(matches!(
-        ModuleBackup::new(
-            module_id(),
-            scope_id(),
-            1,
-            json!({"password": "plain-secret"}),
-        ),
-        Err(BackupError::ForbiddenData { .. })
-    ));
-    assert!(matches!(
-        ModuleBackup::new(
-            module_id(),
-            scope_id(),
-            1,
-            json!({"host_reservation": "opaque"}),
-        ),
-        Err(BackupError::ForbiddenData { .. })
+        ModuleBackup::recover_from_bytes(&untyped_bytes),
+        Err(BackupError::Corrupt(_))
     ));
 
-    let backup = ModuleBackup::new(module_id(), scope_id(), 1, json!({"safe": true})).unwrap();
     let bytes = backup.canonical_bytes().unwrap().into_vec();
     assert!(matches!(
         ModuleBackup::recover_from_bytes(&bytes[..bytes.len() - 1]),

@@ -4,9 +4,7 @@ use dolly_canonical_json::{
 };
 use dolly_core_domain::{ModuleId, ModuleStorageScopeId};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use thiserror::Error;
-
 const MODULE_BACKUP_SCHEMA: &str = "dolly.module-backup/v1";
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -59,6 +57,116 @@ impl ModuleRestoreRequest {
         &self.backup_digest
     }
 }
+/// Typed, closed data held by one Module's durable state projection.
+///
+/// The projection contains only numeric values. It cannot represent arbitrary
+/// JSON objects, caller-defined schemas, raw bytes, callbacks, authority
+/// material, or another Module's state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModuleState {
+    values: Vec<u64>,
+}
+
+impl ModuleState {
+    pub fn new(values: Vec<u64>) -> Self {
+        Self { values }
+    }
+
+    pub fn values(&self) -> &[u64] {
+        &self.values
+    }
+}
+
+/// A Host-admitted identity, revision, and typed state for exactly one Module.
+///
+/// The identity and revision are stored inside this projection and are the
+/// only source used by [`ModuleBackup::capture`]. Callers cannot relabel a
+/// projection at backup time or add state from another Module.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModuleStateProjection {
+    module_id: ModuleId,
+    storage_scope_id: ModuleStorageScopeId,
+    revision: u64,
+    state: ModuleState,
+}
+
+impl ModuleStateProjection {
+    /// Build the projection after Host admission of one Module's state.
+    ///
+    /// The identity, storage scope, and revision must be the exact values from
+    /// that admitted state; backup capture derives all three from this value.
+    pub fn new(
+        module_id: ModuleId,
+        storage_scope_id: ModuleStorageScopeId,
+        revision: u64,
+        state: ModuleState,
+    ) -> Result<Self, BackupError> {
+        validate_revision(revision)?;
+        Ok(Self {
+            module_id,
+            storage_scope_id,
+            revision,
+            state,
+        })
+    }
+
+    pub fn module_id(&self) -> &ModuleId {
+        &self.module_id
+    }
+
+    pub fn storage_scope_id(&self) -> &ModuleStorageScopeId {
+        &self.storage_scope_id
+    }
+
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn state(&self) -> &ModuleState {
+        &self.state
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ModuleStateDocument {
+    values: Vec<u64>,
+}
+
+impl From<&ModuleState> for ModuleStateDocument {
+    fn from(state: &ModuleState) -> Self {
+        Self {
+            values: state.values.clone(),
+        }
+    }
+}
+
+impl From<ModuleStateDocument> for ModuleState {
+    fn from(document: ModuleStateDocument) -> Self {
+        Self {
+            values: document.values,
+        }
+    }
+}
+
+fn canonical_state(state: &ModuleStateDocument) -> Result<CanonicalBytes, BackupError> {
+    let canonical = canonicalize(state)
+        .map_err(|error| BackupError::Canonical(error.to_string()))?
+        .0;
+    if canonical.as_bytes().len() > MAX_MODULE_STATE_BYTES {
+        return Err(BackupError::SizeLimit {
+            kind: "Module state",
+            actual: canonical.as_bytes().len(),
+            limit: MAX_MODULE_STATE_BYTES,
+        });
+    }
+    // The fixed typed document above is the primary boundary. Keep the
+    // heuristic validator as defense in depth for future schema changes.
+    let value =
+        serde_json::to_value(state).map_err(|error| BackupError::Canonical(error.to_string()))?;
+    validate_closed_data(&value).map_err(unsafe_data)?;
+    Ok(canonical)
+}
 
 /// A read-only Module state returned after all restore checks pass.
 ///
@@ -69,7 +177,8 @@ pub struct RestoredModuleState {
     module_id: ModuleId,
     storage_scope_id: ModuleStorageScopeId,
     revision: u64,
-    state: CanonicalBytes,
+    state: ModuleState,
+    state_bytes: CanonicalBytes,
     state_digest: Sha256Digest,
     backup_digest: Sha256Digest,
 }
@@ -87,8 +196,12 @@ impl RestoredModuleState {
         self.revision
     }
 
+    pub fn state(&self) -> &ModuleState {
+        &self.state
+    }
+
     pub fn state_bytes(&self) -> &[u8] {
-        self.state.as_bytes()
+        self.state_bytes.as_bytes()
     }
 
     pub fn state_digest(&self) -> &Sha256Digest {
@@ -109,37 +222,38 @@ impl RestoredModuleState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModuleBackup {
     document: ModuleBackupDocument,
-    state: CanonicalBytes,
+    state: ModuleState,
+    canonical_state: CanonicalBytes,
 }
 
 impl ModuleBackup {
-    /// Capture one already materialized Module state as canonical JSON.
-    pub fn new(
+    /// Capture the exact identity, revision, and typed state in one Host
+    /// projection. No caller-supplied identity or state value is accepted.
+    pub fn capture(projection: &ModuleStateProjection) -> Result<Self, BackupError> {
+        Self::from_parts(
+            projection.module_id.clone(),
+            projection.storage_scope_id.clone(),
+            projection.revision,
+            &projection.state,
+        )
+    }
+
+    fn from_parts(
         module_id: ModuleId,
         storage_scope_id: ModuleStorageScopeId,
         revision: u64,
-        state: Value,
+        state: &ModuleState,
     ) -> Result<Self, BackupError> {
         validate_revision(revision)?;
-        validate_closed_data(&state).map_err(unsafe_data)?;
-        let state = canonicalize(&state)
-            .map_err(|error| BackupError::Canonical(error.to_string()))?
-            .0;
-        if state.as_bytes().len() > MAX_MODULE_STATE_BYTES {
-            return Err(BackupError::SizeLimit {
-                kind: "Module state",
-                actual: state.as_bytes().len(),
-                limit: MAX_MODULE_STATE_BYTES,
-            });
-        }
-        let state_digest = Sha256Digest::compute(state.as_bytes());
+        let state_document = ModuleStateDocument::from(state);
+        let canonical_state = canonical_state(&state_document)?;
+        let state_digest = Sha256Digest::compute(canonical_state.as_bytes());
         let unsigned = ModuleBackupUnsignedDocument {
             schema: MODULE_BACKUP_SCHEMA.to_owned(),
             module_id,
             storage_scope_id,
             revision,
-            state: serde_json::from_slice(state.as_bytes())
-                .map_err(|error| BackupError::Canonical(error.to_string()))?,
+            state: state_document,
             state_digest,
         };
         let backup_digest = digest_unsigned(&unsigned)?;
@@ -154,19 +268,11 @@ impl ModuleBackup {
                 limit: MAX_MODULE_BACKUP_BYTES,
             });
         }
-        Ok(Self { document, state })
-    }
-
-    /// Capture any serializable state using the same closed data checks.
-    pub fn capture<T: Serialize>(
-        module_id: ModuleId,
-        storage_scope_id: ModuleStorageScopeId,
-        revision: u64,
-        state: &T,
-    ) -> Result<Self, BackupError> {
-        let state = serde_json::to_value(state)
-            .map_err(|error| BackupError::StateEncoding(error.to_string()))?;
-        Self::new(module_id, storage_scope_id, revision, state)
+        Ok(Self {
+            document,
+            state: state.clone(),
+            canonical_state,
+        })
     }
 
     pub fn module_id(&self) -> &ModuleId {
@@ -181,12 +287,12 @@ impl ModuleBackup {
         self.document.revision
     }
 
-    pub fn state(&self) -> &Value {
-        &self.document.state
+    pub fn state(&self) -> &ModuleState {
+        &self.state
     }
 
     pub fn state_bytes(&self) -> &[u8] {
-        self.state.as_bytes()
+        self.canonical_state.as_bytes()
     }
 
     pub fn state_digest(&self) -> &Sha256Digest {
@@ -206,10 +312,8 @@ impl ModuleBackup {
 
     pub fn verify_integrity(&self) -> Result<(), BackupError> {
         validate_document(&self.document)?;
-        let canonical_state = canonicalize(&self.document.state)
-            .map_err(|error| BackupError::Canonical(error.to_string()))?
-            .0;
-        if canonical_state.as_bytes() != self.state.as_bytes() {
+        let expected_state = canonical_state(&self.document.state)?;
+        if expected_state.as_bytes() != self.canonical_state.as_bytes() {
             return Err(BackupError::DigestMismatch("state bytes"));
         }
         Ok(())
@@ -241,6 +345,7 @@ impl ModuleBackup {
             storage_scope_id: self.storage_scope_id().clone(),
             revision: self.revision(),
             state: self.state.clone(),
+            state_bytes: self.canonical_state.clone(),
             state_digest: self.state_digest().clone(),
             backup_digest: self.backup_digest().clone(),
         })
@@ -273,10 +378,13 @@ impl ModuleBackup {
             ));
         }
         validate_document(&document)?;
-        let state = canonicalize(&document.state)
-            .map_err(|error| BackupError::Canonical(error.to_string()))?
-            .0;
-        Ok(Self { document, state })
+        let canonical_state = canonical_state(&document.state)?;
+        let state = ModuleState::from(document.state.clone());
+        Ok(Self {
+            document,
+            state,
+            canonical_state,
+        })
     }
 }
 
@@ -287,7 +395,7 @@ struct ModuleBackupDocument {
     module_id: ModuleId,
     storage_scope_id: ModuleStorageScopeId,
     revision: u64,
-    state: Value,
+    state: ModuleStateDocument,
     state_digest: Sha256Digest,
     backup_digest: Sha256Digest,
 }
@@ -323,7 +431,7 @@ struct ModuleBackupUnsignedDocument {
     module_id: ModuleId,
     storage_scope_id: ModuleStorageScopeId,
     revision: u64,
-    state: Value,
+    state: ModuleStateDocument,
     state_digest: Sha256Digest,
 }
 
@@ -340,17 +448,7 @@ fn validate_document(document: &ModuleBackupDocument) -> Result<(), BackupError>
         ));
     }
     validate_revision(document.revision)?;
-    validate_closed_data(&document.state).map_err(unsafe_data)?;
-    let state = canonicalize(&document.state)
-        .map_err(|error| BackupError::Canonical(error.to_string()))?
-        .0;
-    if state.as_bytes().len() > MAX_MODULE_STATE_BYTES {
-        return Err(BackupError::SizeLimit {
-            kind: "Module state",
-            actual: state.as_bytes().len(),
-            limit: MAX_MODULE_STATE_BYTES,
-        });
-    }
+    let state = canonical_state(&document.state)?;
     let manifest = canonicalize(document)
         .map_err(|error| BackupError::Canonical(error.to_string()))?
         .0;
@@ -397,8 +495,6 @@ pub enum BackupError {
     },
     #[error("Module backup contains forbidden {kind} at {path}")]
     ForbiddenData { path: String, kind: String },
-    #[error("backup state encoding failed: {0}")]
-    StateEncoding(String),
     #[error("canonical Module backup encoding failed: {0}")]
     Canonical(String),
     #[error("corrupt Module backup: {0}")]
