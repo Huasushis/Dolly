@@ -10,7 +10,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::hash::Hash;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use dolly_canonical_json::{Sha256Digest, canonicalize};
 use dolly_core_domain::{ExtensionId, WorkerEpoch};
@@ -835,6 +835,43 @@ impl SecretProvider for InMemorySecretProvider {
 struct GateState {
     active_generation: i64,
     stopped: bool,
+    active_in_flight: usize,
+}
+
+#[derive(Debug)]
+struct AuthorityGate {
+    state: Mutex<GateState>,
+    drained: Condvar,
+}
+
+impl AuthorityGate {
+    fn new(active_generation: i64) -> Self {
+        Self {
+            state: Mutex::new(GateState {
+                active_generation,
+                stopped: false,
+                active_in_flight: 0,
+            }),
+            drained: Condvar::new(),
+        }
+    }
+}
+
+struct AuthorityInFlight {
+    gate: Arc<AuthorityGate>,
+}
+
+impl Drop for AuthorityInFlight {
+    fn drop(&mut self) {
+        let mut gate = match self.gate.state.lock() {
+            Ok(gate) => gate,
+            Err(error) => error.into_inner(),
+        };
+        gate.active_in_flight = gate.active_in_flight.saturating_sub(1);
+        if gate.active_in_flight == 0 {
+            self.gate.drained.notify_all();
+        }
+    }
 }
 
 /// Host authority that combines exact policy, sealed secret use, and a stop
@@ -844,7 +881,7 @@ pub struct HostExternalIoAuthority {
     owner: SecretOwner,
     policy: Arc<ExternalIoPolicy>,
     secrets: HostSecretAuthority,
-    gate: Arc<Mutex<GateState>>,
+    gate: Arc<AuthorityGate>,
 }
 
 impl HostExternalIoAuthority {
@@ -875,10 +912,7 @@ impl HostExternalIoAuthority {
             owner,
             policy: Arc::new(policy),
             secrets,
-            gate: Arc::new(Mutex::new(GateState {
-                active_generation: generation,
-                stopped: false,
-            })),
+            gate: Arc::new(AuthorityGate::new(generation)),
         })
     }
 
@@ -902,36 +936,78 @@ impl HostExternalIoAuthority {
         bytes: &[u8],
     ) -> Result<(), ExternalIoError> {
         let owner = SecretOwner::from_premise(premise)?;
-        if owner != self.owner {
+        self.provision_for_owner(&owner, reference, bytes)
+    }
+
+    fn provision_for_owner(
+        &self,
+        owner: &SecretOwner,
+        reference: SecretRef,
+        bytes: &[u8],
+    ) -> Result<(), ExternalIoError> {
+        if owner != &self.owner {
             return Err(ExternalIoError::StaleGeneration);
         }
         self.owner
             .check_live()
             .map_err(|_| ExternalIoError::StaleGeneration)?;
-        let gate = self
+        let lifecycle_in_flight = self
+            .owner
+            .lifecycle
+            .as_ref()
+            .map(DaemonLifecycleToken::begin_in_flight)
+            .transpose()
+            .map_err(map_lifecycle_error)?;
+        if let Some(scope) = &lifecycle_in_flight {
+            scope.check().map_err(map_lifecycle_error)?;
+        }
+        let _authority_in_flight = self.begin_in_flight(self.owner.extension_generation)?;
+        if let Some(scope) = &lifecycle_in_flight {
+            scope.check().map_err(map_lifecycle_error)?;
+        }
+        self.secrets
+            .provision(&self.owner, reference, bytes)
+            .map_err(|_| ExternalIoError::AuthorityUnavailable)
+    }
+
+    fn begin_in_flight(&self, generation: i64) -> Result<AuthorityInFlight, ExternalIoError> {
+        let mut gate = self
             .gate
+            .state
             .lock()
             .map_err(|_| ExternalIoError::AuthorityUnavailable)?;
         if gate.stopped {
             return Err(ExternalIoError::Stopped);
         }
-        if gate.active_generation != self.owner.extension_generation {
+        if gate.active_generation != generation {
             return Err(ExternalIoError::StaleGeneration);
         }
-        drop(gate);
-        self.secrets
-            .provision(&self.owner, reference, bytes)
-            .map_err(|_| ExternalIoError::AuthorityUnavailable)
+        gate.active_in_flight = gate
+            .active_in_flight
+            .checked_add(1)
+            .ok_or(ExternalIoError::AuthorityUnavailable)?;
+        Ok(AuthorityInFlight {
+            gate: Arc::clone(&self.gate),
+        })
     }
 
     pub fn policy(&self) -> &ExternalIoPolicy {
         &self.policy
     }
 
-    /// Mark the authority stopped before any later effect may enter.
+    /// Mark the authority stopped and wait for in-flight Host work to finish.
     pub fn stop(&self) {
-        if let Ok(mut gate) = self.gate.lock() {
-            gate.stopped = true;
+        let mut gate = match self.gate.state.lock() {
+            Ok(gate) => gate,
+            Err(error) => error.into_inner(),
+        };
+        gate.stopped = true;
+        self.gate.drained.notify_all();
+        while gate.active_in_flight != 0 {
+            gate = match self.gate.drained.wait(gate) {
+                Ok(gate) => gate,
+                Err(error) => error.into_inner(),
+            };
         }
     }
 
@@ -942,6 +1018,7 @@ impl HostExternalIoAuthority {
         }
         let mut gate = self
             .gate
+            .state
             .lock()
             .map_err(|_| ExternalIoError::AuthorityUnavailable)?;
         gate.active_generation = generation;
@@ -1014,6 +1091,7 @@ impl HostExternalIoAuthority {
         }
         let gate = self
             .gate
+            .state
             .lock()
             .map_err(|_| ExternalIoError::AuthorityUnavailable)?;
         if gate.stopped {
@@ -1142,16 +1220,11 @@ impl ExternalIoPermit {
                 .check()
                 .map_err(|error| ExternalIoExecutionError::Denied(map_lifecycle_error(error)))?;
         }
-        let gate =
-            self.authority.gate.lock().map_err(|_| {
-                ExternalIoExecutionError::Denied(ExternalIoError::AuthorityUnavailable)
-            })?;
-        if gate.stopped {
-            return Err(ExternalIoExecutionError::Denied(ExternalIoError::Stopped));
-        }
-        if gate.active_generation != self.generation
-            || self.authority.policy.extension_generation() != self.generation
-        {
+        let _authority_in_flight = self
+            .authority
+            .begin_in_flight(self.generation)
+            .map_err(ExternalIoExecutionError::Denied)?;
+        if self.authority.policy.extension_generation() != self.generation {
             return Err(ExternalIoExecutionError::Denied(
                 ExternalIoError::StaleGeneration,
             ));
@@ -1247,6 +1320,60 @@ fn valid_operation(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Barrier, Mutex, mpsc};
+    use std::thread;
+    use std::time::Duration;
+
+    struct BlockingSecretProvider {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+        values: Mutex<HashMap<(SecretOwner, SecretRef), Vec<u8>>>,
+    }
+
+    impl BlockingSecretProvider {
+        fn new(entered: Arc<Barrier>, release: Arc<Barrier>) -> Self {
+            Self {
+                entered,
+                release,
+                values: Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn stored_bytes(&self, owner: &SecretOwner, reference: &SecretRef) -> Option<Vec<u8>> {
+            self.values
+                .lock()
+                .ok()
+                .and_then(|values| values.get(&(owner.clone(), reference.clone())).cloned())
+        }
+    }
+
+    impl SecretProvider for BlockingSecretProvider {
+        fn provision(
+            &self,
+            owner: &SecretOwner,
+            reference: SecretRef,
+            bytes: &[u8],
+        ) -> Result<(), SecretError> {
+            self.entered.wait();
+            self.release.wait();
+            let mut values = self.values.lock().map_err(|_| SecretError::Unavailable)?;
+            values.insert((owner.clone(), reference), bytes.to_vec());
+            Ok(())
+        }
+
+        fn resolve(
+            &self,
+            owner: &SecretOwner,
+            reference: &SecretRef,
+        ) -> Result<SecretMaterial, SecretError> {
+            let values = self.values.lock().map_err(|_| SecretError::Unavailable)?;
+            values
+                .get(&(owner.clone(), reference.clone()))
+                .map(|bytes| SecretMaterial::from_bytes(bytes))
+                .ok_or(SecretError::Unavailable)
+        }
+    }
 
     #[test]
     fn secret_material_is_not_debuggable_and_resolves_only_in_a_callback() {
@@ -1284,6 +1411,80 @@ mod tests {
         assert!(!policy.allows_target(
             &ExternalTarget::new("https", "api.example.test", 443, "/v1/other").unwrap()
         ));
+    }
+
+    #[test]
+    fn stop_waits_for_in_flight_secret_provision() {
+        let owner = SecretOwner::for_test(
+            "org.example.extension",
+            "module-one",
+            "connection-one",
+            1,
+            4,
+        );
+        let reference: SecretRef = "secret://vault/race".parse().expect("reference");
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let provider = Arc::new(BlockingSecretProvider::new(
+            Arc::clone(&entered),
+            Arc::clone(&release),
+        ));
+        let mut policy = ExternalIoPolicy::new("org.example.extension", 1, 4).unwrap();
+        policy.allow_operation("read").unwrap();
+        let authority =
+            HostExternalIoAuthority::from_test(policy, HostSecretAuthority::new(provider.clone()));
+
+        let provision_authority = authority.clone();
+        let provision_owner = owner.clone();
+        let provision_reference = reference.clone();
+        let provision = thread::spawn(move || {
+            provision_authority.provision_for_owner(
+                &provision_owner,
+                provision_reference,
+                b"race-secret",
+            )
+        });
+        entered.wait();
+        assert_eq!(provider.stored_bytes(&owner, &reference), None);
+
+        let (stop_started_sender, stop_started_receiver) = mpsc::channel();
+        let (stop_finished_sender, stop_finished_receiver) = mpsc::channel();
+        let stop_authority = authority.clone();
+        let stopper = thread::spawn(move || {
+            stop_started_sender.send(()).expect("stop start");
+            stop_authority.stop();
+            stop_finished_sender.send(()).expect("stop finish");
+        });
+        stop_started_receiver.recv().expect("stop thread");
+
+        let mut gate = authority.gate.state.lock().expect("authority gate");
+        while !gate.stopped {
+            gate = authority.gate.drained.wait(gate).expect("authority drain");
+        }
+        assert_eq!(gate.active_in_flight, 1);
+        assert!(matches!(
+            stop_finished_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        drop(gate);
+
+        release.wait();
+        assert!(provision.join().expect("provision thread").is_ok());
+        stop_finished_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stop completion");
+        stopper.join().expect("stopper thread");
+
+        assert_eq!(
+            provider.stored_bytes(&owner, &reference),
+            Some(b"race-secret".to_vec())
+        );
+        let after_stop = authority.provision_for_owner(&owner, reference.clone(), b"after-stop");
+        assert!(matches!(after_stop, Err(ExternalIoError::Stopped)));
+        assert_eq!(
+            provider.stored_bytes(&owner, &reference),
+            Some(b"race-secret".to_vec())
+        );
     }
 
     #[test]
