@@ -15,6 +15,7 @@ members = [
     "crates/dolly-observability",
     "crates/dolly-worker",
     "crates/dolly-local-daemon",
+    "crates/dolly-channel",
 ]
 
 [workspace.package]
