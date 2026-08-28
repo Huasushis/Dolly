@@ -7,7 +7,7 @@
 //! links; deletion/tamper never reads as false Absent/Committed), idempotent
 //! replay/conflict over the ordered target Pages, and real rollback/recovery.
 
-use dolly_canonical_json::CanonicalJsonValue;
+use dolly_canonical_json::{CanonicalJsonValue, ParseLimits, canonicalize, deserialize_core_json};
 use dolly_core_domain::{
     HostIngressErrorCode, HostIngressKind, HostIngressStatus, HostIngressStatusRequest,
     HostIngressSubmitOutcome, HostIngressSubmitRequest, PageId,
@@ -97,6 +97,7 @@ fn graph(module_ids: &[&str], receiver_input_pages: &[&str]) -> Value {
                 "module_id": module_id,
                 "descriptor_revision": 1,
                 "source_descriptor_digest": digest(&descriptor(module_id)),
+                "owner_extension_id": EXTENSION_ID,
                 "value": descriptor(module_id)
             }),
         );
@@ -702,12 +703,13 @@ fn non_lexical_target_order_commits_reconciles_replays_and_conflicts() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn live_grant_under_another_extension_cannot_reuse_module_outputs() {
+fn live_grant_under_another_extension_cannot_reuse_module_outputs_even_with_identical_descriptor() {
     let body = graph(&[MODULE_ID, MODULE_B_ID], &[]);
     let mut harness = Harness::new("cross-extension");
-    // A second Extension holds a live grant for the SAME module id but pins
-    // its own (different) descriptor; it must not reuse this Module's graph
-    // outputs even though its graph revision/digest match.
+    // A second Extension holds a live grant for the SAME module id and pins
+    // the byte-IDENTICAL descriptor digest and graph as the owning
+    // Extension. It must still be rejected: graph admission names the
+    // authoritative Extension owner, and the grant's Extension is not it.
     {
         let mut store = SqliteCoreStore::new(&mut harness.connection).unwrap();
         store
@@ -717,7 +719,7 @@ fn live_grant_under_another_extension_cannot_reuse_module_outputs() {
                 MODULE_ID,
                 1,
                 1,
-                &digest(&json!({"module_id": MODULE_ID, "kind": "other-extension"})),
+                &digest(&descriptor(MODULE_ID)),
                 1,
                 &digest(&json!({"manifest": 1})),
                 1,
@@ -737,6 +739,10 @@ fn live_grant_under_another_extension_cannot_reuse_module_outputs() {
         .expect_err("a grant under another Extension must not reuse this Module's outputs");
     assert_eq!(error.code(), HostIngressErrorCode::NotAuthorized);
     assert_eq!(mapping_rows(&mut harness.connection), 0);
+
+    // The owning Extension's grant still works.
+    let (mapping, _) = committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap());
+    assert_eq!(mapping.extension_id, EXTENSION_ID);
 }
 
 #[test]
@@ -768,6 +774,157 @@ fn substituted_consistent_command_identity_is_rejected() {
     let error = status(&mut harness.connection, &harness.authority, &harness.grant, "msg-1")
         .expect_err("a substituted command identity must fail closed");
     assert_eq!(error.code(), HostIngressErrorCode::Corrupt);
+}
+
+#[test]
+fn fully_canonical_self_consistent_substitution_reaches_the_immutable_effect_link() {
+    let mut harness = Harness::new("canonical-substitution");
+    let incoming =
+        request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
+    let (mapping, _) = committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap());
+
+    // Reconstruct the exact committed command and read the real stored
+    // transition so the forged records are canonically self-consistent:
+    // matching request digest, transition digest, state hash/projection, the
+    // single IngressCommitted event, reply, outcome, error, and safety stop.
+    fn command_for(
+        ingress_key: &str,
+        operation_digest: &str,
+        block_id: &str,
+        pages: &[String],
+        payload: &CanonicalJsonValue,
+        command_id: &str,
+    ) -> dolly_core_reducer::CoreCommand {
+        dolly_core_reducer::CoreCommand::Ingress(dolly_core_reducer::IngressCommand {
+            command_id: command_id.to_owned(),
+            runtime_source: "org.dolly.channel#receiver#0198ab31-6c44-7e8a-b2bb-000000000110".into(),
+            ingress_key: ingress_key.to_owned(),
+            operation_digest: operation_digest.to_owned(),
+            block_id: block_id.to_owned(),
+            block: serde_json::to_value(payload).expect("payload serializes"),
+            pages: pages.to_vec(),
+        })
+    }
+    let input = dolly_core_reducer::EnvironmentInput {
+        now: "2026-08-28T00:00:00.000000Z".into(),
+        ..Default::default()
+    };
+    let real_transition_jcs: Vec<u8> = harness
+        .connection
+        .query_row(
+            "SELECT transition_jcs FROM core_operations WHERE command_id = ?1",
+            [&mapping.command_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let transition_value: serde_json::Value = deserialize_core_json(
+        &real_transition_jcs,
+        ParseLimits::semantic(64).unwrap(),
+    )
+    .unwrap();
+    let real_transition: dolly_core_reducer::Transition =
+        serde_json::from_value(transition_value).unwrap();
+
+    // Forge new minted identities and a new command/event, keeping every
+    // digest-protected anchor (snapshot state, block, ingress record)
+    // identical so the forged records are canonically self-consistent.
+    let forged_ingress_id = "0198ab31-6c44-7e8a-b2bb-00000000abcd";
+    let forged_command_id = format!("host-ingress-{}-{forged_ingress_id}", mapping.ingress_key);
+    let forged_command = command_for(
+        &mapping.ingress_key,
+        &mapping.operation_digest,
+        &mapping.block_id,
+        &mapping.target_page_ids,
+        &mapping.payload,
+        &forged_command_id,
+    );
+    let forged_request_digest = canonicalize(&json!({
+        "command": serde_json::to_value(&forged_command).unwrap(),
+        "input": serde_json::to_value(&input).unwrap(),
+    }))
+    .unwrap()
+    .1
+    .to_canonical_string();
+
+    let mut forged_transition = real_transition.clone();
+    forged_transition.events[0].command_id = forged_command_id.clone();
+    let (forged_transition_jcs, forged_transition_digest) = {
+        let value = serde_json::to_value(&forged_transition).unwrap();
+        let (bytes, digest) = canonicalize(&value).unwrap();
+        (bytes.into_vec(), digest.to_canonical_string())
+    };
+
+    let mut forged_mapping = mapping.clone();
+    forged_mapping.ingress_id = forged_ingress_id.into();
+    forged_mapping.command_id = forged_command_id.clone();
+    let (forged_mapping_jcs, forged_mapping_digest) = {
+        let value = serde_json::to_value(&forged_mapping).unwrap();
+        let (bytes, digest) = canonicalize(&value).unwrap();
+        (bytes.into_vec(), digest.to_canonical_string())
+    };
+
+    // Rewrite the mutable rows consistently: canonical mapping bytes/digest,
+    // indexed ingress/command ids, operation request/transition digests and
+    // transition bytes, and the transition event command id.
+    harness
+        .connection
+        .execute(
+            "UPDATE host_ingress_mappings
+             SET ingress_id = ?2, command_id = ?3, mapping_jcs = ?4, mapping_digest = ?5
+             WHERE ingress_key = ?1",
+            rusqlite::params![
+                &mapping.ingress_key,
+                forged_ingress_id,
+                &forged_command_id,
+                &forged_mapping_jcs,
+                &forged_mapping_digest,
+            ],
+        )
+        .unwrap();
+    harness
+        .connection
+        .execute(
+            "UPDATE core_operations
+             SET command_id = ?2, request_digest = ?3, transition_digest = ?4, transition_jcs = ?5
+             WHERE command_id = ?1",
+            rusqlite::params![
+                &mapping.command_id,
+                &forged_command_id,
+                &forged_request_digest,
+                &forged_transition_digest,
+                &forged_transition_jcs,
+            ],
+        )
+        .unwrap();
+
+    // Every mutable row is now internally consistent; the ONLY immutable
+    // anchors left are the journal entry and the hash-protected Core state.
+    // The forged event has no journal entry, so the verifier must fail at the
+    // effect-link stage with Corrupt — never Absent, never Committed.
+    let error = status(&mut harness.connection, &harness.authority, &harness.grant, "msg-1")
+        .expect_err("a fully self-consistent substitution must corrupt at the immutable effect link");
+    assert_eq!(error.code(), HostIngressErrorCode::Corrupt);
+
+    // The authoritative journal entry (immutable via the hash-protected Core
+    // state) still records the REAL command id, never the forged one.
+    let journal_contains_real: i64 = harness
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM core_journal WHERE command_id = ?1",
+            [&mapping.command_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let journal_contains_forged: i64 = harness
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM core_journal WHERE event_digest = ?1",
+            [&forged_mapping_digest],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(journal_contains_real, 1, "journal keeps the real command id");
+    assert_eq!(journal_contains_forged, 0, "the forged event has no journal entry");
 }
 
 // ---------------------------------------------------------------------------
