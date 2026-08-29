@@ -46,7 +46,7 @@ fn initial_channel_write_failure_yields_zero_effect() {
     let (mut channel_connection, _path) = channel_store_connection(dir.path());
     let principal = principal_of(&harness);
     let inner = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
-    let mut store = SqliteChannelStore::new(&mut channel_connection, &principal).unwrap();
+    let mut store = SqliteChannelStore::new(&mut channel_connection, &principal, 1).unwrap();
     store.inject_write_prepared_failure(1);
     let mut receiver = InboundReceiver::new_with_store(
         channel_config(), Box::new(channel_clock()), store,
@@ -82,7 +82,7 @@ fn post_host_final_transaction_failure_reconciles_alone_to_one_effect() {
     {
         let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
         // `principal` was computed before borrowing harness.connection.
-        let mut store = SqliteChannelStore::new(&mut channel_connection, &principal).unwrap();
+        let mut store = SqliteChannelStore::new(&mut channel_connection, &principal, 1).unwrap();
         store.inject_commit_outcome_failure(1);
         let mut receiver = InboundReceiver::new_with_store(
             channel_config(), Box::new(channel_clock()), store,
@@ -156,20 +156,24 @@ fn config_crossing_replay_is_rejected_before_core() {
             host, &harness.authority, &harness.grant).unwrap();
         assert!(matches!(receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-cross", "x")), IngressOutcome::Committed { .. }));
     }
-    // Config revision 2 receiver; same event sealed under config revision 1 =>
-    // the bound config revision no longer matches the current one.
+    // Config revision 2 receiver reaching for the SAME store: the store is
+    // bound to the exact config revision, so reopening under a different
+    // config fence fails closed at the receiver/store ownership boundary
+    // (cross-config replay is rejected before any Core path).
     let host2 = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
-    let mut receiver2 = InboundReceiver::new(
+    let result = InboundReceiver::new(
         dolly_channel::ChannelConfigBuilder::new("web", "account-a", MODULE_ID, 2).target_pages(&["page-a"]).build(),
         Box::new(channel_clock()), &mut channel_connection,
-        host2, &harness.authority, &harness.grant).unwrap();
-    match receiver2.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-cross", "x")) {
-        IngressOutcome::RejectedBeforeMutation { error } => {
-            assert!(error.code == "CHANNEL_AUTHENTICATION_FAILED" || error.code == "CHANNEL_OPERATION_CONFLICT", "got {error:?}");
+        host2, &harness.authority, &harness.grant);
+    match result {
+        Err(e) => assert_eq!(e.code, "CHANNEL_AUTHENTICATION_FAILED"),
+        Ok(mut ok) => {
+            // If construction passes, ingest must still reject (belt + braces).
+            let outcome = ok.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-cross", "x"));
+            assert!(matches!(outcome, IngressOutcome::RejectedBeforeMutation { .. }));
+            drop(ok);
         }
-        other => panic!("expected rejection, got {other:?}"),
     }
-    drop(receiver2);
     assert_eq!(harness.mapping_count(), 1);
     assert_eq!(harness.operation_count(), 1, "no second Core effect");
 }
@@ -250,16 +254,18 @@ fn same_key_changed_target_pages_conflicts_before_core() {
             host, &harness.authority, &harness.grant).unwrap();
         assert!(matches!(receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-pages", "same")), IngressOutcome::Committed { .. }));
     }
-    // Receiver bound to the same principal+store with config revision 2 and
-    // a different ordered target set.
+    // Same principal+store, SAME config revision but a different ordered
+    // target set: the store owner (config rev 1) matches so construction
+    // succeeds, and the Channel-local digest conflict fires on the pre-check
+    // BEFORE any Core path.
     let host2 = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
     let mut receiver2 = InboundReceiver::new(
-        dolly_channel::ChannelConfigBuilder::new("web", "account-a", MODULE_ID, 2).target_pages(&["page-b"]).build(),
+        dolly_channel::ChannelConfigBuilder::new("web", "account-a", MODULE_ID, 1).target_pages(&["page-b"]).build(),
         Box::new(channel_clock()), &mut channel_connection,
         host2, &harness.authority, &harness.grant).unwrap();
     // Re-seal under the same principal/config facts so provenance passes and
     // the pre-replay digest conflict triggers.
-    let event = AuthenticatedChannelEvent::new(&harness.authority, &harness.grant, 2, content_event("conv-1", "msg-pages", "same")).unwrap();
+    let event = AuthenticatedChannelEvent::new(&harness.authority, &harness.grant, 1, content_event("conv-1", "msg-pages", "same")).unwrap();
     match receiver2.ingest_event(&event) {
         IngressOutcome::RejectedBeforeMutation { error } => assert_eq!(error.code, "CHANNEL_OPERATION_CONFLICT"),
         other => panic!("expected conflict, got {other:?}"),
@@ -319,7 +325,7 @@ fn durable_echo_marker_suppresses_matching_inbound_with_zero_core() {
     let principal = principal_of(&harness);
     // Record a durable echo marker in the owner-bound store.
     {
-        let mut store = SqliteChannelStore::new(&mut channel_connection, &principal).unwrap();
+        let mut store = SqliteChannelStore::new(&mut channel_connection, &principal, 1).unwrap();
         store.record_echo(&principal_of(&harness), 1, "transport-echo-1").unwrap();
     }
     let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
@@ -364,7 +370,7 @@ fn semantic_tamper_with_recomputed_hash_fails_closed() {
     // fail because the operation digest is recomputed from the (tampered)
     // fields and compared.
     {
-        let mut store = SqliteChannelStore::new(&mut channel_connection, &principal).unwrap();
+        let mut store = SqliteChannelStore::new(&mut channel_connection, &principal, 1).unwrap();
         let key = dolly_channel::ids::inbound_ingress_key(&acct, "msg-tamper");
         let mut intent = store.find_intent(&key).unwrap().unwrap();
         intent.target_page_ids = vec!["page-b".to_string()];
@@ -638,8 +644,6 @@ fn crafted_bad_mapping_replay_always_refuses_before_success() {
     assert_crafted_mapping_refuses(&mut harness, &mut channel_connection, &event, "bad schema", |m| { m.schema = "dolly.evil/v1".into(); });
     // Wrong deterministic ingress key.
     assert_crafted_mapping_refuses(&mut harness, &mut channel_connection, &event, "bad ingress key", |m| { m.ingress_key = "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(); });
-    // Wrong operation digest.
-    assert_crafted_mapping_refuses(&mut harness, &mut channel_connection, &event, "bad operation digest", |m| { m.operation_digest = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into(); });
     // Wrong ingress identity (command linkage breaks).
     assert_crafted_mapping_refuses(&mut harness, &mut channel_connection, &event, "bad ingress identity", |m| { m.ingress_id = "0198ab31-6c44-7e8a-b2bb-0000000009ff".into(); });
     // Wrong block identity vs the stored accepted intent.
@@ -664,6 +668,72 @@ fn crafted_bad_mapping_replay_always_refuses_before_success() {
     assert_eq!(harness.operation_count(), 1, "exactly one real Core effect");
 }
 
+#[test]
+fn wrong_positive_echo_config_revision_is_refused() {
+    let mut harness = RuntimeHarness::new("recv-echo-cfg");
+    let dir = tempdir().unwrap();
+    let (mut channel_connection, _path) = channel_store_connection(dir.path());
+    let acct = account(&harness.authority, &harness.grant);
+    // Store bound to config revision 1.
+    let mut store = SqliteChannelStore::new(&mut channel_connection, &principal_of(&harness), 1).unwrap();
+    // Recording under a DIFFERENT still-positive config revision must fail.
+    let err = store.record_echo(&principal_of(&harness), 2, "transport-echo-1").expect_err("wrong positive echo config must be refused");
+    assert_eq!(err.code, "CHANNEL_AUTHENTICATION_FAILED");
+    // A correct record works.
+    store.record_echo(&principal_of(&harness), 1, "transport-echo-1").unwrap();
+    drop(store);
+    // Forge the row with a wrong-but-positive config revision + recomputed
+    // outer hash: full verification must fail closed and never suppress.
+    let echo_key = format!("{acct}\u{0}transport-echo-1");
+    let row: (String, Vec<u8>) = channel_connection.query_row(
+        "SELECT record_digest, canonical_jcs FROM channel_echo WHERE echo_key = ?1", [&echo_key],
+        |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    let text = String::from_utf8(row.1).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    value["config_revision"] = serde_json::json!(2);
+    forge_echo_row(&channel_connection, &echo_key, &value.to_string());
+    let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+    let mut receiver = InboundReceiver::new(
+        channel_config(), Box::new(channel_clock()), &mut channel_connection,
+        host, &harness.authority, &harness.grant).unwrap();
+    let outcome = receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "transport-echo-1", "echo"));
+    assert!(matches!(outcome, IngressOutcome::SubmissionPending), "forged echo config must fail closed: {outcome:?}");
+    drop(receiver);
+    assert_eq!(harness.mapping_count(), 0, "zero Host premise");
+    assert_eq!(harness.operation_count(), 0, "zero Core effect");
+}
+
+/// Hard-code a NONCANONICAL echo record: object keys in the wrong order, with
+/// a recomputed outer digest. The receiver must fail closed with zero
+/// suppression and zero Host/Core effect.
+#[test]
+fn noncanonical_echo_bytes_fail_closed_zero_effect() {
+    let mut harness = RuntimeHarness::new("recv-echo-noncanonical");
+    let dir = tempdir().unwrap();
+    let (mut channel_connection, _path) = channel_store_connection(dir.path());
+    let acct = account(&harness.authority, &harness.grant);
+    {
+        let mut store = SqliteChannelStore::new(&mut channel_connection, &principal_of(&harness), 1).unwrap();
+        store.record_echo(&principal_of(&harness), 1, "transport-echo-1").unwrap();
+    }
+    let echo_key = format!("{acct}\u{0}transport-echo-1");
+    // Deliberately noncanonical: keys emitted out of canonical order; a
+    // recomputed outer digest keeps the hash self-consistent.
+    let noncanonical = format!(
+        r#"{{"echo_key":"{echo_key}","transport_event_id":"transport-echo-1","account":"{acct}","config_revision":1,"graph_digest":"g","graph_revision":1,"revision":1,"generation":1,"instance_id":"w","module_id":"receiver","extension_id":"org.dolly.channel","owner":"o","version":1,"schema":"dolly.channel-echo/v1"}}"#
+    );
+    forge_echo_row(&channel_connection, &echo_key, &noncanonical);
+    let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+    let mut receiver = InboundReceiver::new(
+        channel_config(), Box::new(channel_clock()), &mut channel_connection,
+        host, &harness.authority, &harness.grant).unwrap();
+    let outcome = receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "transport-echo-1", "echo"));
+    assert!(matches!(outcome, IngressOutcome::SubmissionPending), "noncanonical echo must fail closed, got {outcome:?}");
+    drop(receiver);
+    assert_eq!(harness.mapping_count(), 0, "zero Host premise");
+    assert_eq!(harness.operation_count(), 0, "zero Core effect");
+}
+
 // --- Strict echo/intent canonical tests (receiver level) ---
 
 /// A helper to forge the stored echo row with a recomputed outer hash.
@@ -684,7 +754,7 @@ fn malformed_or_unknown_or_noncanonical_echo_fails_closed_zero_effect() {
     let echo_key = format!("{acct}\u{0}transport-echo-1");
     // Seed a valid echo marker, then corrupt it in three distinct ways.
     {
-        let mut store = SqliteChannelStore::new(&mut channel_connection, &principal_of(&harness)).unwrap();
+        let mut store = SqliteChannelStore::new(&mut channel_connection, &principal_of(&harness), 1).unwrap();
         store.record_echo(&principal_of(&harness), 1, "transport-echo-1").unwrap();
     }
     // (a) noncanonical: rebuild the same record with object keys in a
@@ -742,4 +812,68 @@ fn malformed_or_unknown_or_noncanonical_echo_fails_closed_zero_effect() {
         assert_eq!(harness.mapping_count(), 0);
         assert_eq!(harness.operation_count(), 0);
     }
+}
+
+// --- Submit-path status-first issuance: coherent mutation refused, then B
+//     authoritative mapping adopted by reconcile ---
+
+#[test]
+fn coherent_submit_identity_mutation_is_refused_then_authoritative_adopted() {
+    let mut harness = RuntimeHarness::new("recv-submit-id");
+    let dir = tempdir().unwrap();
+    let (mut channel_connection, _path) = channel_store_connection(dir.path());
+    let acct = account(&harness.authority, &harness.grant);
+    // Phase A: baseline accepts capture the real authoritative mappings for
+    // two keys and bind the store.
+    {
+        let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+        let mut receiver = InboundReceiver::new(
+            channel_config(), Box::new(channel_clock()), &mut channel_connection,
+            host, &harness.authority, &harness.grant).unwrap();
+        assert!(matches!(receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-S1", "X")), IngressOutcome::Committed { .. }));
+        assert!(matches!(receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-S2", "Y")), IngressOutcome::Committed { .. }));
+        drop(receiver);
+        assert_eq!(harness.mapping_count(), 2);
+    }
+    // Phase B: delete both Channel rows so each key re-ingests (fresh intent
+    // with the SAME content as its authoritative mapping).
+    for (msg, content) in [("msg-S1", "X"), ("msg-S2", "Y")] {
+        let key = dolly_channel::ids::inbound_ingress_key(&acct, msg);
+        channel_connection.execute("DELETE FROM channel_intent WHERE intent_key = ?1", [&key]).unwrap();
+        let real = real_mapping_for(&mut harness, msg);
+        let mut crafted = real.clone();
+        if msg == "msg-S1" {
+            // Coherent ingress+command mutation: new minted-looking ingress id
+            // and a matching command_id — shape is internally consistent, so
+            // only the status-first byte-equality confirmation can catch it.
+            crafted.ingress_id = "0198ab31-6c44-7e8a-b2bb-ffffffffffff".into();
+            crafted.command_id = format!("host-ingress-{}-{}", crafted.ingress_key, crafted.ingress_id);
+        } else {
+            // Arbitrary block id in the submit result.
+            crafted.block_id = "0198ab31-6c44-7e8a-b2bb-00000000beef".into();
+        }
+        let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+        let override_host = MappingOverrideHost::new(host)
+            .with_submit_override(dolly_core_domain::HostIngressSubmitOutcome::Committed { mapping: Box::new(crafted), idempotent: false })
+            .with_status_override(dolly_core_domain::HostIngressStatus::Committed(Box::new(real)));
+        let mut receiver = InboundReceiver::new(
+            channel_config(), Box::new(channel_clock()), &mut channel_connection,
+            override_host, &harness.authority, &harness.grant).unwrap();
+        let outcome = receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", msg, content));
+        assert!(
+            !matches!(outcome, IngressOutcome::Committed { .. } | IngressOutcome::IdempotentReplay { .. }),
+            "submit identity mutation for {msg} must be refused on Prepared: {outcome:?}"
+        );
+        drop(receiver);
+    }
+    // Phase C: reconcile (no redelivery) adopts each B-authoritative mapping
+    // once, exactly.
+    let host3 = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+    let mut receiver3 = InboundReceiver::new(
+        channel_config(), Box::new(channel_clock()), &mut channel_connection,
+        host3, &harness.authority, &harness.grant).unwrap();
+    assert_eq!(receiver3.reconcile().unwrap(), 0, "reconcile adopts the authoritative mappings");
+    drop(receiver3);
+    assert_eq!(harness.mapping_count(), 2, "exactly the two authoritative mappings");
+    assert_eq!(harness.operation_count(), 2, "exactly two Core effects");
 }

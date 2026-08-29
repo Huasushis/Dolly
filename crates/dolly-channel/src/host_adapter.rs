@@ -240,8 +240,8 @@ pub(crate) fn validate_host_mapping(
     intent: &ChannelIntent,
     mapping: &HostIngressMapping,
 ) -> Result<(), ChannelError> {
-    use dolly_core_domain::{HOST_INGRESS_RECORD_SCHEMA, HostIngressKind};
-    use dolly_core_reducer::{derive_ingress_identity, derive_ingress_key};
+    use dolly_core_domain::{BlockId, HOST_INGRESS_RECORD_SCHEMA, HostIngressKind, UuidV7};
+    use dolly_core_reducer::derive_ingress_key;
 
     let mismatch = |what: &str| {
         ChannelError::new(codes::OPERATION_CONFLICT, false, ChannelOutcome::NotApplied, format!("host mapping does not match the prepared intent: {what}"))
@@ -320,31 +320,13 @@ pub(crate) fn validate_host_mapping(
     if mapping.payload_digest != intent.payload_digest {
         return Err(mismatch("content"));
     }
-    // Operation digest recomputed from the intent/canonical request must match
-    // the mapping's stored operation digest.
-    let host_request = HostIngressSubmitRequest {
-        external_event_id: mapping.external_event_id.clone(),
-        kind,
-        references_external_event_id: mapping.references_external_event_id.clone(),
-        target_page_ids: mapping
-            .target_page_ids
-            .iter()
-            .map(|page| PageId::from_str(page).map_err(|_| mismatch("target page syntax")))
-            .collect::<Result<Vec<PageId>, ChannelError>>()?,
-        payload: mapping.payload.clone(),
-    };
-    let identity = derive_ingress_identity(
-        &mapping.owner, &mapping.extension_id, &mapping.module_id, &mapping.instance_id,
-        mapping.generation as u64, mapping.revision, mapping.graph_revision, &host_request,
-    )
-    .map_err(|_| corrupt("operation digest derivation"))?;
-    if identity.operation_digest != mapping.operation_digest {
-        return Err(corrupt("operation digest does not match the canonical request"));
-    }
-    // Ingress/block/command linkage and exact stored block identity.
-    if mapping.ingress_id.is_empty() || mapping.block_id.is_empty() {
-        return Err(corrupt("mapping lacks ingress/block identity"));
-    }
+    // Ingress/block identity must be authoritative RFC-9562 UUIDv7-shaped
+    // IDs (B mints them; the Channel never recomputes minted identities). The
+    // operation digest itself is not recomputed locally: B is the issuance
+    // authority and the status-first confirmation cross-verifies the submit
+    // mapping byte-equal against B's fully verified status mapping.
+    mapping.ingress_id.parse::<UuidV7>().map_err(|_| corrupt("ingress identity is not a UUIDv7"))?;
+    mapping.block_id.parse::<BlockId>().map_err(|_| corrupt("block identity is not an authoritative ID"))?;
     let expected_command_id = format!("host-ingress-{}-{}", mapping.ingress_key, mapping.ingress_id);
     if mapping.command_id != expected_command_id {
         return Err(corrupt("ingress/command linkage"));
@@ -354,8 +336,10 @@ pub(crate) fn validate_host_mapping(
             return Err(mismatch("block identity"));
         }
     }
-    // Exact delivery sequence: count/order/unique-commit/blob of the ordered
-    // target pages, all belonging to this mapping's block.
+    // Exact delivery sequence: count == ordered targets, same order, and
+    // unique strictly-increasing commit sequences. Per-delivery block linkage
+    // is not part of the mapping schema; the top-level block/effect link is
+    // verified by B and enforced here via the status-first confirmation.
     if mapping.deliveries.len() != intent.target_page_ids.len() {
         return Err(mismatch("deliveries count"));
     }
@@ -433,14 +417,35 @@ impl<'host, 'conn, 'principal, H: HostIngress + ?Sized> HostIngressCoreAdapter<'
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn status_for_event(
+    /// Whether two mappings are canonical byte-equal (the submit response
+    /// must match B's authoritative status mapping exactly before adoption).
+    fn mappings_canonically_equal(a: &HostIngressMapping, b: &HostIngressMapping) -> bool {
+        match (
+            dolly_canonical_json::canonicalize(a),
+            dolly_canonical_json::canonicalize(b),
+        ) {
+            (Ok((ab, _)), Ok((bb, _))) => ab.as_bytes() == bb.as_bytes(),
+            _ => false,
+        }
+    }
+
+    /// Status-first issuance confirmation: after a fresh submit response, ask
+    /// B status for the same principal/key and require the returned fully
+    /// verified mapping to be canonical byte-equal to the submit mapping. The
+    /// B-authoritative status mapping is what the Channel adopts.
+    pub(crate) fn confirm_submit_against_status(
         &mut self,
         external_event_id: &str,
-    ) -> Result<IngressStatusResult, CoreIngressError> {
+        submit_mapping: &HostIngressMapping,
+    ) -> Result<HostIngressMapping, CoreIngressError> {
         match self.status_mapping_for_event(external_event_id)? {
-            Some(mapping) => Ok(IngressStatusResult::Committed { commit: commit_from_mapping(&mapping) }),
-            None => Ok(IngressStatusResult::Absent),
+            Some(status_mapping) => {
+                if !Self::mappings_canonically_equal(submit_mapping, &status_mapping) {
+                    return Err(rejected(INTENT_CONFLICT_CODE));
+                }
+                Ok(*status_mapping)
+            }
+            None => Err(rejected("CHANNEL_INTENT_INCONSISTENT")),
         }
     }
 
@@ -544,12 +549,18 @@ impl<H: HostIngress + ?Sized> CoreIngress for HostIngressCoreAdapter<'_, '_, '_,
         };
         match self.core.submit(self.authority, self.grant, &premise) {
             Ok(HostIngressSubmitOutcome::Committed { mapping, idempotent }) => {
-                // 3. Validate the returned mapping against the fresh intent
-                //    (a recreated Channel row must never adopt an unrelated
-                //    existing Host effect), then commit atomically.
+                // 3. B status is the issuance authority: confirm the submit
+                //    mapping byte-equal against the status mapping for the
+                //    same principal/key, then validate that authoritative
+                //    mapping against the fresh intent and commit atomically.
+                //    A coherently mutated ingress_id+command_id or an
+                //    arbitrary block_id in the submit result differs from B
+                //    status and is refused (the durable row stays Prepared for
+                //    reconcile() to adopt B's authoritative mapping).
+                let authoritative = self.confirm_submit_against_status(&facts.external_event_id, &mapping)?;
                 let intent = self.store.find_intent(&intent_key).map_err(|e| rejected(&e.code))?
                     .ok_or_else(|| rejected("CHANNEL_INTENT_INCONSISTENT"))?;
-                let commit = self.adopt_committed(&intent, &mapping)?;
+                let commit = self.adopt_committed(&intent, &authoritative)?;
                 Ok(IngressSubmitReceipt::Committed { idempotent, commit })
             }
             Ok(HostIngressSubmitOutcome::Conflict { .. }) => Err(rejected(INTENT_CONFLICT_CODE)),

@@ -174,7 +174,7 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
         }
         let mut config = config;
         config.transport_account = principal.account().to_string();
-        let store = SqliteChannelStore::new(connection, &principal)?;
+        let store = SqliteChannelStore::new(connection, &principal, config.revision)?;
         Ok(Self { config, clock, store, host, authority, grant, principal })
     }
 
@@ -205,7 +205,7 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
         }
         let mut config = config;
         config.transport_account = principal.account().to_string();
-        store.verify_owner_against(&principal)?;
+        store.verify_owner_against(&principal, config.revision)?;
         Ok(Self { config, clock, store, host, authority, grant, principal })
     }
 

@@ -269,17 +269,28 @@ pub struct MappingOverrideHost<H: HostIngress> {
     inner: H,
     pub last_mapping: Option<dolly_core_domain::HostIngressMapping>,
     pub status_override: Option<dolly_core_domain::HostIngressStatus>,
+    pub submit_override: Option<Result<dolly_core_domain::HostIngressSubmitOutcome, HostIngressError>>,
     pub submit_calls: u64,
     pub status_calls: u64,
 }
 
 impl<H: HostIngress> MappingOverrideHost<H> {
     pub fn new(inner: H) -> Self {
-        Self { inner, last_mapping: None, status_override: None, submit_calls: 0, status_calls: 0 }
+        Self { inner, last_mapping: None, status_override: None, submit_override: None, submit_calls: 0, status_calls: 0 }
     }
 
     pub fn with_status_override(mut self, status: dolly_core_domain::HostIngressStatus) -> Self {
         self.status_override = Some(status);
+        self
+    }
+
+    pub fn with_submit_override(mut self, outcome: dolly_core_domain::HostIngressSubmitOutcome) -> Self {
+        self.submit_override = Some(Ok(outcome));
+        self
+    }
+
+    pub fn commit_outcome(mut self, outcome: dolly_core_domain::HostIngressSubmitOutcome) -> Self {
+        self.submit_override = Some(Ok(outcome));
         self
     }
 }
@@ -288,6 +299,9 @@ impl<H: HostIngress> HostIngress for MappingOverrideHost<H> {
     fn submit(&mut self, authority: &HostConnectionAuthority, grant: &HostCapabilityGrant,
         request: &HostIngressSubmitRequest) -> Result<HostIngressSubmitOutcome, HostIngressError> {
         self.submit_calls += 1;
+        if let Some(override_outcome) = &self.submit_override {
+            return override_outcome.clone();
+        }
         let result = self.inner.submit(authority, grant, request);
         if let Ok(HostIngressSubmitOutcome::Committed { mapping, .. }) = &result {
             self.last_mapping = Some((**mapping).clone());
