@@ -331,11 +331,11 @@ impl IngressOutcome {
 // Pipeline
 // ---------------------------------------------------------------------------
 
-fn digest_of(value: &str) -> String {
+pub(crate) fn digest_of(value: &str) -> String {
     dolly_canonical_json::Sha256Digest::compute(value.as_bytes()).to_string()
 }
 
-fn build_draft(
+pub(crate) fn build_draft(
     event: &InboundEvent,
     session_id: &str,
     normalized_text: &str,
@@ -406,7 +406,7 @@ fn build_draft(
     })
 }
 
-fn draft_canonical_string(draft: &CanonicalJsonValue) -> Result<String, ChannelError> {
+pub(crate) fn draft_canonical_string(draft: &CanonicalJsonValue) -> Result<String, ChannelError> {
     canonicalize(draft)
         .map(|(bytes, _)| String::from_utf8(bytes.as_bytes().to_vec()).expect("canonical UTF-8"))
         .map_err(|_| {

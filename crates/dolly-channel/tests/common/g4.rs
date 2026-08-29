@@ -1,15 +1,15 @@
 //! Shared G4-C receiver test harness: a real Runtime connection (Core engine,
 //! Host connection, capability grants, durable Host ingress slice) plus a
-//! durable module-scoped Channel ledger store, and fault-injecting wrappers
-//! for the accepted seams.
+//! durable module-scoped Channel store, and fault-injecting wrappers for the
+//! accepted seams.
 
 #![allow(dead_code)]
 
 use std::str::FromStr;
 
 use dolly_channel::{
-    ChannelConfig, ChannelConfigBuilder, ChannelLedger, ChannelLedgerStore, EventKind,
-    InboundEvent, VirtualClock,
+    AuthenticatedChannelEvent, ChannelEventContent, ChannelLedger, ChannelStore, ChannelStoreOwner,
+    EventKind, SqliteChannelStore, VirtualClock, ids,
 };
 use dolly_core_domain::{
     HostIngressError, HostIngressErrorCode, HostIngressStatus, HostIngressStatusRequest,
@@ -85,11 +85,7 @@ pub fn graph_with_outputs(
         } else {
             vec!["page-a".to_string(), "page-b".to_string()]
         };
-        output_pages.insert((*module_id).to_owned(), serde_json::json!(pages));
-    }
-    let mut output_pages = serde_json::Map::new();
-    for module_id in module_ids {
-        output_pages.insert((*module_id).to_owned(), json!(["page-a", "page-b"]));
+        output_pages.insert((*module_id).to_owned(), json!(pages));
     }
     let mut descriptors = serde_json::Map::new();
     for module_id in module_ids {
@@ -315,6 +311,11 @@ impl RuntimeHarness {
             .unwrap();
     }
 
+    /// A mutable Core store over the harness connection for snapshot reads.
+    pub fn core_store(&mut self) -> SqliteCoreStore<'_> {
+        SqliteCoreStore::new(&mut self.connection).unwrap()
+    }
+
     pub fn mapping_count(&self) -> i64 {
         self.connection
             .query_row("SELECT COUNT(*) FROM host_ingress_mappings", [], |row| {
@@ -335,42 +336,77 @@ impl RuntimeHarness {
             )
             .unwrap()
     }
+}
 
-    /// A mutable Core store over the harness connection for snapshot reads.
-    pub fn core_store(&mut self) -> SqliteCoreStore<'_> {
-        SqliteCoreStore::new(&mut self.connection).unwrap()
+pub fn store_owner(
+    authority: &HostConnectionAuthority,
+    grant: &HostCapabilityGrant,
+) -> ChannelStoreOwner {
+    ChannelStoreOwner {
+        extension_id: grant.extension_id().to_string(),
+        module_id: grant.module_id().to_string(),
+        account: ids::channel_account(
+            authority.extension_connection_id(),
+            grant.extension_id(),
+            grant.module_id(),
+            authority.worker_epoch().as_str(),
+        ),
     }
 }
 
-pub fn channel_config() -> ChannelConfig {
-    ChannelConfigBuilder::new("web", "account-a", MODULE_ID, 1)
+pub fn channel_config() -> dolly_channel::ChannelConfig {
+    dolly_channel::ChannelConfigBuilder::new("web", "account-a", MODULE_ID, 1)
         .target_pages(&["page-a"])
         .build()
 }
 
 pub fn channel_clock() -> VirtualClock {
-    VirtualClock::at(Timestamp::from_str(CHANNEL_NOW).expect("timestamp"))
+    VirtualClock::at(Timestamp::from_str(CHANNEL_NOW).unwrap_or_else(|_| panic!("timestamp")))
 }
 
-pub fn channel_event(
-    account: &str,
+/// A sealed, already-authenticated event under the given authority/grant.
+pub fn sealed_event(
+    authority: &HostConnectionAuthority,
+    grant: &HostCapabilityGrant,
     conversation: &str,
     message_id: &str,
     text: &str,
-) -> InboundEvent {
-    InboundEvent {
+) -> AuthenticatedChannelEvent {
+    AuthenticatedChannelEvent::new(
+        authority,
+        grant,
+        content_event(conversation, message_id, text),
+    )
+    .expect("sealed event")
+}
+
+fn content_event(conversation: &str, message_id: &str, text: &str) -> ChannelEventContent {
+    ChannelEventContent {
         channel_id: "web-primary".to_string(),
         transport: "web".to_string(),
-        account: account.to_string(),
         external_conversation_id: conversation.to_string(),
         external_message_id: message_id.to_string(),
         sender_class: "user".to_string(),
-        sender_id: format!("sender-{account}"),
+        sender_id: "sender-1".to_string(),
         text: text.to_string(),
-        received_at: Timestamp::from_str(CHANNEL_NOW).expect("timestamp"),
+        received_at: Timestamp::from_str(CHANNEL_NOW).unwrap_or_else(|_| panic!("timestamp")),
         event_kind: EventKind::Message,
         references_external_message_id: None,
     }
+}
+
+/// A sealed edit event under the given authority/grant.
+pub fn sealed_edit_event(
+    authority: &HostConnectionAuthority,
+    grant: &HostCapabilityGrant,
+    message_id: &str,
+    references: &str,
+    text: &str,
+) -> AuthenticatedChannelEvent {
+    let mut content = content_event("conv-1", message_id, text);
+    content.event_kind = EventKind::Edit;
+    content.references_external_message_id = Some(references.to_string());
+    AuthenticatedChannelEvent::new(authority, grant, content).expect("sealed edit event")
 }
 
 /// Fault-injecting `HostIngress` wrapper over a real store: drops submit or
@@ -450,26 +486,86 @@ impl<H: HostIngress> HostIngress for FaultyHostIngress<H> {
     }
 }
 
-/// A `ChannelLedgerStore` that keeps the ledger only in memory (a save that
-/// never reaches durable storage), simulating a crash that loses the
-/// Channel-side durable state while the Host ingress side already committed.
-pub struct NullChannelLedgerStore {
-    state: Option<ChannelLedger>,
+/// A `ChannelLedgerStore` + `ChannelIntentStore` over a real
+/// `SqliteChannelStore` with injectable persistence failures, used to force a
+/// post-Host-commit / pre-final-save crash window.
+pub struct FailpointChannelStore<'connection> {
+    inner: SqliteChannelStore<'connection>,
+    /// Remaining Channel ledger-document saves to fail.
+    pub fail_doc_saves: u64,
+    /// Remaining prepared-intent writes to fail.
+    pub fail_prepared_writes: u64,
 }
 
-impl NullChannelLedgerStore {
-    pub fn new() -> Self {
-        Self { state: None }
+impl<'connection> FailpointChannelStore<'connection> {
+    pub fn new(inner: SqliteChannelStore<'connection>) -> Self {
+        Self {
+            inner,
+            fail_doc_saves: 0,
+            fail_prepared_writes: 0,
+        }
     }
 }
 
-impl ChannelLedgerStore for NullChannelLedgerStore {
+impl ChannelStore for FailpointChannelStore<'_> {
     fn load(&mut self) -> Result<ChannelLedger, dolly_channel::ChannelError> {
-        Ok(self.state.clone().unwrap_or_default())
+        self.inner.load()
     }
 
     fn save(&mut self, ledger: &ChannelLedger) -> Result<(), dolly_channel::ChannelError> {
-        self.state = Some(ledger.clone());
-        Ok(())
+        if self.fail_doc_saves > 0 {
+            self.fail_doc_saves -= 1;
+            return Err(dolly_channel::ChannelError::new(
+                "CHANNEL_INTERNAL",
+                false,
+                dolly_channel::ChannelOutcome::NotApplied,
+                "injected ledger-document save failure",
+            ));
+        }
+        self.inner.save(ledger)
+    }
+
+    fn find_intent(
+        &mut self,
+        intent_key: &str,
+    ) -> Result<Option<dolly_channel::ChannelIntent>, dolly_channel::ChannelError> {
+        self.inner.find_intent(intent_key)
+    }
+
+    fn write_prepared(
+        &mut self,
+        intent: &dolly_channel::ChannelIntent,
+    ) -> Result<(), dolly_channel::ChannelError> {
+        if self.fail_prepared_writes > 0 {
+            self.fail_prepared_writes -= 1;
+            return Err(dolly_channel::ChannelError::new(
+                "CHANNEL_INTERNAL",
+                false,
+                dolly_channel::ChannelOutcome::NotApplied,
+                "injected prepared-intent write failure",
+            ));
+        }
+        self.inner.write_prepared(intent)
+    }
+
+    fn settle_accepted(
+        &mut self,
+        intent_key: &str,
+        block_id: &str,
+    ) -> Result<(), dolly_channel::ChannelError> {
+        self.inner.settle_accepted(intent_key, block_id)
+    }
+
+    fn mark_rejected(
+        &mut self,
+        intent_key: &str,
+        code: &str,
+    ) -> Result<(), dolly_channel::ChannelError> {
+        self.inner.mark_rejected(intent_key, code)
+    }
+    fn list_pending(
+        &mut self,
+    ) -> Result<Vec<dolly_channel::ChannelIntent>, dolly_channel::ChannelError> {
+        self.inner.list_pending()
     }
 }
