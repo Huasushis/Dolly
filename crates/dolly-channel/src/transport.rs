@@ -5,7 +5,11 @@
 //! a recorded driver, or a production adapter). The seam communicates exactly
 //! the outcome classes the specification requires: confirmed pieces with
 //! transport message IDs, rejected pieces, and `Unknown` for timeouts or
-//! losses after bytes may have reached the transport.
+//! losses after bytes may have reached the transport. The seam is also
+//! **status-capable**: after a send whose response was lost (Dispatched), a
+//! restart calls [`ChannelTransport::status`] with the idempotency key and
+//! receives the exact transport-side outcome (confirmed/partial/unknown),
+//! never a blind resend or an age-to-unknown guess.
 
 /// One outbound piece handed to the transport.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +46,15 @@ pub enum TransportPieceOutcome {
     },
 }
 
+impl TransportPieceOutcome {
+    pub fn ordinal(&self) -> u32 {
+        match self {
+            TransportPieceOutcome::Confirmed { ordinal, .. }
+            | TransportPieceOutcome::Rejected { ordinal, .. }
+            | TransportPieceOutcome::Unknown { ordinal } => *ordinal,
+        }
+    }
+}
 
 /// The closed result of one `send` call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +72,30 @@ pub enum TransportSendResult {
     Rejected { code: String },
 }
 
+/// A status query for one previously-dispatched send whose response was lost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportStatusRequest {
+    /// The `action_id` of the original send.
+    pub action_id: String,
+    /// The idempotency key originally supplied (when supported).
+    pub idempotency_key: Option<String>,
+}
+
+/// The exact transport-side status of one previously-dispatched send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportStatusResult {
+    /// The send was confirmed; the transport IDs are known.
+    Confirmed { message_ids: Vec<String> },
+    /// The send was partially confirmed; per-piece outcomes are known.
+    Partial { pieces: Vec<TransportPieceOutcome> },
+    /// The send was rejected by the transport (nothing was delivered).
+    Rejected { code: String },
+    /// The transport does not know the outcome (response lost, timeout, or
+    /// the send was never received). The Channel MUST NOT guess; this stays
+    /// `Dispatched` and is retried status-first on the next reconcile.
+    Unknown,
+}
+
 /// The transport-facing capability and delivery seam.
 pub trait ChannelTransport {
     /// Whether the transport accepts and honors a provider-side idempotency
@@ -68,18 +105,26 @@ pub trait ChannelTransport {
     /// Deliver one send request. The result is the only observation input to
     /// ledger reconciliation; the Channel never guesses.
     fn send(&mut self, request: &TransportSendRequest) -> TransportSendResult;
+    /// Query the exact transport-side status of one previously-dispatched
+    /// send whose response was lost. Used by status-first reconciliation on
+    /// restart: the Channel calls this for every `Dispatched` row BEFORE any
+    /// decision, never blind-resends, and never age-guesses to `unknown`.
+    fn status(&mut self, request: &TransportStatusRequest) -> TransportStatusResult;
 }
 
 /// A deterministic scripted transport for tests and recorded drivers.
 ///
 /// Scripts are consumed in order; a send past the end of the script fails
 /// closed with `Timeout` (matching the specification's bias toward `unknown`
-/// over a fabricated failure).
+/// over a fabricated failure). Status scripts are consumed in order per
+/// `action_id`; a status query past the end returns `Unknown`.
 #[derive(Debug, Clone, Default)]
 pub struct ScriptedTransport {
     idempotency_supported: bool,
     script: Vec<TransportSendResult>,
     calls: Vec<TransportSendRequest>,
+    status_script: Vec<(String, TransportStatusResult)>,
+    status_calls: Vec<TransportStatusRequest>,
 }
 
 impl ScriptedTransport {
@@ -88,6 +133,8 @@ impl ScriptedTransport {
             idempotency_supported,
             script: Vec::new(),
             calls: Vec::new(),
+            status_script: Vec::new(),
+            status_calls: Vec::new(),
         }
     }
 
@@ -95,8 +142,16 @@ impl ScriptedTransport {
         self.script.push(result);
     }
 
+    pub fn push_status(&mut self, action_id: &str, result: TransportStatusResult) {
+        self.status_script.push((action_id.to_string(), result));
+    }
+
     pub fn calls(&self) -> &[TransportSendRequest] {
         &self.calls
+    }
+
+    pub fn status_calls(&self) -> &[TransportStatusRequest] {
+        &self.status_calls
     }
 }
 
@@ -111,5 +166,18 @@ impl ChannelTransport for ScriptedTransport {
             return TransportSendResult::Timeout;
         }
         self.script.remove(0)
+    }
+
+    fn status(&mut self, request: &TransportStatusRequest) -> TransportStatusResult {
+        self.status_calls.push(request.clone());
+        // Find the first matching scripted status for this action_id.
+        let pos = self
+            .status_script
+            .iter()
+            .position(|(id, _)| id == &request.action_id);
+        match pos {
+            Some(idx) => self.status_script.remove(idx).1,
+            None => TransportStatusResult::Unknown,
+        }
     }
 }

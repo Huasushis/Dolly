@@ -623,13 +623,13 @@ fn apply_transport_observations(
             }
         }
     }
-    settle_outbound_entry(config, ledger, action_id, now)
+    settle_from_outbound_entry(config, ledger, action_id, now)
 }
 
 /// Reconcile a ledger entry from its recorded piece outcomes into a terminal
 /// state and frozen `ActionResult`, or leave it pending (`dispatched`) when
 /// the outcome is still unknown.
-fn settle_outbound_entry(
+pub(crate) fn settle_from_outbound_entry(
     config: &ChannelConfig,
     ledger: &mut ChannelLedger,
     action_id: &str,
@@ -976,7 +976,7 @@ fn recover_pending_send(
         // Still unresolved; may have reached the transport. Do not guess.
         return SendDispatchResult::DispatchedPending;
     }
-    settle_outbound_entry(config, ledger, action_id, &now)
+    settle_from_outbound_entry(config, ledger, action_id, &now)
 }
 
 /// Apply late transport observations (webhook echoes, provider receipts) to a
@@ -1035,7 +1035,7 @@ pub fn observe_outbound(
             }
         }
     }
-    settle_outbound_entry(config, ledger, action_id, clock.now().as_str())
+    settle_from_outbound_entry(config, ledger, action_id, clock.now().as_str())
 }
 
 /// Whether `dispatch_send` returned a terminal result (used by tests).
