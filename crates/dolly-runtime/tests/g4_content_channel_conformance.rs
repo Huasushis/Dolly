@@ -1312,22 +1312,45 @@ fn g4_wp010_bounded_import_and_crash_recovery_round_trip() {
         .expect("durable import record survives reopen");
     assert_eq!(recovered.state, "available");
 
-    // 4. Exactly the absent contract: a status read for a never-created
-    //    import answers NotFound, not an authoritative `absent` — verified
-    //    against the actual service, so a Host could not distinguish
-    //    never-submitted from committed through the current product either.
+    // 4. The Sol-accepted Asset Host absent contract: status for a
+    //    never-created ImportId answers an authoritative explicit `absent`
+    //    StatusResult — not an error, never minting an AssetRef, carrying
+    //    no lifecycle/terminal state, and disclosing nothing beyond the
+    //    queried ImportId.
     let never_created = service
         .status(&capability, &import_id(901))
-        .expect_err("status for a never-created import must refuse");
+        .expect("status for a never-created import must answer an authoritative absent StatusResult");
     assert_eq!(
-        never_created.code, AssetErrorCode::NotFound,
-        "no authoritative absent outcome exists — only NotFound"
+        never_created.state, "absent",
+        "explicit absent state for a never-created import"
     );
+    assert!(
+        !never_created.terminal,
+        "absent must not masquerade as a terminal state"
+    );
+    assert!(
+        never_created.asset.is_none(),
+        "absent must never mint an AssetRef"
+    );
+    assert!(
+        never_created.error.is_none(),
+        "absent must not carry an error envelope"
+    );
+    assert_eq!(
+        never_created.import_id, import_id(901),
+        "absent must bind exactly the queried ImportId and disclose nothing else"
+    );
+    for masquerade in ["accepted", "available", "rejected", "cancelled"] {
+        assert_ne!(
+            never_created.state, masquerade,
+            "absent must not collide with the recorded lifecycle state {masquerade}"
+        );
+    }
 
     product_red(
         "G4-WP010-IMPORT-BOUND-001",
         seam,
-        "the exercised dolly_asset surface implements bounded ACCEPTED->AVAILABLE import, crash recovery, and returns NotFound (never an authoritative absent) for a never-created import (all proven above); this probe does not drive the runtime Core route, and no host.asset.import/status service exists that would let a committed asset_input block reach this service, so no ImportId/AssetRef can enter a committed record and no host can read absent (Asset Host seam A)",
+        "the exercised dolly_asset surface implements bounded ACCEPTED->AVAILABLE import, crash recovery, and answers the authoritative explicit absent StatusResult for a never-created import (all proven above); this probe does not drive the runtime Core route, and no host.asset.import/status service exists that would let a committed asset_input block reach this service, so no ImportId/AssetRef can enter a committed record through the runtime route and no host can observe absent across it (Asset Host seam A)",
         "WP-010 Asset Host seam (A)",
     );
 }
