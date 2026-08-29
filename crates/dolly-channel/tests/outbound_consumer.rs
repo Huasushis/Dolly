@@ -707,7 +707,7 @@ fn crash_after_prepared_before_dispatch_redispatch_and_never_duplicates() {
         send_block_for(MODULE_ID, action_id, &fixture.session, &["Hello."]),
         vec!["page-a".to_string()],
     );
-    let transport = SharedTransport::new(false); // no idempotency: pre-send CAS
+    let transport = SharedTransport::new(true); // idempotency-keyed (required)
     transport.push(TransportSendResult::AllConfirmed {
         message_ids: vec!["m-after-prepare".to_string()],
     });
@@ -757,7 +757,7 @@ fn crash_after_dispatch_marker_never_blind_resends_and_reconciles_status_first()
         send_block_for(MODULE_ID, action_id, &fixture.session, &["Hello."]),
         vec!["page-a".to_string()],
     );
-    let transport = SharedTransport::new(false); // no idempotency support
+    let transport = SharedTransport::new(true); // idempotency-keyed (required)
     transport.push(TransportSendResult::AllConfirmed {
         message_ids: vec!["m-result-crash".to_string()],
     });
@@ -962,3 +962,98 @@ fn revoked_grant_or_changed_lifecycle_fence_refuses_consume_before_any_effect() 
     let mut reopened = SqliteChannelStore::new(&mut module_conn2, &fixture.principal, 1).unwrap();
     assert!(reopened.list_pending_outbound().unwrap().is_empty());
 }
+
+/// Item 5: configured piece/token rate limiting is applied before the
+/// dispatch CAS/transport. A burst past the per-session rate is refused
+/// retryable with zero transport effect; the row stays durably Queued (not
+/// leaked); the second action is admitted after the bucket refills.
+#[test]
+fn configured_rate_limit_refuses_burst_with_zero_transport_then_refills() {
+    let mut fixture = setup("consumer-rate");
+    let config = ChannelConfigBuilder::new("web", "account-a", MODULE_ID, 1)
+        .target_pages(&["page-a"])
+        .max_pending_per_session(8)
+        .max_pieces_per_second_per_session(1)
+        .build();
+    let a1 = "0198ab31-6c44-7e8a-b2bb-000000000813";
+    let a2 = "0198ab31-6c44-7e8a-b2bb-000000000814";
+    commit_block(
+        &mut fixture.harness.connection,
+        "consumer-rate",
+        "ing-1",
+        &format!("{a1}-block"),
+        send_block_for(MODULE_ID, a1, &fixture.session, &["one"]),
+        vec!["page-a".to_string()],
+    );
+    commit_block(
+        &mut fixture.harness.connection,
+        "consumer-rate",
+        "ing-2",
+        &format!("{a2}-block"),
+        send_block_for(MODULE_ID, a2, &fixture.session, &["two"]),
+        vec!["page-a".to_string()],
+    );
+    let transport = SharedTransport::new(true);
+    transport.push(TransportSendResult::AllConfirmed {
+        message_ids: vec!["m-rate-1".to_string()],
+    });
+    transport.push(TransportSendResult::AllConfirmed {
+        message_ids: vec!["m-rate-2".to_string()],
+    });
+    let mut module_conn = reopen_module_store(&fixture);
+    let mut consumer = OutboundConsumer::new(
+        config,
+        Box::new(channel_clock()),
+        &mut module_conn,
+        &mut fixture.harness.connection,
+        Box::new(transport.clone()),
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .expect("consumer");
+    let outcomes = consumer.consume(&far_deadline()).expect("consume");
+    assert_eq!(outcomes.len(), 2, "two committed sends evaluated");
+    let mut terminal = 0;
+    let mut rate_rejected = 0;
+    for outcome in &outcomes {
+        match outcome {
+            dolly_channel::ConsumerOutcome::Terminal { .. } => terminal += 1,
+            dolly_channel::ConsumerOutcome::Rejected { error, .. } => {
+                assert_eq!(error.code, codes::RATE_LIMITED);
+                assert!(error.retryable);
+                rate_rejected += 1;
+            }
+            other => panic!("expected terminal or rate rejection, got {other:?}"),
+        }
+    }
+    assert_eq!(terminal, 1, "first action admitted");
+    assert_eq!(rate_rejected, 1, "second action refused by the token bucket");
+    assert_eq!(transport.calls().len(), 1, "the burst never reached the transport");
+    drop(consumer);
+
+    // After the bucket refills (advance the clock), the durably-Queued action
+    // dispatches exactly once.
+    let mut clock = channel_clock();
+    clock.advance_seconds(2);
+    let mut module_conn2 = Connection::open(&fixture.module_path).unwrap();
+    let mut consumer2 = OutboundConsumer::new(
+        channel_config(),
+        Box::new(clock),
+        &mut module_conn2,
+        &mut fixture.harness.connection,
+        Box::new(transport.clone()),
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .expect("consumer");
+    let outcomes2 = consumer2.consume(&far_deadline()).expect("consume");
+    assert!(
+        outcomes2.iter().any(|o| matches!(
+            o,
+            dolly_channel::ConsumerOutcome::Terminal { action_id, .. } if action_id == a2
+        )),
+        "the rate-refused action dispatches after the bucket refills"
+    );
+    assert_eq!(transport.calls().len(), 2, "second action dispatched exactly once");
+}
+
