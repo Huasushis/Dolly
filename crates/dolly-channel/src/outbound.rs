@@ -423,27 +423,14 @@ pub fn dispatch_send(
     // 5. Persist `prepared` before any transport work.
     let now = clock.now().as_str().to_string();
     let idempotency_supported = transport.idempotency_supported();
-    let idempotency_key = if idempotency_supported {
-        Some(ids::outbound_idempotency_key(&action.action_id))
-    } else {
-        None
-    };
-    let entry = OutboundEntry {
-        action_id: action.action_id.clone(),
-        session_id: session_id.to_string(),
-        config_revision: config.revision,
-        state: OutboundState::Prepared,
+    let entry = build_prepared_entry(
+        config,
+        clock,
+        action,
+        &session_id,
         pieces,
         idempotency_supported,
-        idempotency_key,
-        attempts: vec![AttemptRecord {
-            at: now.clone(),
-            kind: "prepare".to_string(),
-            detail_digest: digest_of(&config.revision.to_string()),
-        }],
-        dispatched_at: None,
-        result_jcs: None,
-    };
+    );
     if ledger
         .insert_outbound(entry, config.ledger_bounds.outbound_max_entries)
         .is_err()
@@ -459,25 +446,79 @@ pub fn dispatch_send(
     // 6. Dispatch. When the transport has no idempotency key support the
     // `dispatched` marker MUST be durable before or atomically with send
     // initiation.
+    transport_and_settle(config, ledger, transport, &action.action_id, &now, idempotency_supported)
+}
+
+/// Crate-internal: build the durable ledger `Prepared` entry for one
+/// authorized send (mirrors the durable Prepared outbound record).
+pub(crate) fn build_prepared_entry(
+    config: &ChannelConfig,
+    clock: &dyn Clock,
+    action: &SendAction,
+    session_id: &str,
+    pieces: Vec<OutboundPiece>,
+    idempotency_supported: bool,
+) -> OutboundEntry {
+    let now = clock.now().as_str().to_string();
+    let idempotency_key = if idempotency_supported {
+        Some(ids::outbound_idempotency_key(&action.action_id))
+    } else {
+        None
+    };
+    OutboundEntry {
+        action_id: action.action_id.clone(),
+        session_id: session_id.to_string(),
+        config_revision: config.revision,
+        state: OutboundState::Prepared,
+        pieces,
+        idempotency_supported,
+        idempotency_key,
+        attempts: vec![AttemptRecord {
+            at: now.clone(),
+            kind: "prepare".to_string(),
+            detail_digest: digest_of(&config.revision.to_string()),
+        }],
+        dispatched_at: None,
+        result_jcs: None,
+    }
+}
+
+/// Crate-internal: drive one `Prepared` outbound row through the transport
+/// and settle it. Shared by `dispatch_send` (fresh sends) and the
+/// committed-Action consumer (re-admission of a Prepared send that never
+/// reached dispatch). When the transport has no idempotency-key support the
+/// caller MUST persist the durable `dispatched` marker before this call; the
+/// in-memory marker is written here before send initiation.
+pub(crate) fn transport_and_settle(
+    config: &ChannelConfig,
+    ledger: &mut ChannelLedger,
+    transport: &mut dyn ChannelTransport,
+    action_id: &str,
+    now: &str,
+    idempotency_supported: bool,
+) -> SendDispatchResult {
     if !idempotency_supported {
-        if let Some(existing) = ledger.outbound.get_mut(&action.action_id) {
+        if let Some(existing) = ledger.outbound.get_mut(action_id) {
             existing.state = OutboundState::Dispatched;
-            existing.dispatched_at = Some(now.clone());
+            existing.dispatched_at = Some(now.to_string());
             existing.attempts.push(AttemptRecord {
-                at: now.clone(),
+                at: now.to_string(),
                 kind: "dispatch".to_string(),
                 detail_digest: digest_of("pre-dispatch"),
             });
         }
     }
     let request = TransportSendRequest {
-        action_id: action.action_id.clone(),
+        action_id: action_id.to_string(),
         idempotency_key: ledger
-            .outbound_entry(&action.action_id)
+            .outbound_entry(action_id)
             .and_then(|e| e.idempotency_key.clone()),
-        session_id: session_id.to_string(),
+        session_id: ledger
+            .outbound_entry(action_id)
+            .map(|e| e.session_id.clone())
+            .unwrap_or_default(),
         pieces: ledger
-            .outbound_entry(&action.action_id)
+            .outbound_entry(action_id)
             .map(|e| {
                 e.pieces
                     .iter()
@@ -491,17 +532,17 @@ pub fn dispatch_send(
     };
     let result = transport.send(&request);
     if idempotency_supported {
-        if let Some(existing) = ledger.outbound.get_mut(&action.action_id) {
+        if let Some(existing) = ledger.outbound.get_mut(action_id) {
             existing.state = OutboundState::Dispatched;
-            existing.dispatched_at = Some(now.clone());
+            existing.dispatched_at = Some(now.to_string());
             existing.attempts.push(AttemptRecord {
-                at: now.clone(),
+                at: now.to_string(),
                 kind: "dispatch".to_string(),
                 detail_digest: digest_of("post-idempotent-send"),
             });
         }
     }
-    apply_transport_observations(config, ledger, &action.action_id, &now, result)
+    apply_transport_observations(config, ledger, action_id, now, result)
 }
 
 /// Apply one transport call result to a ledger entry and produce the closed
@@ -793,6 +834,10 @@ fn error_to_action_result(action_id: &str, error: ChannelError) -> CanonicalJson
 /// Recover crash-stale outbound rows: a `prepared`/`dispatched` row older
 /// than the configured `unknown_after_seconds` is reconciled to `unknown`
 /// (MUST NOT be failed or re-dispatched). Returns the reconciled action IDs.
+/// A `Prepared` row that never recorded a dispatch attempt has never reached
+/// the transport (the durable dispatched marker precedes send initiation);
+/// it is left for the committed-Action consumer to dispatch and is NEVER
+/// reconciled to `unknown`.
 pub fn recover_outbound(
     config: &ChannelConfig,
     clock: &dyn Clock,
@@ -805,6 +850,11 @@ pub fn recover_outbound(
         .iter()
         .filter(|(_, e)| !e.state.is_terminal())
         .filter_map(|(id, e)| {
+            if e.state == OutboundState::Prepared
+                && !e.attempts.iter().any(|a| a.kind == "dispatch")
+            {
+                return None;
+            }
             let at = e.dispatched_at.as_deref().or_else(|| {
                 e.attempts
                     .first()
