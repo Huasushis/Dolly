@@ -15,6 +15,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 
+[features]
+default = []
+# Non-default test/conformance surface: exposes the crate-private store/intent
+# records and the receiver test constructor for real-SQLite failpoint tests.
+# Cannot expose real Host authority: opening a store still requires the sealed
+# HostConnectionAuthority + HostCapabilityGrant.
+test-support = []
+
 [dev-dependencies]
 dolly-core-reducer = { path = "../dolly-core-reducer" }
 tempfile = "3"

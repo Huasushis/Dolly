@@ -27,12 +27,12 @@ pub mod ingress;
 pub(crate) mod intent;
 pub mod ledger;
 pub mod outbound;
-pub mod principal;
+pub(crate) mod principal;
 pub mod projection;
 pub mod rate_limit;
 pub mod receiver;
 pub mod result_validator;
-pub mod store;
+pub(crate) mod store;
 pub mod transport;
 
 pub use clock::{
@@ -66,8 +66,20 @@ pub use result_validator::{
     RESULT_VALIDATOR_ID, RESULT_VALIDATOR_REVISION, SEND_RESULT_SCHEMA_ID, SEND_RESULT_SCHEMA_TAG,
     result_contract_matches, semantic_validate_send_result, validate_send_result,
 };
-pub use store::{SqliteChannelStore, create_channel_store_schema};
+
 pub use transport::{
     ChannelTransport, ScriptedTransport, TransportPiece, TransportPieceOutcome,
     TransportSendRequest, TransportSendResult,
 };
+
+/// Test/conformance surface only: exposes the crate-private store, intent
+/// record and receiver test constructor so real-SQLite/Core failpoint tests
+/// can observe and inject the production state machine. Enabled only by the
+/// non-default `test-support` feature; a caller without the sealed Host
+/// authority and capability grant cannot open a store, so no real Host
+/// authority is exposed.
+#[cfg(feature = "test-support")]
+pub use crate::intent::{ChannelIntent, IntentState};
+#[cfg(feature = "test-support")]
+pub use crate::store::{SqliteChannelStore, create_channel_store_schema};
+
