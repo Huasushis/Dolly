@@ -495,6 +495,7 @@ pub struct SqliteChannelStore<'connection> {
     fail_commit_outcome: u64,
     fail_write_prepared_outbound: u64,
     fail_mark_dispatched: u64,
+    fail_after_dispatch_cas: u64,
     fail_commit_outbound_terminal: u64,
 }
 
@@ -558,6 +559,7 @@ impl<'connection> SqliteChannelStore<'connection> {
             fail_commit_outcome: 0,
             fail_write_prepared_outbound: 0,
             fail_mark_dispatched: 0,
+            fail_after_dispatch_cas: 0,
             fail_commit_outbound_terminal: 0,
         })
     }
@@ -594,6 +596,14 @@ impl<'connection> SqliteChannelStore<'connection> {
     /// terminal+echo commits.
     pub fn inject_commit_outbound_terminal_failure(&mut self, n: u64) {
         self.fail_commit_outbound_terminal = n;
+    }
+
+    #[cfg(feature = "test-support")]
+    /// Test-support only: inject a failure AFTER the dispatch CAS UPDATE
+    /// succeeds but BEFORE its COMMIT (transaction-boundary crash), proving
+    /// the whole CAS rolls back atomically.
+    pub fn inject_after_dispatch_cas_failure(&mut self, n: u64) {
+        self.fail_after_dispatch_cas = n;
     }
 
     /// Verify the store is bound to the exact current principal (full fence
@@ -1190,6 +1200,7 @@ impl<'connection> SqliteChannelStore<'connection> {
         session_id: &str,
         max_pending_per_session: usize,
         max_pending_total: usize,
+        waiting_reservations: usize,
         now: &str,
     ) -> Result<bool, ChannelError> {
         self.verify_owner_meta()?;
@@ -1233,7 +1244,12 @@ impl<'connection> SqliteChannelStore<'connection> {
                 |row| row.get(0),
             )
             .map_err(map_sqlite)?;
-        if per_session as usize >= max_pending_per_session || total as usize >= max_pending_total {
+        // ONE combined bound: durable queued/in-flight plus waiting
+        // reservations <= max_pending_per_session; the ledger-wide durable
+        // bound is max_pending_total.
+        if per_session as usize + waiting_reservations >= max_pending_per_session
+            || total as usize >= max_pending_total
+        {
             transaction.commit().map_err(map_sqlite)?;
             return Ok(false);
         }
@@ -1315,8 +1331,13 @@ impl<'connection> SqliteChannelStore<'connection> {
             return Ok(DispatchClaim::AlreadyDispatched);
         }
         // Build the Dispatched record (recomputed canonical bytes + digest
-        // from the loaded+verified durable truth).
+        // from the loaded+verified durable truth) and remember the EXACT
+        // digest of the row this caller verified BEFORE the CAS.
         let original_state = record.entry.state;
+        let verified_digest = {
+            let (_, d) = Self::outbound_record_bytes(&record)?;
+            d
+        };
         record.entry.state = OutboundState::Dispatched;
         record.entry.dispatched_at = Some(now.to_string());
         record.entry.attempts.push(AttemptRecord {
@@ -1325,20 +1346,22 @@ impl<'connection> SqliteChannelStore<'connection> {
             detail_digest: Sha256Digest::compute(b"dispatch-cas").to_canonical_string(),
         });
         let (bytes, digest) = Self::outbound_record_bytes(&record)?;
-        // Single CAS in one Immediate transaction: the UPDATE only fires when
-        // the durable row's state column still equals the Prepared/Queued
-        // state this caller loaded+verified. SQLite serializes the
-        // transaction, so exactly one concurrent claimant sees
-        // rows-changed == 1; all others see 0 and MUST NOT transport. A CAS
-        // failure means zero transport.
+        // Digest-bound single CAS in ONE Immediate transaction: the UPDATE
+        // predicate binds the EXACT verified record digest AND the
+        // Prepared/Queued state. A row that changed between load and CAS (same
+        // state but different bytes) can never win; SQLite serializes the
+        // transaction so exactly one concurrent claimant sees rows-changed==1,
+        // all others see 0 and MUST NOT transport. A CAS failure means zero
+        // transport.
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite)?;
         let changed = transaction
             .execute(
-                "UPDATE channel_outbound SET record_digest = ?2, canonical_jcs = ?3, state = ?5, queued_seq = ?6
-                 WHERE outbound_key = ?1 AND state = ?4",
+                "UPDATE channel_outbound
+                 SET record_digest = ?2, canonical_jcs = ?3, state = ?5, queued_seq = ?6
+                 WHERE outbound_key = ?1 AND record_digest = ?7 AND state = ?4",
                 params![
                     outbound_key,
                     digest,
@@ -1346,9 +1369,23 @@ impl<'connection> SqliteChannelStore<'connection> {
                     original_state.as_str(),
                     record.entry.state.as_str(),
                     record.entry.queued_seq,
+                    verified_digest,
                 ],
             )
             .map_err(map_sqlite)?;
+        // Transaction-boundary failpoint: a failure after the UPDATE but
+        // before COMMIT must roll the whole CAS back, leaving the row
+        // Queued/Prepared (verified in tests) so a later claimer can win.
+        if self.fail_after_dispatch_cas > 0 {
+            self.fail_after_dispatch_cas -= 1;
+            drop(transaction);
+            return Err(ChannelError::new(
+                codes::INTERNAL,
+                false,
+                ChannelOutcome::NotApplied,
+                "injected dispatch-CAS transaction-boundary failure",
+            ));
+        }
         transaction.commit().map_err(map_sqlite)?;
         if changed == 0 {
             return Ok(DispatchClaim::LostRace);
@@ -2360,7 +2397,7 @@ mod tests {
                 .unwrap();
             assert!(
                 store
-                    .admit_to_queue(action_id, "session-main", 8, 64, "2026-08-09T15:00:00.000000Z")
+                    .admit_to_queue(action_id, "session-main", 8, 64, 0, "2026-08-09T15:00:00.000000Z")
                     .unwrap(),
                 "admission succeeds"
             );
@@ -2404,7 +2441,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cas.sqlite3");
         let action_id = "0198ab31-6c44-7e8a-b2bb-000000000303";
-        // Seed one Prepared row.
         {
             let mut conn = Connection::open(&path).unwrap();
             create_channel_store_schema(&mut conn).unwrap();
@@ -2412,30 +2448,73 @@ mod tests {
             store
                 .insert_prepared_or_replay(&valid_outbound_record(action_id, "session-main", "receiver", "hi"))
                 .unwrap();
+            store
+                .admit_to_queue(action_id, "session-main", 8, 64, 0, "2026-08-09T15:00:00.000000Z")
+                .unwrap();
         }
-        // Two independent connections/stores over ONE SQLite file race the
-        // dispatch CAS on the same row.
-        let mut c1 = Connection::open(&path).unwrap();
-        let mut c2 = Connection::open(&path).unwrap();
-        let mut s1 = SqliteChannelStore::new(&mut c1, &principal(), 1).unwrap();
-        let mut s2 = SqliteChannelStore::new(&mut c2, &principal(), 1).unwrap();
-        let r1 = s1.claim_dispatch(action_id, "2026-08-09T15:00:00.000000Z").unwrap();
-        let r2 = s2.claim_dispatch(action_id, "2026-08-09T15:00:00.000000Z").unwrap();
-        let wins = [
-            matches!(r1, DispatchClaim::Won(_)),
-            matches!(r2, DispatchClaim::Won(_)),
-        ]
-        .iter()
-        .filter(|w| **w)
-        .count();
-        assert_eq!(wins, 1, "exactly one concurrent claimant wins the dispatch CAS");
-        // The loser must not have been given transport authority.
-        drop(s1);
-        // The row is now Dispatched (the winner's transition is durable).
-        let mut s3 = SqliteChannelStore::new(&mut c1, &principal(), 1).unwrap();
+        // Two INDEPENDENT SQLite connections race the dispatch CAS on the SAME
+        // row simultaneously. Exactly one must Win; the loser sees LostRace.
+        let conn_path = path.clone();
+        let wins = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let wins = std::sync::Arc::clone(&wins);
+            let conn_path = conn_path.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut conn = Connection::open(&conn_path).unwrap();
+                let mut store = SqliteChannelStore::new(&mut conn, &principal(), 1).unwrap();
+                match store.claim_dispatch(action_id, "2026-08-09T15:00:00.000000Z").unwrap() {
+                    DispatchClaim::Won(_) => {
+                        *wins.lock().unwrap() += 1;
+                    }
+                    DispatchClaim::LostRace | DispatchClaim::AlreadyDispatched => {}
+                    other => panic!("unexpected claim {other:?}"),
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(*wins.lock().unwrap(), 1, "exactly one concurrent claimant wins");
+        // The winner's Dispatched transition is durable and the CAS was bound
+        // to the verified row digest (state + bytes advanced atomically).
+        let mut s3conn = Connection::open(&path).unwrap();
+        let mut s3 = SqliteChannelStore::new(&mut s3conn, &principal(), 1).unwrap();
         let record = s3.find_outbound(action_id).unwrap().unwrap();
         assert_eq!(record.entry.state, OutboundState::Dispatched);
-}
+        assert!(record.entry.dispatched_at.is_some());
+    }
+
+    #[test]
+    fn dispatch_cas_transaction_boundary_failure_rolls_back_atomically() {
+        let mut connection = connection();
+        let action_id = "0198ab31-6c44-7e8a-b2bb-000000000304";
+        let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+        store
+            .insert_prepared_or_replay(&valid_outbound_record(action_id, "session-main", "receiver", "hi"))
+            .unwrap();
+        store
+            .admit_to_queue(action_id, "session-main", 8, 64, 0, "2026-08-09T15:00:00.000000Z")
+            .unwrap();
+        // Crash AFTER the CAS UPDATE but BEFORE COMMIT: the whole transaction
+        // must roll back, leaving the row durably Queued (never a half-applied
+        // Dispatched marker, never a leaked winner).
+        store.inject_after_dispatch_cas_failure(1);
+        let err = store
+            .claim_dispatch(action_id, "2026-08-09T15:00:00.000000Z")
+            .expect_err("transaction-boundary failure propagates");
+        assert_eq!(err.code, codes::INTERNAL);
+        let record = store.find_outbound(action_id).unwrap().unwrap();
+        assert_eq!(record.entry.state, OutboundState::Queued, "CAS rolled back atomically");
+        assert!(record.entry.dispatched_at.is_none());
+        // A later clean claimer still wins exactly once (no leaked state).
+        match store.claim_dispatch(action_id, "2026-08-09T15:00:01.000000Z").unwrap() {
+            DispatchClaim::Won(_) => {}
+            other => panic!("later claimer must win after rollback, got {other:?}"),
+        }
+        let record = store.find_outbound(action_id).unwrap().unwrap();
+        assert_eq!(record.entry.state, OutboundState::Dispatched);
+    }
 
 
 }
