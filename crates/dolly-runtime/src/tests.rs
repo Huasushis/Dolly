@@ -51,9 +51,9 @@ fn graph() -> Value {
         "output_pages": {"producer":["in"],"receiver":["out"]},
         "subscriptions": {"out":["consumer"]},
         "descriptors": {
-            "receiver": {"module_id":"receiver","descriptor_revision":9,"source_descriptor_digest":digest(&receiver),"value":receiver},
-            "producer": {"module_id":"producer","descriptor_revision":3,"source_descriptor_digest":digest(&producer),"value":producer},
-            "consumer": {"module_id":"consumer","descriptor_revision":4,"source_descriptor_digest":digest(&consumer),"value":consumer}
+            "receiver": {"module_id":"receiver","descriptor_revision":9,"source_descriptor_digest":digest(&receiver),"owner_extension_id":"org.dolly.test","value":receiver},
+            "producer": {"module_id":"producer","descriptor_revision":3,"source_descriptor_digest":digest(&producer),"owner_extension_id":"org.dolly.test","value":producer},
+            "consumer": {"module_id":"consumer","descriptor_revision":4,"source_descriptor_digest":digest(&consumer),"owner_extension_id":"org.dolly.test","value":consumer}
         },
         "authorized_metadata_namespaces": [],
         "authorized_action_names": []
@@ -85,6 +85,7 @@ fn manifest(module_id: &str, config: &Value, activation_id: &str) -> Value {
                     module_id: "receiver".into(),
                     descriptor_revision: 9,
                     source_descriptor_digest: digest(&receiver),
+                    owner_extension_id: "org.dolly.test".into(),
                     value: receiver,
                 },
             ),
@@ -94,6 +95,7 @@ fn manifest(module_id: &str, config: &Value, activation_id: &str) -> Value {
                     module_id: "producer".into(),
                     descriptor_revision: 3,
                     source_descriptor_digest: digest(&producer),
+                    owner_extension_id: "org.dolly.test".into(),
                     value: producer,
                 },
             ),
@@ -103,6 +105,7 @@ fn manifest(module_id: &str, config: &Value, activation_id: &str) -> Value {
                     module_id: "consumer".into(),
                     descriptor_revision: 4,
                     source_descriptor_digest: digest(&consumer),
+                    owner_extension_id: "org.dolly.test".into(),
                     value: consumer,
                 },
             ),
