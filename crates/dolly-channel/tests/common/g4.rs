@@ -19,7 +19,7 @@ use dolly_storage::{
     host_ingress::create_host_ingress_schema,
 };
 use dolly_channel::{
-    AuthenticatedChannelEvent, ChannelEventContent, ChannelLedger, EventKind, VirtualClock, ids,
+    AuthenticatedChannelEvent, ChannelEventContent, EventKind, VirtualClock, ids,
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};

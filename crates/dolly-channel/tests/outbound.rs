@@ -11,7 +11,7 @@ use dolly_channel::{
 };
 
 fn dispatch(config: &dolly_channel::ChannelConfig, ledger: &mut ChannelLedger, transport: &mut ScriptedTransport, block: &serde_json::Value) -> SendDispatchResult {
-    let mut clock = clock();
+    let clock = clock();
     let action = parse_send_action(block).expect("block carries a channel send");
     let mut admission = OutboundAdmission::new();
     dispatch_send(config, &clock, ledger, transport, &mut admission, &action)
@@ -284,7 +284,7 @@ fn late_confirmation_reconciles_dispatched_row_to_confirmed() {
         OutboundState::Dispatched
     );
 
-    let mut clock = clock();
+    let clock = clock();
     let outcome = observe_outbound(
         &config,
         &clock,
@@ -309,7 +309,7 @@ fn late_confirmation_reconciles_dispatched_row_to_confirmed() {
 fn non_channel_owner_action_is_rejected_before_any_effect() {
     let mut ledger = ChannelLedger::new();
     ledger.insert_session("account-a", "conv-1", "session-main");
-    let mut transport = ScriptedTransport::new(true);
+    let transport = ScriptedTransport::new(true);
 
     let block = non_channel_action_block("0198ab31-6c44-7e8a-b2bb-000000000098");
     let parsed = parse_send_action(&block);
@@ -409,7 +409,7 @@ fn rate_limit_backpressure_is_deterministic() {
         &["Hello."],
     ))
     .unwrap();
-    let mut transport = ScriptedTransport::new(true);
+    let transport = ScriptedTransport::new(true);
 
     // First send admitted and confirmed.
     let mut t1 = transport.clone();

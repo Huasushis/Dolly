@@ -65,7 +65,7 @@ fn authenticated_message_commits_to_durable_premise() {
 #[test]
 fn duplicate_delivery_replays_prior_mapping_without_core_call() {
     let config = config();
-    let mut clock = clock();
+    let clock = clock();
     let mut ledger = ChannelLedger::new();
     let mut core = MemCoreIngress::new();
 
@@ -111,7 +111,7 @@ fn duplicate_delivery_replays_prior_mapping_without_core_call() {
 #[test]
 fn same_id_different_content_is_an_idempotency_conflict_before_mutation() {
     let config = config();
-    let mut clock = clock();
+    let clock = clock();
     let mut ledger = ChannelLedger::new();
     let mut core = MemCoreIngress::new();
 
@@ -143,7 +143,7 @@ fn same_id_different_content_is_an_idempotency_conflict_before_mutation() {
 #[test]
 fn cross_owner_account_fails_before_mutation() {
     let config = config();
-    let mut clock = clock();
+    let clock = clock();
     let mut ledger = ChannelLedger::new();
     let mut core = MemCoreIngress::new();
 
@@ -171,7 +171,7 @@ fn unauthorized_sender_fails_before_mutation() {
     let config = ChannelConfigBuilder::new("web", "account-a", "web-channel", 1)
         .allowed_senders(&["sender-account-a"])
         .build();
-    let mut clock = clock();
+    let clock = clock();
     let mut ledger = ChannelLedger::new();
     let mut core = MemCoreIngress::new();
 
@@ -191,7 +191,7 @@ fn unauthorized_sender_fails_before_mutation() {
 #[test]
 fn malformed_event_fails_before_mutation() {
     let config = config();
-    let mut clock = clock();
+    let clock = clock();
     let mut ledger = ChannelLedger::new();
     let mut core = MemCoreIngress::new();
 
@@ -227,7 +227,7 @@ fn malformed_event_fails_before_mutation() {
 #[test]
 fn stale_edit_of_unknown_message_fails_before_mutation() {
     let config = config();
-    let mut clock = clock();
+    let clock = clock();
     let mut ledger = ChannelLedger::new();
     let mut core = MemCoreIngress::new();
 
@@ -248,7 +248,7 @@ fn stale_edit_of_unknown_message_fails_before_mutation() {
 #[test]
 fn account_change_starts_fresh_dedup_namespace_without_collision() {
     let mut config = config();
-    let mut clock = clock();
+    let clock = clock();
     let mut ledger = ChannelLedger::new();
     let mut core = MemCoreIngress::new();
 
@@ -320,7 +320,7 @@ fn stop_restart_preserves_ledger_and_pending_rows() {
 #[test]
 fn lost_response_reconciles_through_status_then_committed_without_replay() {
     let config = config();
-    let mut clock = clock();
+    let clock = clock();
     let mut ledger = ChannelLedger::new();
     let mut core = MemCoreIngress::new();
 
@@ -357,7 +357,7 @@ fn lost_response_reconciles_through_status_then_committed_without_replay() {
 #[test]
 fn lost_response_with_authoritative_absent_replays_byte_identical() {
     let config = config();
-    let mut clock = clock();
+    let clock = clock();
     let mut ledger = ChannelLedger::new();
     let mut core = MemCoreIngress::new();
 
@@ -393,7 +393,7 @@ fn lost_response_with_authoritative_absent_replays_byte_identical() {
 #[test]
 fn echoed_outbound_id_is_suppressed_with_zero_effect() {
     let config = config();
-    let mut clock = clock();
+    let clock = clock();
     let mut ledger = ChannelLedger::new();
     let mut core = MemCoreIngress::new();
 
