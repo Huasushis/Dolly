@@ -3,7 +3,9 @@
 //! The Channel never invents a Block or Asset ID (those are minted by Core).
 //! What it derives are the stable *keys* it must own:
 //!
-//! - the account-scoped inbound ingress key (deduplication namespace),
+//! - the principal-derived Channel account (the deduplication namespace of
+//!   one sealed Host authority/grant),
+//! - the account-scoped inbound ingress key,
 //! - the operation digest of a byte-identical draft,
 //! - the outbound transport idempotency key derived from `action_id`,
 //! - deterministic per-operation request IDs, and
@@ -63,6 +65,32 @@ pub fn inbound_ingress_key(transport_account: &str, external_message_id: &str) -
 /// replay idempotently in Core exactly when this digest matches.
 pub fn operation_digest(canonical_draft_bytes: &[u8]) -> String {
     domain_hash(OPERATION_PREFIX, &[canonical_draft_bytes])
+}
+
+/// The deterministic Channel account handle of one sealed principal: a
+/// domain-separated digest over the authority-bound owner (Host connection
+/// identity), granted Extension, granted Module, and worker epoch (instance).
+///
+/// The account is a pure function of the sealed current Host authority and
+/// capability grant, so a transport event carries no account claim a caller
+/// could forge, and two principals can never collide in the Channel
+/// deduplication namespace.
+pub fn channel_account(
+    owner: &str,
+    extension_id: &str,
+    module_id: &str,
+    instance_id: &str,
+) -> String {
+    let digest = domain_hash_raw(
+        b"org.dolly.channel\0account\0",
+        &[
+            owner.as_bytes(),
+            extension_id.as_bytes(),
+            module_id.as_bytes(),
+            instance_id.as_bytes(),
+        ],
+    );
+    format!("dolly-account-{}", &digest[..16])
 }
 
 /// The stable transport idempotency key derived from an `action_id`. Supplied
@@ -145,6 +173,15 @@ mod tests {
         let d3 = operation_digest(b"{\"x\": 1}");
         assert_eq!(d1, d2);
         assert_ne!(d1, d3);
+    }
+
+    #[test]
+    fn channel_account_is_principal_bound_and_deterministic() {
+        let a = channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
+        assert!(a.starts_with("dolly-account-"));
+        assert_eq!(a, channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1"));
+        assert_ne!(a, channel_account("owner-2", "org.dolly.channel", "receiver", "worker-1"));
+        assert_ne!(a, channel_account("owner-1", "org.dolly.channel", "receiver", "worker-2"));
     }
 
     #[test]

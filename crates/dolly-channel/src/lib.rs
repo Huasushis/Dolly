@@ -25,8 +25,10 @@ pub mod error;
 pub mod host_adapter;
 pub mod ids;
 pub mod ingress;
+pub mod intent;
 pub mod ledger;
 pub mod outbound;
+pub mod principal;
 pub mod projection;
 pub mod rate_limit;
 pub mod receiver;
@@ -46,6 +48,7 @@ pub use ingress::{
     IngressStatusResult, IngressSubmitReceipt, IngressSubmitRequest, parse_event, process_event,
     reconcile_inbound,
 };
+pub use intent::{CHANNEL_INTENT_RECORD_SCHEMA, ChannelIntent, IntentState};
 pub use ledger::PieceOutcome;
 pub use ledger::{
     ChannelLedger, EventKind, InboundEntry, InboundState, OutboundEntry, OutboundPiece,
@@ -56,16 +59,18 @@ pub use outbound::{
     PieceObservation, SendAction, SendDispatchResult, dispatch_send, observe_outbound,
     parse_send_action, recover_outbound,
 };
+pub use principal::ChannelPrincipal;
 pub use projection::{
     AttemptProjection, InboundProjection, LedgerSnapshotProjection, OutboundProjection,
 };
 pub use rate_limit::{OutboundAdmission, TokenBucket};
 pub use receiver::InboundReceiver;
+pub use receiver::{AuthenticatedChannelEvent, ChannelEventContent};
 pub use result_validator::{
     RESULT_VALIDATOR_ID, RESULT_VALIDATOR_REVISION, SEND_RESULT_SCHEMA_ID, SEND_RESULT_SCHEMA_TAG,
     result_contract_matches, semantic_validate_send_result, validate_send_result,
 };
-pub use store::{ChannelLedgerStore, SqliteChannelLedgerStore, create_channel_ledger_schema};
+pub use store::{ChannelStore, ChannelStoreOwner, SqliteChannelStore, create_channel_store_schema};
 pub use transport::{
     ChannelTransport, ScriptedTransport, TransportPiece, TransportPieceOutcome,
     TransportSendRequest, TransportSendResult,
