@@ -1057,3 +1057,85 @@ fn configured_rate_limit_refuses_burst_with_zero_transport_then_refills() {
     assert_eq!(transport.calls().len(), 2, "second action dispatched exactly once");
 }
 
+
+/// Items 2/5/6: status-first recovery settles every validated transport
+/// status through the exact frozen result envelope. A Rejected status settles
+/// a terminal Failed row WITH its frozen result_jcs; Unknown keeps the row
+/// Dispatched (never age-guessed, never false success).
+#[test]
+fn status_first_settles_rejected_and_unknown_exactly() {
+    let mut fixture = setup("consumer-status-envelope");
+    let a1 = "0198ab31-6c44-7e8a-b2bb-000000000816";
+    let a2 = "0198ab31-6c44-7e8a-b2bb-000000000817";
+    for (i, (action, msg)) in [(a1, "m-rejected-status"), (a2, "m-unknown-status")].into_iter().enumerate() {
+        commit_block(
+            &mut fixture.harness.connection,
+            "consumer-status-envelope",
+            &format!("ing-{i}"),
+            &format!("{action}-block"),
+            send_block_for(MODULE_ID, action, &fixture.session, &[msg]),
+            vec!["page-a".to_string()],
+        );
+    }
+    let transport = SharedTransport::new(true);
+    // Both sends: transport response lost -> Dispatched; the durable CAS
+    // before transport means both rows are Dispatched after the first pass.
+    transport.push(TransportSendResult::Timeout);
+    transport.push(TransportSendResult::Timeout);
+    let mut module_conn = reopen_module_store(&fixture);
+    {
+        let mut consumer = OutboundConsumer::new(
+            channel_config(),
+            Box::new(channel_clock()),
+            &mut module_conn,
+            &mut fixture.harness.connection,
+            Box::new(transport.clone()),
+            &fixture.harness.authority,
+            &fixture.harness.grant,
+        )
+        .expect("consumer");
+        let outcomes = consumer.consume(&far_deadline()).expect("consume");
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes.iter().all(|o| matches!(
+            o,
+            dolly_channel::ConsumerOutcome::Pending { .. }
+        )));
+        drop(consumer);
+    }
+    // Status scripts: a1 rejected, a2 unknown.
+    transport.push_status(
+        a1,
+        dolly_channel::transport::TransportStatusResult::Rejected {
+            code: "REMOTE_REFUSED".to_string(),
+        },
+    );
+    transport.push_status(
+        a2,
+        dolly_channel::transport::TransportStatusResult::Unknown,
+    );
+    let mut consumer2 = OutboundConsumer::new(
+        channel_config(),
+        Box::new(channel_clock()),
+        &mut module_conn,
+        &mut fixture.harness.connection,
+        Box::new(transport.clone()),
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .expect("consumer");
+    let remaining = consumer2.reconcile().expect("reconcile");
+    // a1 settles Failed (exact envelope); a2 stays Dispatched (unknown,
+    // never age-guessed) -> 1 unresolved.
+    assert_eq!(remaining, 1, "unknown status stays unresolved");
+    let ledger = consumer2.ledger().unwrap();
+    let e1 = ledger.outbound_entry(a1).expect("durable a1");
+    assert_eq!(e1.state, OutboundState::Failed);
+    let envelope: Value = serde_json::from_str(e1.result_jcs.as_deref().expect("frozen result")).unwrap();
+    assert_eq!(envelope["status"], "failed");
+    assert_eq!(envelope["error"]["code"], "CHANNEL_TRANSPORT_REJECTED");
+    assert_eq!(envelope["error"]["outcome"], "not_applied");
+    assert_eq!(envelope["result"], Value::Null);
+    let e2 = ledger.outbound_entry(a2).expect("durable a2");
+    assert_eq!(e2.state, OutboundState::Dispatched, "unknown is never age-guessed");
+    assert!(e2.result_jcs.is_none(), "no fabricated terminal result");
+}
