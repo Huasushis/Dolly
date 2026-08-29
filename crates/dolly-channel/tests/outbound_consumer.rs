@@ -267,6 +267,33 @@ fn far_deadline() -> String {
     timestamp_plus_seconds(CHANNEL_NOW, 60)
 }
 
+/// A Clone-able shared clock so tests advance time while the consumer waits.
+#[derive(Clone)]
+struct SharedClock(std::sync::Arc<std::sync::Mutex<dolly_channel::VirtualClock>>);
+
+impl SharedClock {
+    fn at(at: &str) -> Self {
+        SharedClock(std::sync::Arc::new(std::sync::Mutex::new(
+            dolly_channel::VirtualClock::at(at.parse().expect("ts")),
+        )))
+    }
+    fn advance_seconds(&self, s: i64) {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .advance_seconds(s);
+    }
+}
+
+impl dolly_channel::Clock for SharedClock {
+    fn now(&self) -> dolly_core_domain::Timestamp {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .now()
+    }
+}
+
 /// One consume pass over a committed send with a fresh shared transport.
 fn consume_one(
     fixture: &mut Fixture,
@@ -556,85 +583,116 @@ fn bounded_queue_waits_then_expires_and_releases_no_slot() {
         send_block_for(MODULE_ID, a2, &fixture.session, &["two"]),
         vec!["page-a".to_string()],
     );
+    let clock = SharedClock::at(CHANNEL_NOW);
+    // a1's transport response is lost (Timeout -> dispatched-pending).
     let transport = SharedTransport::new(true);
     transport.push(TransportSendResult::Timeout); // a1 stays dispatched-pending
-    {
-        // a1's slot is held across the pass (dispatched-pending), so when a2
-        // is admitted the session queue is FULL: with an ALREADY-PASSED
-        // caller deadline it backpressures with zero transport call and no
-        // additional slot leak.
-        let mut module_conn = reopen_module_store(&fixture);
-            let mut consumer = OutboundConsumer::new(
-            config,
-            Box::new(channel_clock()),
-            &mut module_conn,
-            &mut fixture.harness.connection,
-            Box::new(transport.clone()),
-            &fixture.harness.authority,
-            &fixture.harness.grant,
-        )
-        .expect("consumer");
-        let outcomes = consumer
-            .consume(&timestamp_plus_seconds(CHANNEL_NOW, -1))
-            .expect("consume");
-        let mut pending = 0;
-        let mut backpressure = 0;
-        for outcome in &outcomes {
-            match outcome {
-                dolly_channel::ConsumerOutcome::Pending { .. } => pending += 1,
-                dolly_channel::ConsumerOutcome::Rejected { error, .. } => {
-                    assert_eq!(error.code, codes::RATE_LIMITED);
-                    assert!(error.retryable);
-                    backpressure += 1;
-                }
-                other => panic!("expected pending or backpressure, got {other:?}"),
+    let mut module_conn = reopen_module_store(&fixture);
+    let mut consumer = OutboundConsumer::new(
+        config,
+        Box::new(clock.clone()),
+        &mut module_conn,
+        &mut fixture.harness.connection,
+        Box::new(transport.clone()),
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .expect("consumer");
+    // Fresh caller deadline: a1 is admitted and holds its durable slot as
+    // dispatched-pending; a2 waits behind the full queue until the deadline
+    // burns past (a background task advances the SHARED clock and wakes the
+    // gate), then backpressures with zero transport and no leaked slot.
+    let advance_clock = clock.clone();
+    let queue_wake = consumer.queue();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        advance_clock.advance_seconds(4);
+        queue_wake.wake_all();
+    });
+    let outcomes = consumer
+        .consume(&timestamp_plus_seconds(CHANNEL_NOW, 3))
+        .expect("consume");
+    let mut pending = 0;
+    let mut backpressure = 0;
+    for outcome in &outcomes {
+        match outcome {
+            dolly_channel::ConsumerOutcome::Pending { .. } => pending += 1,
+            dolly_channel::ConsumerOutcome::Rejected { error, .. } => {
+                assert_eq!(error.code, codes::RATE_LIMITED);
+                assert!(error.retryable);
+                backpressure += 1;
             }
+            other => panic!("expected pending or backpressure, got {other:?}"),
         }
-        assert_eq!(pending, 1, "a1 stays dispatched-pending and holds its slot");
-        assert_eq!(backpressure, 1, "a2 backpressured at the expired deadline");
-        assert_eq!(transport.calls().len(), 1, "only the granted slot dispatched");
-        assert_eq!(
-            consumer
-                .queue()
-                .inflight(&format!("{}\u{0}{}", fixture.account, fixture.session)),
-            1,
-            "exactly the one held slot; a2's failed admission leaked nothing"
-        );
-        drop(consumer);
     }
-    // The deadline-expired action was NOT transported and remains durable
-    // Prepared; a later pass with a fresh deadline dispatches it exactly once
-    // (a1 stays dispatched-pending with no resend).
+    assert_eq!(pending, 1, "a1 stays dispatched-pending and holds its slot");
+    assert_eq!(backpressure, 1, "a2 backpressured at the expired deadline");
+    assert_eq!(transport.calls().len(), 1, "only the granted slot dispatched");
+    // Durable occupancy: exactly the one held (Queued/Dispatched) send for
+    // the session; a2's failed admission leaked nothing.
+    assert_eq!(
+        consumer
+            .pending_outbound()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e.session_id == fixture.session && e.state != OutboundState::Prepared
+            })
+            .count(),
+        1,
+        "exactly the one held slot; a2's failed admission leaked nothing"
+    );
+    drop(consumer);
+
+    // Status-first recovery settles a1 (transport confirms), freeing durable
+    // occupancy, then a fresh pass dispatches a2 exactly once (no blind
+    // resend of a1).
     let transport2 = SharedTransport::new(true);
     transport2.push(TransportSendResult::AllConfirmed {
         message_ids: vec!["m-bp-2".to_string()],
     });
-    let mut module_conn = reopen_module_store(&fixture);
+    transport2.push_status(
+        a1,
+        dolly_channel::transport::TransportStatusResult::Confirmed {
+            message_ids: vec!["m-bp-1-confirmed".to_string()],
+        },
+    );
+    let mut module_conn2 = reopen_module_store(&fixture);
     let mut consumer2 = OutboundConsumer::new(
         channel_config(),
         Box::new(channel_clock()),
-        &mut module_conn,
+        &mut module_conn2,
         &mut fixture.harness.connection,
         Box::new(transport2.clone()),
         &fixture.harness.authority,
         &fixture.harness.grant,
     )
     .expect("consumer");
+    // a1 settles to Confirmed (status-first); a2 stays Prepared (pending,
+    // owned by consume) — so exactly one durable row remains unresolved.
+    let remaining = consumer2.reconcile().expect("reconcile");
+    assert_eq!(remaining, 1, "a2 (never-admitted Prepared) remains, owned by consume");
     let outcomes2 = consumer2.consume(&far_deadline()).expect("consume");
-    assert_eq!(outcomes2.len(), 2, "a1 (pending) + a2 (dispatched now)");
     let mut terminal_a2 = false;
+    let mut replay_a1 = false;
     for outcome in &outcomes2 {
         match outcome {
             dolly_channel::ConsumerOutcome::Terminal { action_id, .. } => {
-                assert_eq!(action_id, a2, "the backpressured action dispatches later");
-                terminal_a2 = true;
+                if action_id == a2 {
+                    terminal_a2 = true;
+                } else if action_id == a1 {
+                    // a1 was settled by status-first reconcile; consume
+                    // returns the stored terminal result with zero transport.
+                    replay_a1 = true;
+                }
             }
             dolly_channel::ConsumerOutcome::Pending { .. } => {}
             other => panic!("unexpected outcome {other:?}"),
         }
     }
-    assert!(terminal_a2, "a2 reached terminal");
-    assert_eq!(transport2.calls().len(), 1);
+    assert!(terminal_a2, "a2 reached terminal exactly once");
+    assert!(replay_a1, "a1 replays its stored result, never blind-resent");
+    assert_eq!(transport2.calls().len(), 1, "a1 was never blind-resent");
 }
 
 #[test]
@@ -851,7 +909,10 @@ fn zero_reverse_echo_or_premise_leakage() {
     assert!(outcomes.is_empty(), "no committed send Action, no outcome");
     assert_eq!(consumer.ledger().unwrap().outbound.len(), 0);
     assert_eq!(transport.calls().len(), 0);
-    assert_eq!(consumer.queue().total_inflight(), 0, "queue untouched");
+    assert!(
+        consumer.pending_outbound().unwrap().is_empty(),
+        "queue untouched (no durable occupancy)"
+    );
     drop(consumer);
 }
 

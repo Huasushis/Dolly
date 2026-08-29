@@ -483,6 +483,7 @@ pub(crate) fn build_prepared_entry(
         }],
         dispatched_at: None,
         result_jcs: None,
+        queued_seq: None,
     }
 }
 
