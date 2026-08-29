@@ -231,6 +231,53 @@ pub(crate) fn prepare_intent(
     })
 }
 
+/// The Channel-local operation digest of one committed outbound send action.
+///
+/// A domain-separated SHA-256 over the complete sealed-principal fences
+/// (owner, Extension, module, instance, generation, incarnation revision,
+/// graph revision + digest, config revision, account), the exactly targeted
+/// module, and the canonical bytes of the committed `org.dolly.channel.send`
+/// Action. Reused in the durable Prepared outbound record so the same
+/// `action_id` under a different target/content/config conflicts before
+/// enqueue, and a same key+digest replay returns the stored result.
+pub(crate) fn outbound_operation_digest(
+    extension_id: &str,
+    module_id: &str,
+    instance_id: &str,
+    generation: u64,
+    revision: i64,
+    graph_revision: i64,
+    graph_digest: &str,
+    config_revision: i64,
+    account: &str,
+    action_jcs: &str,
+    target_module_id: &str,
+) -> String {
+    use dolly_canonical_json::canonicalize;
+    let mut identity = serde_json::Map::new();
+    identity.insert(
+        "schema".into(),
+        serde_json::json!("dolly.channel-outbound/operation/v1"),
+    );
+    identity.insert("account".into(), serde_json::json!(account));
+    identity.insert("extension_id".into(), serde_json::json!(extension_id));
+    identity.insert("module_id".into(), serde_json::json!(module_id));
+    identity.insert("instance_id".into(), serde_json::json!(instance_id));
+    identity.insert("generation".into(), serde_json::json!(generation));
+    identity.insert("revision".into(), serde_json::json!(revision));
+    identity.insert("graph_revision".into(), serde_json::json!(graph_revision));
+    identity.insert("graph_digest".into(), serde_json::json!(graph_digest));
+    identity.insert("config_revision".into(), serde_json::json!(config_revision));
+    identity.insert("target_module_id".into(), serde_json::json!(target_module_id));
+    identity.insert("action_jcs".into(), serde_json::json!(action_jcs));
+    let canonical = canonicalize(&serde_json::Value::Object(identity))
+        .expect("outbound identity is canonical JSON")
+        .0
+        .as_bytes()
+        .to_vec();
+    Sha256Digest::compute(&canonical).to_string()
+}
+
 /// Validate a returned Host mapping against the exact prepared intent before
 /// any terminal commit. This is the ONE complete validation path used by
 /// submit, status, reconcile and receiver-local replay adoption:

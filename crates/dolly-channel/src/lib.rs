@@ -27,6 +27,7 @@ pub mod ingress;
 pub(crate) mod intent;
 pub mod ledger;
 pub mod outbound;
+pub mod outbound_committed;
 pub(crate) mod principal;
 pub mod projection;
 pub mod rate_limit;
@@ -56,6 +57,7 @@ pub use outbound::{
     PieceObservation, SendAction, SendDispatchResult, dispatch_send, observe_outbound,
     parse_send_action, recover_outbound,
 };
+pub use outbound_committed::{CommittedSendAction, committed_send_from_block};
 pub use principal::ChannelPrincipal;
 pub use projection::{
     AttemptProjection, InboundProjection, LedgerSnapshotProjection, OutboundProjection,

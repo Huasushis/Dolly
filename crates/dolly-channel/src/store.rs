@@ -31,7 +31,9 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::error::{ChannelError, ChannelOutcome, codes};
 use crate::host_adapter::{channel_facts_from_draft, channel_intent_digest, payload_digest_of};
 use crate::intent::{CHANNEL_INTENT_RECORD_SCHEMA, ChannelIntent, IntentState};
-use crate::ledger::{ChannelLedger, EventKind, InboundEntry, InboundState};
+use crate::ledger::{
+    ChannelLedger, EventKind, InboundEntry, InboundState, OutboundEntry, OutboundState,
+};
 use crate::principal::ChannelPrincipal;
 
 /// Derive the content facts from the canonical draft (`request_jcs`) — the
@@ -216,6 +218,63 @@ struct EchoRecord {
     echo_key: String,
 }
 
+/// The logical table holding the durable outbound records (single durable
+/// source of truth for the committed targeted-Action outbound pipeline).
+const CHANNEL_OUTBOUND_TABLE: &str = "channel_outbound";
+
+/// The closed schema discriminator of one durable `Prepared` outbound record.
+const OUTBOUND_RECORD_SCHEMA: &str = "dolly.channel-outbound/v1";
+
+/// The result of persisting the durable `Prepared` outbound row for one
+/// committed action key (`action_id`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OutboundPreparedOutcome {
+    /// A fresh Prepared row was durably persisted (key+digest not seen).
+    Prepared,
+    /// An identical (same key, same operation digest) non-terminal row
+    /// already exists (crash re-entry); it is the surviving authority and was
+    /// NOT overwritten or downgraded.
+    PreparedExisting,
+    /// A terminal row already exists for this key+digest: the exact frozen
+    /// result MUST be returned with zero re-dispatch.
+    ReplayTerminal {
+        state: OutboundState,
+        result_jcs: String,
+    },
+}
+
+/// The strict canonical durable outbound record: the complete sealed
+/// principal fence facts, the canonical committed Action bytes, the
+/// authority-bound operation digest, and the accepted [`OutboundEntry`]
+/// working state. `deny_unknown_fields` rejects any unknown or forged field;
+/// every field is re-verified against the bound store owner on read.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DurableOutboundRecord {
+    pub(crate) schema: String,
+    pub(crate) version: i64,
+    /// The durable row key: the committed Action's `action_id`.
+    pub(crate) outbound_key: String,
+    /// Authority-bound operation digest (fences + target + canonical Action).
+    pub(crate) digest: String,
+    /// The canonical committed `org.dolly.channel.send` Action bytes.
+    pub(crate) action_jcs: String,
+    /// The exactly targeted module of the committed Action.
+    pub(crate) target_module_id: String,
+    pub(crate) owner: String,
+    pub(crate) extension_id: String,
+    pub(crate) module_id: String,
+    pub(crate) instance_id: String,
+    pub(crate) generation: i64,
+    pub(crate) revision: i64,
+    pub(crate) graph_revision: i64,
+    pub(crate) graph_digest: String,
+    pub(crate) config_revision: i64,
+    pub(crate) account: String,
+    /// The accepted outbound ledger working state.
+    pub(crate) entry: OutboundEntry,
+}
+
 /// The schema discriminator stored in the owner singleton.
 const CHANNEL_STORE_SCHEMA_DISCRIMINATOR: &str = "dolly.channel-store/v1";
 /// The physical schema version of the Channel store.
@@ -242,6 +301,11 @@ CREATE TABLE channel_echo (
     echo_key TEXT PRIMARY KEY NOT NULL,
     record_digest TEXT NOT NULL,
     canonical_jcs BLOB NOT NULL
+);
+CREATE TABLE channel_outbound (
+    outbound_key TEXT PRIMARY KEY NOT NULL,
+    record_digest TEXT NOT NULL,
+    canonical_jcs BLOB NOT NULL
 )
 "#;
 
@@ -266,9 +330,16 @@ pub(crate) const CHANNEL_ECHO_SCHEMA_SQL: &str = "CREATE TABLE channel_echo (
     canonical_jcs BLOB NOT NULL
 )";
 
+pub(crate) const CHANNEL_OUTBOUND_SCHEMA_SQL: &str = "CREATE TABLE channel_outbound (
+    outbound_key TEXT PRIMARY KEY NOT NULL,
+    record_digest TEXT NOT NULL,
+    canonical_jcs BLOB NOT NULL
+)";
+
 const OWNER_COLUMNS: &[&str] = &["singleton", "schema_version", "schema_discriminator", "owner_jcs", "owner_digest"];
 const INTENT_COLUMNS: &[&str] = &["intent_key", "record_digest", "canonical_jcs"];
 const ECHO_COLUMNS: &[&str] = &["echo_key", "record_digest", "canonical_jcs"];
+const OUTBOUND_COLUMNS: &[&str] = &["outbound_key", "record_digest", "canonical_jcs"];
 
 /// The sealed store ownership, derived only from a [`ChannelPrincipal`] and
 /// carrying the COMPLETE principal fence facts. Constructed solely inside
@@ -367,9 +438,11 @@ pub(crate) fn gate_channel_store_schema(connection: &Connection) -> Result<(), C
     verify_table(connection, CHANNEL_OWNER_TABLE, CHANNEL_OWNER_SCHEMA_SQL)?;
     verify_table(connection, CHANNEL_INTENT_TABLE, CHANNEL_INTENT_SCHEMA_SQL)?;
     verify_table(connection, CHANNEL_ECHO_TABLE, CHANNEL_ECHO_SCHEMA_SQL)?;
+    verify_table(connection, CHANNEL_OUTBOUND_TABLE, CHANNEL_OUTBOUND_SCHEMA_SQL)?;
     verify_columns(connection, CHANNEL_OWNER_TABLE, OWNER_COLUMNS)?;
     verify_columns(connection, CHANNEL_INTENT_TABLE, INTENT_COLUMNS)?;
-    verify_columns(connection, CHANNEL_ECHO_TABLE, ECHO_COLUMNS)
+    verify_columns(connection, CHANNEL_ECHO_TABLE, ECHO_COLUMNS)?;
+    verify_columns(connection, CHANNEL_OUTBOUND_TABLE, OUTBOUND_COLUMNS)
 }
 
 #[cfg(feature = "test-support")]
@@ -391,6 +464,7 @@ pub struct SqliteChannelStore<'connection> {
     /// Test-support failpoints; zero (the default) in production.
     fail_write_prepared: u64,
     fail_commit_outcome: u64,
+    fail_write_prepared_outbound: u64,
 }
 
 impl std::fmt::Debug for SqliteChannelStore<'_> {
@@ -445,7 +519,7 @@ impl<'connection> SqliteChannelStore<'connection> {
             }
         }
         transaction.commit().map_err(map_sqlite)?;
-        Ok(Self { connection, owner, owner_digest, fail_write_prepared: 0, fail_commit_outcome: 0 })
+        Ok(Self { connection, owner, owner_digest, fail_write_prepared: 0, fail_commit_outcome: 0, fail_write_prepared_outbound: 0 })
     }
 
     #[cfg(feature = "test-support")]
@@ -459,6 +533,13 @@ impl<'connection> SqliteChannelStore<'connection> {
     /// terminal transactions.
     pub fn inject_commit_outcome_failure(&mut self, n: u64) {
         self.fail_commit_outcome = n;
+    }
+
+    #[cfg(feature = "test-support")]
+    /// Test-support only: inject failures into the next `n` durable outbound
+    /// Prepared writes (the pre-admission/idempotency persistence step).
+    pub fn inject_write_prepared_outbound_failure(&mut self, n: u64) {
+        self.fail_write_prepared_outbound = n;
     }
 
     /// Verify the store is bound to the exact current principal (full fence
@@ -604,6 +685,126 @@ impl<'connection> SqliteChannelStore<'connection> {
         Ok(())
     }
 
+    /// Full canonical/invariant verification of one loaded durable outbound
+    /// record: record digest recomputed, table key == record key ==
+    /// `entry.action_id`, canonical committed Action bytes re-encoded
+    /// byte-identically, operation digest recomputed from the exact Action
+    /// bytes + complete principal fences, idempotency-key derivation, derived
+    /// account, complete sealed principal == bound store owner, and the
+    /// prepared-state invariants. A self-consistent semantic tamper (fields
+    /// edited and the outer hash recomputed) fails closed at the digest/key/
+    /// owner re-derivation.
+    fn verify_outbound_record(
+        connection: &Connection,
+        outbound_key: &str,
+        record: &DurableOutboundRecord,
+        owner: &StoreOwner,
+    ) -> Result<(), ChannelError> {
+        // Re-encode and recompute the record digest.
+        let bytes = dolly_canonical_json::canonicalize(record)
+            .map_err(|e| corrupted(&format!("channel outbound record failed canonicalization: {e}")))?
+            .0
+            .as_bytes()
+            .to_vec();
+        let recomputed = Sha256Digest::compute(&bytes).to_canonical_string();
+        let stored_digest: String = connection
+            .query_row("SELECT record_digest FROM channel_outbound WHERE outbound_key = ?1", [outbound_key], |row| row.get(0))
+            .map_err(map_sqlite)?;
+        if recomputed != stored_digest {
+            return Err(corrupted("channel outbound record digest mismatch"));
+        }
+        // Table key must equal the record key and the entry action id.
+        if record.outbound_key != outbound_key {
+            return Err(corrupted("channel outbound record key does not match the table key"));
+        }
+        if record.entry.action_id != outbound_key {
+            return Err(corrupted("channel outbound record action id does not match the record key"));
+        }
+        if record.entry.session_id.is_empty() {
+            return Err(corrupted("channel outbound record session is empty"));
+        }
+        // The committed Action bytes must be strictly canonical JSON.
+        let parsed = dolly_canonical_json::parse_core_json(
+            record.action_jcs.as_bytes(),
+            dolly_canonical_json::ParseLimits::protocol_wire(),
+        )
+        .map_err(|_| corrupted("channel outbound action bytes are not canonical JSON"))?;
+        let recanon = dolly_canonical_json::canonicalize(&parsed)
+            .map_err(|_| corrupted("channel outbound action bytes failed canonical re-encoding"))?
+            .0
+            .as_bytes()
+            .to_vec();
+        if recanon != record.action_jcs.as_bytes() {
+            return Err(corrupted("channel outbound action bytes are not canonically encoded"));
+        }
+        // Recompute the authority-bound operation digest from the exact
+        // committed Action bytes, the targeted module, the config revision
+        // and the complete principal fences.
+        let recomputed_digest = crate::host_adapter::outbound_operation_digest(
+            &record.extension_id,
+            &record.module_id,
+            &record.instance_id,
+            record.generation as u64,
+            record.revision,
+            record.graph_revision,
+            &record.graph_digest,
+            record.config_revision,
+            &record.account,
+            &record.action_jcs,
+            &record.target_module_id,
+        );
+        if recomputed_digest != record.digest {
+            return Err(corrupted("channel outbound operation digest mismatch (semantic tamper)"));
+        }
+        // Idempotency-key derivation is deterministic from the action id.
+        let expected_key = if record.entry.idempotency_supported {
+            Some(crate::ids::outbound_idempotency_key(&record.outbound_key))
+        } else {
+            None
+        };
+        if record.entry.idempotency_key != expected_key {
+            return Err(corrupted("channel outbound idempotency key does not match the action id"));
+        }
+        // Derived account must equal the stored account.
+        let expected_account = crate::ids::channel_account(
+            &record.owner,
+            &record.extension_id,
+            &record.module_id,
+            &record.instance_id,
+        );
+        if record.account != expected_account {
+            return Err(corrupted("channel outbound record account does not match the derived principal account"));
+        }
+        // Full bound principal equality against the store owner.
+        if record.owner != owner.owner
+            || record.extension_id != owner.extension_id
+            || record.module_id != owner.module_id
+            || record.instance_id != owner.instance_id
+            || record.generation != owner.generation
+            || record.revision != owner.revision
+            || record.graph_revision != owner.graph_revision
+            || record.graph_digest != owner.graph_digest
+            || record.config_revision != owner.config_revision
+            || record.account != owner.account
+        {
+            return Err(corrupted("channel outbound record owner/meta does not match the bound principal"));
+        }
+        if !record.target_module_id.is_empty() && record.target_module_id != record.module_id {
+            // A committed outbound Action targets the current module; any
+            // other target is opposite-direction authority and fails closed.
+            return Err(corrupted("channel outbound record targets a different module"));
+        }
+        // Prepared-state invariants: a non-terminal row never carries a
+        // frozen result, and a Prepared row was never dispatched.
+        if !record.entry.state.is_terminal() && record.entry.result_jcs.is_some() {
+            return Err(corrupted("channel outbound non-terminal record carries a frozen result"));
+        }
+        if record.entry.state == OutboundState::Prepared && record.entry.dispatched_at.is_some() {
+            return Err(corrupted("channel outbound prepared record is already dispatched"));
+        }
+        Ok(())
+    }
+
     fn load_intent(&mut self, intent_key: &str) -> Result<Option<ChannelIntent>, ChannelError> {
         self.verify_owner_meta()?;
         let row: Option<(String, Vec<u8>)> = self
@@ -723,6 +924,121 @@ impl<'connection> SqliteChannelStore<'connection> {
             let record = ChannelIntent::from_canonical_string(text)?;
             Self::verify_intent(self.connection, &key, &record, &self.owner)?;
             if record.state == IntentState::Prepared {
+                pending.push(record);
+            }
+        }
+        Ok(pending)
+    }
+
+    fn load_outbound(&mut self, outbound_key: &str) -> Result<Option<DurableOutboundRecord>, ChannelError> {
+        self.verify_owner_meta()?;
+        let row: Option<(String, Vec<u8>)> = self
+            .connection
+            .query_row("SELECT record_digest, canonical_jcs FROM channel_outbound WHERE outbound_key = ?1", [outbound_key], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()
+            .map_err(map_sqlite)?;
+        let Some((digest, jcs)) = row else { return Ok(None); };
+        let computed = Sha256Digest::compute(&jcs).to_canonical_string();
+        if computed != digest {
+            return Err(corrupted("channel outbound stored digest mismatch (tampered)"));
+        }
+        let text = std::str::from_utf8(&jcs).map_err(|_| corrupted("channel outbound record is not UTF-8"))?;
+        let record: DurableOutboundRecord = serde_json::from_str(text)
+            .map_err(|_| corrupted("channel outbound record is not a strict canonical record"))?;
+        Self::verify_outbound_record(self.connection, outbound_key, &record, &self.owner)?;
+        Ok(Some(record))
+    }
+
+    fn write_outbound_row(
+        transaction: &rusqlite::Transaction<'_>,
+        record: &DurableOutboundRecord,
+    ) -> Result<(), ChannelError> {
+        let bytes = dolly_canonical_json::canonicalize(record)
+            .map_err(|e| corrupted(&format!("channel outbound record failed canonicalization: {e}")))?
+            .0
+            .as_bytes()
+            .to_vec();
+        let digest = Sha256Digest::compute(&bytes).to_canonical_string();
+        transaction
+            .execute(
+                "INSERT INTO channel_outbound (outbound_key, record_digest, canonical_jcs) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(outbound_key) DO UPDATE SET record_digest = ?2, canonical_jcs = ?3",
+                params![record.outbound_key, digest, bytes.as_slice()],
+            )
+            .map_err(map_sqlite)?;
+        Ok(())
+    }
+
+    /// Durably persist the `Prepared` outbound record for one committed
+    /// targeted Action BEFORE any queue admission or transport call. The
+    /// same key + operation digest replays idempotently (a terminal row
+    /// returns its stored result with zero re-dispatch, a non-terminal row
+    /// is never overwritten or downgraded); the same key with a different
+    /// digest (different target/content/config) conflicts before enqueue and
+    /// changes nothing.
+    pub(crate) fn write_prepared_outbound(
+        &mut self,
+        record: &DurableOutboundRecord,
+    ) -> Result<OutboundPreparedOutcome, ChannelError> {
+        if self.fail_write_prepared_outbound > 0 {
+            self.fail_write_prepared_outbound -= 1;
+            return Err(ChannelError::new(codes::INTERNAL, false, ChannelOutcome::NotApplied, "injected durable outbound prepared write failure"));
+        }
+        self.verify_owner_meta()?;
+        if record.schema != OUTBOUND_RECORD_SCHEMA || record.version != 1 {
+            return Err(corrupted("channel outbound record discriminator mismatch"));
+        }
+        if record.entry.state != OutboundState::Prepared {
+            return Err(corrupted("write_prepared_outbound requires a prepared outbound record"));
+        }
+        if let Some(existing) = self.load_outbound(&record.outbound_key)? {
+            if existing.digest != record.digest {
+                return Err(ChannelError::new(
+                    codes::OPERATION_CONFLICT,
+                    false,
+                    ChannelOutcome::NotApplied,
+                    "durable outbound key already carries a different operation digest (different target/content/config)",
+                ));
+            }
+            if existing.entry.state.is_terminal() {
+                let result_jcs = existing.entry.result_jcs.clone().ok_or_else(|| {
+                    corrupted("terminal outbound record has no frozen result")
+                })?;
+                return Ok(OutboundPreparedOutcome::ReplayTerminal {
+                    state: existing.entry.state,
+                    result_jcs,
+                });
+            }
+            return Ok(OutboundPreparedOutcome::PreparedExisting);
+        }
+        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(map_sqlite)?;
+        Self::write_outbound_row(&transaction, record)?;
+        transaction.commit().map_err(map_sqlite)?;
+        Ok(OutboundPreparedOutcome::Prepared)
+    }
+
+    /// The verified durable outbound record for one action key.
+    pub(crate) fn find_outbound(&mut self, outbound_key: &str) -> Result<Option<DurableOutboundRecord>, ChannelError> {
+        self.load_outbound(outbound_key)
+    }
+
+    /// Every non-terminal (`Prepared`) durable outbound record, for
+    /// restart/recovery and the committed-Action pipeline.
+    pub(crate) fn list_pending_outbound(&mut self) -> Result<Vec<DurableOutboundRecord>, ChannelError> {
+        self.verify_owner_meta()?;
+        let mut statement = self.connection.prepare("SELECT outbound_key, record_digest, canonical_jcs FROM channel_outbound").map_err(map_sqlite)?;
+        let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?))).map_err(map_sqlite)?.collect::<Result<Vec<_>, _>>().map_err(map_sqlite)?;
+        let mut pending = Vec::new();
+        for (key, digest, jcs) in rows {
+            let computed = Sha256Digest::compute(&jcs).to_canonical_string();
+            if computed != digest {
+                return Err(corrupted("channel outbound stored digest mismatch (tampered)"));
+            }
+            let text = std::str::from_utf8(&jcs).map_err(|_| corrupted("channel outbound record is not UTF-8"))?;
+            let record: DurableOutboundRecord = serde_json::from_str(text)
+                .map_err(|_| corrupted("channel outbound record is not a strict canonical record"))?;
+            Self::verify_outbound_record(self.connection, &key, &record, &self.owner)?;
+            if !record.entry.state.is_terminal() {
                 pending.push(record);
             }
         }
@@ -934,7 +1250,7 @@ mod tests {
     use super::*;
     use crate::host_adapter::channel_intent_digest;
     use crate::intent::CHANNEL_INTENT_RECORD_SCHEMA as SCHEMA;
-    use crate::ledger::EventKind;
+    use crate::ledger::{EventKind, OutboundPiece, OutboundState, PieceOutcome};
 
     fn principal() -> ChannelPrincipal {
         ChannelPrincipal::from_parts("owner-1", "org.dolly.channel", "receiver", "worker-1", 1, 1, 1, "digest-g")
@@ -1465,5 +1781,175 @@ mod tests {
             let err = store.project_ledger().expect_err("forged echo must fail closed");
             assert_eq!(err.code, codes::LEDGER_CORRUPT);
         }
+    }
+
+    // -- durable Prepared outbound record ----------------------------------
+
+    fn outbound_account() -> String {
+        crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1")
+    }
+
+    /// A canonical committed send Action JSON object (text part only).
+    fn send_action_jcs(action_id: &str, session_id: &str, target: &str, text: &str) -> String {
+        let action = serde_json::json!({
+            "action_id": action_id,
+            "name": "org.dolly.channel.send",
+            "target": {"module_id": target},
+            "arguments": {
+                "session_id": session_id,
+                "parts": [{"kind": "text", "text": text, "format": "plain"}],
+                "reply_to_external_message_id": null
+            },
+            "contract_binding": {
+                "module_id": target,
+                "descriptor_revision": 1,
+                "action_contract_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "action_contract": {
+                    "name": "org.dolly.channel.send",
+                    "arguments_schema": {
+                        "uri": "https://dolly.example/spec/0.1/schemas/channel-send.schema.json",
+                        "schema_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                        "semantic_validator": null
+                    },
+                    "result_schema": {
+                        "uri": "https://dolly.example/spec/0.1/schemas/channel-send-result.schema.json",
+                        "schema_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                        "semantic_validator": {
+                            "id": "org.dolly.validator.channel-send-result",
+                            "revision": 1
+                        }
+                    },
+                    "description": "send a message",
+                    "side_effect_class": "idempotent_write"
+                }
+            }
+        });
+        String::from_utf8(
+            dolly_canonical_json::canonicalize(&action).unwrap().0.as_bytes().to_vec(),
+        )
+        .expect("canonical action is UTF-8")
+    }
+
+    /// A semantically valid durable Prepared outbound record bound to the
+    /// test store owner and config revision, with the authority-bound digest
+    /// recomputed from the canonical Action bytes.
+    fn valid_outbound_record(action_id: &str, session_id: &str, target: &str, text: &str) -> DurableOutboundRecord {
+        let action_jcs = send_action_jcs(action_id, session_id, target, text);
+        let account = outbound_account();
+        let digest = crate::host_adapter::outbound_operation_digest(
+            "org.dolly.channel", "receiver", "worker-1", 1, 1, 1, "digest-g",
+            1, &account, &action_jcs, target,
+        );
+        DurableOutboundRecord {
+            schema: OUTBOUND_RECORD_SCHEMA.to_string(),
+            version: 1,
+            outbound_key: action_id.to_string(),
+            digest,
+            action_jcs,
+            target_module_id: target.to_string(),
+            owner: "owner-1".to_string(),
+            extension_id: "org.dolly.channel".to_string(),
+            module_id: "receiver".to_string(),
+            instance_id: "worker-1".to_string(),
+            generation: 1,
+            revision: 1,
+            graph_revision: 1,
+            graph_digest: "digest-g".to_string(),
+            config_revision: 1,
+            account,
+            entry: OutboundEntry {
+                action_id: action_id.to_string(),
+                session_id: session_id.to_string(),
+                config_revision: 1,
+                state: OutboundState::Prepared,
+                pieces: vec![OutboundPiece {
+                    ordinal: 0,
+                    text: text.to_string(),
+                    transport_message_id: None,
+                    outcome: None,
+                }],
+                idempotency_supported: true,
+                idempotency_key: Some(crate::ids::outbound_idempotency_key(action_id)),
+                attempts: vec![],
+                dispatched_at: None,
+                result_jcs: None,
+            },
+        }
+    }
+
+    #[test]
+    fn prepared_outbound_record_is_idempotent_conflicts_on_change_and_durable() {
+        let mut connection = connection();
+        let account = outbound_account();
+        let action_id = "0198ab31-6c44-7e8a-b2bb-000000000201";
+        let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+        let first = valid_outbound_record(action_id, "session-main", "receiver", "Hello.");
+        assert_eq!(
+            store.write_prepared_outbound(&first).unwrap(),
+            OutboundPreparedOutcome::Prepared,
+            "a fresh key+digest persists as Prepared"
+        );
+        // Same key + digest replays with nothing changed and no downgrade.
+        let replay = valid_outbound_record(action_id, "session-main", "receiver", "Hello.");
+        assert_eq!(
+            store.write_prepared_outbound(&replay).unwrap(),
+            OutboundPreparedOutcome::PreparedExisting,
+            "same key+digest is idempotent"
+        );
+        // Same key + different content (different text) conflicts before enqueue.
+        let changed = valid_outbound_record(action_id, "session-main", "receiver", "Different.");
+        let error = store.write_prepared_outbound(&changed).expect_err("different content must conflict");
+        assert_eq!(error.code, codes::OPERATION_CONFLICT);
+        // The durable row is unchanged by the conflict attempt.
+        let loaded = store.find_outbound(action_id).unwrap().expect("durable row");
+        assert_eq!(loaded.entry.pieces[0].text, "Hello.");
+        // Reopen (restart) still sees the durable Prepared row.
+        drop(store);
+        let mut reopened = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+        let again = reopened.find_outbound(action_id).unwrap().expect("survives restart");
+        assert_eq!(again.entry.state, OutboundState::Prepared);
+        assert_eq!(again.digest, first.digest);
+        assert_eq!(reopened.list_pending_outbound().unwrap().len(), 1);
+        let _ = account;
+    }
+
+    #[test]
+    fn prepared_outbound_tamper_fails_closed() {
+        let mut connection = connection();
+        let action_id = "0198ab31-6c44-7e8a-b2bb-000000000202";
+        let record = valid_outbound_record(action_id, "session-main", "receiver", "Hello.");
+        {
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+            store.write_prepared_outbound(&record).unwrap();
+        }
+        // Re-hash a tampered canonical record: change the targeted module and
+        // recompute the outer hash. Full verification must fail closed.
+        let row: (String, Vec<u8>) = connection.query_row(
+            "SELECT record_digest, canonical_jcs FROM channel_outbound WHERE outbound_key = ?1",
+            [action_id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        let text = String::from_utf8(row.1).unwrap();
+        let mut forged: serde_json::Value = serde_json::from_str(&text).unwrap();
+        forged["target_module_id"] = serde_json::json!("receiver-other");
+        let forged = serde_json::to_string(&forged).unwrap();
+        let digest = Sha256Digest::compute(forged.as_bytes()).to_canonical_string();
+        connection.execute(
+            "UPDATE channel_outbound SET record_digest = ?1, canonical_jcs = ?2 WHERE outbound_key = ?3",
+            rusqlite::params![digest, forged.as_bytes(), action_id],
+        ).unwrap();
+        let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+        let err = store.find_outbound(action_id).expect_err("semantic tamper must fail closed");
+        assert_eq!(err.code, codes::LEDGER_CORRUPT);
+    }
+
+    #[test]
+    fn prepared_outbound_write_failure_leaves_no_row() {
+        let mut connection = connection();
+        let action_id = "0198ab31-6c44-7e8a-b2bb-000000000203";
+        let record = valid_outbound_record(action_id, "session-main", "receiver", "Hello.");
+        let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+        store.inject_write_prepared_outbound_failure(1);
+        let err = store.write_prepared_outbound(&record).expect_err("injected write failure");
+        assert_eq!(err.code, codes::INTERNAL);
+        assert!(store.find_outbound(action_id).unwrap().is_none(), "no durable row after a failed pre-admission write");
     }
 }
