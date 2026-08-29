@@ -26,12 +26,9 @@ pub mod ids;
 pub mod ingress;
 pub(crate) mod intent;
 pub mod ledger;
-pub mod outbound;
-#[cfg(feature = "test-support")]
-pub mod outbound_committed;
-#[cfg(feature = "test-support")]
+pub(crate) mod outbound;
+pub(crate) mod outbound_committed;
 pub mod outbound_consumer;
-#[cfg(feature = "test-support")]
 pub mod outbound_queue;
 pub(crate) mod principal;
 pub mod projection;
@@ -59,29 +56,20 @@ pub use ledger::{
 };
 pub use ledger::{ledger_from_json_string, ledger_to_json_string};
 
-/// The raw outbound dispatch surface is the accepted crate contract that the
-/// G4 conformance probes drive directly (they pre-authorize the session and
-/// extract the committed Action from the real Core snapshot). It is NOT a
-/// production entry point: the shipping runtime has no committed-Action
-/// consumer loop, and no caller can feed an unverified `SendAction` into the
-/// real transport path without the sealed authority/grant and a committed
-/// Block from the authoritative journal.
+/// Raw verifier/direct-dispatch surface. Test/conformance-only: the G4
+/// conformance probes drive these directly over pre-authorized sessions and
+/// committed Blocks from the real Core journal. NOT a production entry point:
+/// the production path is the sealed [`OutboundConsumer`]; no caller can feed
+/// an unverified `SendAction` into the real transport path in a default
+/// build. Enabled only by the non-default `test-support` feature.
+#[cfg(feature = "test-support")]
 pub use outbound::{
     PieceObservation, SendAction, SendDispatchResult, dispatch_send, observe_outbound,
     parse_send_action, recover_outbound,
 };
 
-/// Committed-Action outbound consumer, verification boundary, and bounded
-/// queue. Test/conformance-only: these are the seam-D implementation pieces
-/// the integrator wires into the runtime loop. Enabled only by the
-/// non-default `test-support` feature.
-#[cfg(feature = "test-support")]
-pub use outbound_committed::{CommittedSendAction, committed_send_from_block};
-#[cfg(feature = "test-support")]
-pub use outbound_consumer::{
-    CommittedActionSource, ConsumerOutcome, OutboundConsumer, SnapshotCommittedActionSource,
-};
-#[cfg(feature = "test-support")]
+/// The single sealed production outbound consumer and its queue seam.
+pub use outbound_consumer::{ConsumerOutcome, OutboundConsumer};
 pub use outbound_queue::{BoundedPendingQueue, PendingQueueSlot};
 
 pub use transport::{

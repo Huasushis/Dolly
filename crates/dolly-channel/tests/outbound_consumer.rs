@@ -21,7 +21,7 @@ mod common;
 use common::g4::*;
 use dolly_channel::{
     ChannelConfigBuilder, ChannelPrincipal, InboundReceiver, IngressOutcome, OutboundConsumer,
-    OutboundState, SnapshotCommittedActionSource, SqliteChannelStore, create_channel_store_schema,
+    OutboundState, SqliteChannelStore, create_channel_store_schema,
     timestamp_plus_seconds,
 };
 use dolly_channel::error::codes;
@@ -273,13 +273,11 @@ fn consume_one(
     transport: &SharedTransport,
 ) -> (Connection, dolly_channel::ConsumerOutcome) {
     let mut module_conn = reopen_module_store(fixture);
-    let source = SnapshotCommittedActionSource::new(&mut fixture.harness.connection)
-        .expect("committed-action source over the real Core journal");
     let mut consumer = OutboundConsumer::new(
         channel_config(),
         Box::new(channel_clock()),
         &mut module_conn,
-        source,
+        &mut fixture.harness.connection,
         Box::new(transport.clone()),
         &fixture.harness.authority,
         &fixture.harness.grant,
@@ -374,13 +372,11 @@ fn pre_admission_durability_failure_yields_zero_effect() {
         let mut module_conn = reopen_module_store(&fixture);
         let mut store = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
         store.inject_write_prepared_outbound_failure(1);
-        let source = SnapshotCommittedActionSource::new(&mut fixture.harness.connection)
-            .expect("committed-action source");
         let mut consumer = OutboundConsumer::new_with_store(
             channel_config(),
             Box::new(channel_clock()),
             store,
-            source,
+            &mut fixture.harness.connection,
             Box::new(transport.clone()),
             &fixture.harness.authority,
             &fixture.harness.grant,
@@ -452,36 +448,23 @@ fn wrong_target_foreign_owner_and_unowned_session_are_rejected_with_zero_effect(
 
     let transport = SharedTransport::new(true);
     let mut module_conn = reopen_module_store(&fixture);
-    let source = SnapshotCommittedActionSource::new(&mut fixture.harness.connection).unwrap();
     let mut consumer = OutboundConsumer::new(
         channel_config(),
         Box::new(channel_clock()),
         &mut module_conn,
-        source,
+        &mut fixture.harness.connection,
         Box::new(transport.clone()),
         &fixture.harness.authority,
         &fixture.harness.grant,
     )
     .expect("consumer");
     let outcomes = consumer.consume(&far_deadline()).expect("consume");
-    // The foreign-owner block is not a channel send Action (the cheap filter
-    // skips it: zero leakage), so the non-targeted and unowned-session send
-    // Actions are the only outcomes.
-    assert_eq!(outcomes.len(), 2, "the two real channel send Actions processed");
-    for outcome in &outcomes {
-        match outcome {
-            dolly_channel::ConsumerOutcome::Rejected { error, .. } => {
-                assert!(
-                    error.code == codes::AUTHORIZATION_FAILED
-                        || error.code == codes::SESSION_MISSING,
-                    "unexpected rejection code: {}",
-                    error.code
-                );
-            }
-            other => panic!("expected deterministic rejection, got {other:?}"),
-        }
-    }
-    assert_eq!(transport.calls().len(), 0, "zero transport for rejected actions");
+    // The sealed selection refuses every hostile Block BEFORE enqueue: a
+    // non-targeted send, a foreign-owner action, and an unowned-session send
+    // all yield ZERO outcomes and ZERO durable/transport effect. Generic
+    // Blocks must never become actions.
+    assert_eq!(outcomes.len(), 0, "hostile Blocks are refused before enqueue");
+    assert_eq!(transport.calls().len(), 0, "zero transport for refused actions");
     drop(consumer);
     let mut reopened = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
     assert!(reopened.list_pending_outbound().unwrap().is_empty(), "no durable outbound rows");
@@ -512,12 +495,11 @@ fn same_key_different_content_conflicts_before_enqueue() {
         message_ids: vec!["m-conflict".to_string()],
     });
     let mut module_conn = reopen_module_store(&fixture);
-    let source = SnapshotCommittedActionSource::new(&mut fixture.harness.connection).unwrap();
     let mut consumer = OutboundConsumer::new(
         channel_config(),
         Box::new(channel_clock()),
         &mut module_conn,
-        source,
+        &mut fixture.harness.connection,
         Box::new(transport.clone()),
         &fixture.harness.authority,
         &fixture.harness.grant,
@@ -582,12 +564,11 @@ fn bounded_queue_waits_then_expires_and_releases_no_slot() {
         // caller deadline it backpressures with zero transport call and no
         // additional slot leak.
         let mut module_conn = reopen_module_store(&fixture);
-        let source = SnapshotCommittedActionSource::new(&mut fixture.harness.connection).unwrap();
-        let mut consumer = OutboundConsumer::new(
+            let mut consumer = OutboundConsumer::new(
             config,
             Box::new(channel_clock()),
             &mut module_conn,
-            source,
+            &mut fixture.harness.connection,
             Box::new(transport.clone()),
             &fixture.harness.authority,
             &fixture.harness.grant,
@@ -629,12 +610,11 @@ fn bounded_queue_waits_then_expires_and_releases_no_slot() {
         message_ids: vec!["m-bp-2".to_string()],
     });
     let mut module_conn = reopen_module_store(&fixture);
-    let source2 = SnapshotCommittedActionSource::new(&mut fixture.harness.connection).unwrap();
     let mut consumer2 = OutboundConsumer::new(
         channel_config(),
         Box::new(channel_clock()),
         &mut module_conn,
-        source2,
+        &mut fixture.harness.connection,
         Box::new(transport2.clone()),
         &fixture.harness.authority,
         &fixture.harness.grant,
@@ -680,13 +660,11 @@ fn crash_after_prepared_before_dispatch_redispatch_and_never_duplicates() {
         let mut module_conn = reopen_module_store(&fixture);
         let mut store = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
         store.inject_mark_dispatched_failure(1);
-        let source = SnapshotCommittedActionSource::new(&mut fixture.harness.connection)
-            .expect("committed-action source");
         let mut consumer = OutboundConsumer::new_with_store(
             channel_config(),
             Box::new(channel_clock()),
             store,
-            source,
+            &mut fixture.harness.connection,
             Box::new(transport.clone()),
             &fixture.harness.authority,
             &fixture.harness.grant,
@@ -732,13 +710,11 @@ fn crash_after_dispatch_marker_never_blind_resends_and_reconciles_status_first()
         let mut module_conn = reopen_module_store(&fixture);
         let mut store = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
         store.inject_commit_outbound_terminal_failure(1);
-        let source = SnapshotCommittedActionSource::new(&mut fixture.harness.connection)
-            .expect("committed-action source");
         let mut consumer = OutboundConsumer::new_with_store(
             channel_config(),
             Box::new(channel_clock()),
             store,
-            source,
+            &mut fixture.harness.connection,
             Box::new(transport.clone()),
             &fixture.harness.authority,
             &fixture.harness.grant,
@@ -752,12 +728,11 @@ fn crash_after_dispatch_marker_never_blind_resends_and_reconciles_status_first()
     // Phase B: restart. The durable row is Dispatched: it MUST NOT be
     // re-dispatched (no blind resend) and MUST NOT be reported success.
     let mut module_conn = reopen_module_store(&fixture);
-    let source = SnapshotCommittedActionSource::new(&mut fixture.harness.connection).unwrap();
     let mut consumer2 = OutboundConsumer::new(
         channel_config(),
         Box::new(channel_clock()),
         &mut module_conn,
-        source,
+        &mut fixture.harness.connection,
         Box::new(transport.clone()),
         &fixture.harness.authority,
         &fixture.harness.grant,
@@ -784,12 +759,11 @@ fn crash_after_dispatch_marker_never_blind_resends_and_reconciles_status_first()
         },
     );
     {
-        let source = SnapshotCommittedActionSource::new(&mut fixture.harness.connection).unwrap();
-        let mut consumer3 = OutboundConsumer::new(
+            let mut consumer3 = OutboundConsumer::new(
             channel_config(),
             Box::new(channel_clock()),
             &mut module_conn,
-            source,
+            &mut fixture.harness.connection,
             Box::new(transport.clone()),
             &fixture.harness.authority,
             &fixture.harness.grant,
@@ -863,12 +837,11 @@ fn zero_reverse_echo_or_premise_leakage() {
     // Only the committed INBOUND premise (no send Action) exists in Core.
     let transport = SharedTransport::new(true);
     let mut module_conn = reopen_module_store(&fixture);
-    let source = SnapshotCommittedActionSource::new(&mut fixture.harness.connection).unwrap();
     let mut consumer = OutboundConsumer::new(
         channel_config(),
         Box::new(channel_clock()),
         &mut module_conn,
-        source,
+        &mut fixture.harness.connection,
         Box::new(transport.clone()),
         &fixture.harness.authority,
         &fixture.harness.grant,
@@ -880,4 +853,51 @@ fn zero_reverse_echo_or_premise_leakage() {
     assert_eq!(transport.calls().len(), 0);
     assert_eq!(consumer.queue().total_inflight(), 0, "queue untouched");
     drop(consumer);
+}
+
+/// Item 1/6: fresh authority revalidation. After the grant is revoked (or the
+/// generation/lifecycle fence changes), the sealed consumer MUST refuse the
+/// next consume BEFORE any durable or transport effect, with zero outcomes
+/// and zero store mutation.
+#[test]
+fn revoked_grant_or_changed_lifecycle_fence_refuses_consume_before_any_effect() {
+    let mut fixture = setup("consumer-revoke");
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000812";
+    commit_block(
+        &mut fixture.harness.connection,
+        "consumer-revoke",
+        "ing-1",
+        &format!("{action_id}-block"),
+        send_block_for(MODULE_ID, action_id, &fixture.session, &["Hello."]),
+        vec!["page-a".to_string()],
+    );
+
+    // Revoke the current capability grant: the grant fence no longer holds.
+    let authority = fixture.harness.authority.clone();
+    fixture.harness.revoke_grant(&authority, MODULE_ID);
+
+    let transport = SharedTransport::new(true);
+    transport.push(TransportSendResult::AllConfirmed {
+        message_ids: vec!["m-revoked".to_string()],
+    });
+    let mut module_conn = reopen_module_store(&fixture);
+    let mut consumer = OutboundConsumer::new(
+        channel_config(),
+        Box::new(channel_clock()),
+        &mut module_conn,
+        &mut fixture.harness.connection,
+        Box::new(transport.clone()),
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .expect("consumer");
+    let err = consumer.consume(&far_deadline()).expect_err("revoked grant must refuse");
+    assert_eq!(err.code, codes::AUTHENTICATION_FAILED);
+    assert_eq!(transport.calls().len(), 0, "zero transport effect under a revoked grant");
+    drop(consumer);
+
+    // No durable outbound row was written.
+    let mut module_conn2 = Connection::open(&fixture.module_path).unwrap();
+    let mut reopened = SqliteChannelStore::new(&mut module_conn2, &fixture.principal, 1).unwrap();
+    assert!(reopened.list_pending_outbound().unwrap().is_empty());
 }

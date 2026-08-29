@@ -21,6 +21,7 @@ use crate::ids;
 use crate::ledger::{
     AttemptRecord, ChannelLedger, OutboundEntry, OutboundPiece, OutboundState, PieceOutcome,
 };
+#[cfg(feature = "test-support")]
 use crate::rate_limit::OutboundAdmission;
 use crate::result_validator::{
     RESULT_VALIDATOR_ID, RESULT_VALIDATOR_REVISION, SEND_RESULT_SCHEMA_TAG, validate_send_result,
@@ -144,6 +145,7 @@ pub enum SendDispatchResult {
 
 /// One logged piece observation used to settle a pending dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "test-support")]
 pub struct PieceObservation {
     pub ordinal: u32,
     pub outcome: PieceOutcome,
@@ -357,6 +359,7 @@ pub(crate) fn authorize_send(
 /// Returns `Terminal` only when the ledger reached a closed outcome and the
 /// frozen `ActionResult` is produced. `DispatchedPending` means the transport
 /// response was lost and the durable outcome is unknown.
+#[cfg(feature = "test-support")]
 pub fn dispatch_send(
     config: &ChannelConfig,
     clock: &dyn Clock,
@@ -838,6 +841,7 @@ fn error_to_action_result(action_id: &str, error: ChannelError) -> CanonicalJson
 /// the transport (the durable dispatched marker precedes send initiation);
 /// it is left for the committed-Action consumer to dispatch and is NEVER
 /// reconciled to `unknown`.
+#[cfg(feature = "test-support")]
 pub fn recover_outbound(
     config: &ChannelConfig,
     clock: &dyn Clock,
@@ -870,6 +874,7 @@ pub fn recover_outbound(
     ids
 }
 
+#[cfg(feature = "test-support")]
 fn settle_recovered_unknown(
     _config: &ChannelConfig,
     ledger: &mut ChannelLedger,
@@ -954,6 +959,7 @@ fn settle_recovered_unknown(
 /// Reconcile a pending (`prepared`/`dispatched`) row on a re-entry of the same
 /// action (crash recovery). Never re-dispatches; the row is reconciled from
 /// its recorded piece outcomes.
+#[cfg(feature = "test-support")]
 fn recover_pending_send(
     config: &ChannelConfig,
     clock: &dyn Clock,
@@ -982,6 +988,7 @@ fn recover_pending_send(
 /// Apply late transport observations (webhook echoes, provider receipts) to a
 /// pending row and seek a terminal reconciliation. Rows already terminal are
 /// untouched so a confirmed result is never overwritten.
+#[cfg(feature = "test-support")]
 pub fn observe_outbound(
     config: &ChannelConfig,
     clock: &dyn Clock,
@@ -1036,9 +1043,4 @@ pub fn observe_outbound(
         }
     }
     settle_from_outbound_entry(config, ledger, action_id, clock.now().as_str())
-}
-
-/// Whether `dispatch_send` returned a terminal result (used by tests).
-pub fn is_terminal(result: &SendDispatchResult) -> bool {
-    matches!(result, SendDispatchResult::Terminal { .. })
 }
