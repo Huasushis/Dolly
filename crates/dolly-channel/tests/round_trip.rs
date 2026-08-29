@@ -13,7 +13,7 @@ use dolly_channel::{
 #[test]
 fn text_round_trip_has_exact_positive_evidence() {
     let config = config();
-    let mut clock = clock();
+    let clock = clock();
     let mut ledger = ChannelLedger::new();
     let mut core = MemCoreIngress::new();
     let mut transport = ScriptedTransport::new(true);
@@ -101,10 +101,10 @@ fn denied_path_has_zero_callback_effect_and_durable_mutation() {
     let disabled_config = ChannelConfigBuilder::new("web", "account-a", "web-channel", 1)
         .ingress_enabled(false)
         .build();
-    let mut clock = clock();
+    let clock = clock();
     let mut ledger = ChannelLedger::new();
     let mut core = MemCoreIngress::new();
-    let mut transport = ScriptedTransport::new(true);
+    let transport = ScriptedTransport::new(true);
 
     // A transport echo of an unknown id, plus a disabled-ingress event, plus a
     // malformed event: none reach Core, none reach the ledger, none reach the

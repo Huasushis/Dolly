@@ -321,7 +321,6 @@ fn durable_echo_marker_suppresses_matching_inbound_with_zero_core() {
     let mut harness = RuntimeHarness::new("recv-echo");
     let dir = tempdir().unwrap();
     let (mut channel_connection, _path) = channel_store_connection(dir.path());
-    let acct = account(&harness.authority, &harness.grant);
     let principal = principal_of(&harness);
     // Record a durable echo marker in the owner-bound store.
     {
