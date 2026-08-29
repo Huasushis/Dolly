@@ -32,6 +32,7 @@ pub mod outbound_consumer;
 pub mod outbound_queue;
 pub(crate) mod principal;
 pub mod projection;
+#[cfg(feature = "test-support")]
 pub mod rate_limit;
 pub mod receiver;
 pub mod result_validator;
@@ -70,23 +71,23 @@ pub use outbound::{
 
 /// The single sealed production outbound consumer and its queue seam.
 pub use outbound_consumer::{ConsumerOutcome, OutboundConsumer};
-pub use outbound_queue::{OutboundQueueGate, PendingQueueSlot};
+pub use outbound_queue::OutboundQueueGate;
 
-pub use transport::{
-    ChannelTransport, ScriptedTransport, TransportPiece, TransportPieceOutcome,
-    TransportSendRequest, TransportSendResult, TransportStatusRequest, TransportStatusResult,
-};
 pub use principal::ChannelPrincipal;
 pub use projection::{
     AttemptProjection, InboundProjection, LedgerSnapshotProjection, OutboundProjection,
 };
+#[cfg(feature = "test-support")]
 pub use rate_limit::{OutboundAdmission, TokenBucket};
 pub use receiver::{AuthenticatedChannelEvent, ChannelEventContent, InboundReceiver};
 pub use result_validator::{
     RESULT_VALIDATOR_ID, RESULT_VALIDATOR_REVISION, SEND_RESULT_SCHEMA_ID, SEND_RESULT_SCHEMA_TAG,
     result_contract_matches, semantic_validate_send_result, validate_send_result,
 };
-
+pub use transport::{
+    ChannelTransport, ScriptedTransport, TransportPiece, TransportPieceOutcome,
+    TransportSendRequest, TransportSendResult, TransportStatusRequest, TransportStatusResult,
+};
 
 /// Test/conformance surface only: exposes the crate-private store, intent
 /// record and receiver test constructor so real-SQLite/Core failpoint tests
@@ -100,4 +101,3 @@ pub use crate::intent::{ChannelIntent, IntentState};
 pub use crate::store::{
     DurableOutboundRecord, OutboundPreparedOutcome, SqliteChannelStore, create_channel_store_schema,
 };
-

@@ -40,12 +40,15 @@ use crate::principal::ChannelPrincipal;
 /// Derive the content facts from the canonical draft (`request_jcs`) — the
 /// single source of content truth. Projection fields and digest inputs are
 /// re-derived here and compared, never trusted from divergent stored copies.
-fn derive_draft_facts(intent: &ChannelIntent) -> Result<crate::host_adapter::ChannelDraftFacts, ChannelError> {
+fn derive_draft_facts(
+    intent: &ChannelIntent,
+) -> Result<crate::host_adapter::ChannelDraftFacts, ChannelError> {
     let parsed = serde_json::from_str::<serde_json::Value>(&intent.request_jcs)
         .map_err(|_| corrupted("channel intent draft is not JSON"))?;
     let draft = dolly_canonical_json::CanonicalJsonValue::try_from(parsed)
         .map_err(|_| corrupted("channel intent draft is not canonical JSON"))?;
-    channel_facts_from_draft(&draft).map_err(|_| corrupted("channel intent draft metadata is malformed"))
+    channel_facts_from_draft(&draft)
+        .map_err(|_| corrupted("channel intent draft metadata is malformed"))
 }
 
 /// The exact top-level fields the accepted draft builder emits.
@@ -54,15 +57,27 @@ const DRAFT_ROOT_KEYS: &[&str] = &["schema", "parts", "actions", "metadata"];
 const DRAFT_NAMESPACE_KEYS: &[&str] = &["org.dolly.channel"];
 /// The exact channel-metadata fields the accepted draft builder emits.
 const CHANNEL_METADATA_KEYS: &[&str] = &[
-    "channel_id", "transport", "session_id", "external_conversation_id",
-    "external_message_id", "sender_class", "received_at", "event_kind",
+    "channel_id",
+    "transport",
+    "session_id",
+    "external_conversation_id",
+    "external_message_id",
+    "sender_class",
+    "received_at",
+    "event_kind",
     "references_external_message_id",
 ];
 /// Channel metadata fields REQUIRED by the draft builder (all non-empty
 /// strings); `references_external_message_id` is the only optional field.
 const CHANNEL_REQUIRED_KEYS: &[&str] = &[
-    "channel_id", "transport", "session_id", "external_conversation_id",
-    "external_message_id", "sender_class", "received_at", "event_kind",
+    "channel_id",
+    "transport",
+    "session_id",
+    "external_conversation_id",
+    "external_message_id",
+    "sender_class",
+    "received_at",
+    "event_kind",
 ];
 
 /// Strict canonical verification of the stored draft (`request_jcs`): it must
@@ -91,17 +106,25 @@ fn verify_draft_canonical(intent: &ChannelIntent) -> Result<(), ChannelError> {
     };
     for key in root.iter().map(|(k, _)| k) {
         if !DRAFT_ROOT_KEYS.contains(&key) {
-            return Err(corrupted("channel intent draft carries an unknown top-level field"));
+            return Err(corrupted(
+                "channel intent draft carries an unknown top-level field",
+            ));
         }
     }
     for key in DRAFT_ROOT_KEYS {
         if root.get(key).is_none() {
-            return Err(corrupted(&format!("channel intent draft lacks required top-level field {key}")));
+            return Err(corrupted(&format!(
+                "channel intent draft lacks required top-level field {key}"
+            )));
         }
     }
     match root.get("schema") {
         Some(CanonicalJsonValue::String(tag)) if tag == crate::ingress::BLOCK_DRAFT_SCHEMA_TAG => {}
-        _ => return Err(corrupted("channel intent draft schema must equal dolly.block-draft/v1")),
+        _ => {
+            return Err(corrupted(
+                "channel intent draft schema must equal dolly.block-draft/v1",
+            ));
+        }
     }
     if !matches!(root.get("parts"), Some(CanonicalJsonValue::Array(_))) {
         return Err(corrupted("channel intent draft parts must be an array"));
@@ -115,35 +138,52 @@ fn verify_draft_canonical(intent: &ChannelIntent) -> Result<(), ChannelError> {
     };
     for key in metadata.iter().map(|(k, _)| k) {
         if !DRAFT_NAMESPACE_KEYS.contains(&key) {
-            return Err(corrupted("channel intent draft carries an unknown metadata namespace"));
+            return Err(corrupted(
+                "channel intent draft carries an unknown metadata namespace",
+            ));
         }
     }
     // 3. Channel metadata: every spec-required field present with the correct
     //    type (non-empty strings used by the lossless projection), no unknown
     //    fields; the edit/delete reference is the only optional field.
     let Some(CanonicalJsonValue::Object(channel)) = metadata.get("org.dolly.channel") else {
-        return Err(corrupted("channel intent draft lacks the channel metadata namespace"));
+        return Err(corrupted(
+            "channel intent draft lacks the channel metadata namespace",
+        ));
     };
     for key in channel.iter().map(|(k, _)| k) {
         if !CHANNEL_METADATA_KEYS.contains(&key) {
-            return Err(corrupted("channel intent draft carries an unknown metadata field"));
+            return Err(corrupted(
+                "channel intent draft carries an unknown metadata field",
+            ));
         }
     }
     for key in CHANNEL_REQUIRED_KEYS {
         if channel.get(key).is_none() {
-            return Err(corrupted(&format!("channel metadata lacks required field {key}")));
+            return Err(corrupted(&format!(
+                "channel metadata lacks required field {key}"
+            )));
         }
-        if !matches!(channel.get(key), Some(CanonicalJsonValue::String(value)) if !value.is_empty()) {
-            return Err(corrupted(&format!("channel metadata field {key} must be a non-empty string")));
+        if !matches!(channel.get(key), Some(CanonicalJsonValue::String(value)) if !value.is_empty())
+        {
+            return Err(corrupted(&format!(
+                "channel metadata field {key} must be a non-empty string"
+            )));
         }
     }
     if let Some(references) = channel.get("references_external_message_id") {
         // If present it must be a nonempty valid external identity string; a
         // present empty/invalid value is rejected, never normalized to None.
         match references {
-            CanonicalJsonValue::String(value) if !value.is_empty() && value.len() <= crate::ingress::MAX_EXTERNAL_ID_BYTES
-                && !value.chars().any(|c| c.is_control()) => {}
-            _ => return Err(corrupted("channel metadata references_external_message_id must be a nonempty valid external identity")),
+            CanonicalJsonValue::String(value)
+                if !value.is_empty()
+                    && value.len() <= crate::ingress::MAX_EXTERNAL_ID_BYTES
+                    && !value.chars().any(|c| c.is_control()) => {}
+            _ => {
+                return Err(corrupted(
+                    "channel metadata references_external_message_id must be a nonempty valid external identity",
+                ));
+            }
         }
     }
     // Exact relation shape consistent with the accepted builder: a message
@@ -161,7 +201,9 @@ fn verify_draft_canonical(intent: &ChannelIntent) -> Result<(), ChannelError> {
         }
         "edit" | "delete" => {
             if !has_reference {
-                return Err(corrupted("edit/delete draft must carry a nonempty reference"));
+                return Err(corrupted(
+                    "edit/delete draft must carry a nonempty reference",
+                ));
             }
         }
         _ => return Err(corrupted("channel metadata event_kind is invalid")),
@@ -222,6 +264,8 @@ struct EchoRecord {
 /// The logical table holding the durable outbound records (single durable
 /// source of truth for the committed targeted-Action outbound pipeline).
 const CHANNEL_OUTBOUND_TABLE: &str = "channel_outbound";
+const CHANNEL_OUTBOUND_ADMISSION_TABLE: &str = "channel_outbound_admission";
+const CHANNEL_OUTBOUND_RATE_TABLE: &str = "channel_outbound_rate";
 
 /// The closed schema discriminator of one durable `Prepared` outbound record.
 pub(crate) const OUTBOUND_RECORD_SCHEMA: &str = "dolly.channel-outbound/v1";
@@ -265,6 +309,18 @@ pub enum DispatchClaim {
         result_jcs: Option<String>,
     },
 }
+/// Result of one durable admission transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OutboundAdmissionOutcome {
+    Granted,
+    Waiting {
+        now_micros: i64,
+        wake_at_micros: i64,
+    },
+    Expired,
+    Cancelled,
+    Saturated,
+}
 
 /// The strict canonical durable outbound record: the complete sealed
 /// principal fence facts, the canonical committed Action bytes, the
@@ -285,10 +341,13 @@ pub struct DurableOutboundRecord {
     pub action_jcs: String,
     /// The Activation whose persisted manifest selected the input.
     pub activation_id: String,
-    /// Deterministic digest of the frozen manifest bytes.
+    /// Normative persisted manifest digest.
     pub manifest_digest: String,
-    /// The input item's index in Manifest Delivery order.
-    pub input_index: usize,
+    /// Exact Delivery occurrence coordinates within the manifest input item.
+    pub occurrence_index: usize,
+    pub page_id: String,
+    pub page_seq: i64,
+    pub commit_seq: i64,
     /// The send Action's index within the frozen Block's `body.actions`.
     pub action_index: usize,
     /// The committed Block that delivered the Action.
@@ -343,6 +402,19 @@ CREATE TABLE channel_outbound (
     state TEXT NOT NULL CHECK (state IN ('prepared','queued','dispatched','confirmed','partial','failed','unknown')),
     session_id TEXT NOT NULL,
     queued_seq INTEGER
+);
+CREATE TABLE channel_outbound_admission (
+    ticket INTEGER PRIMARY KEY AUTOINCREMENT,
+    outbound_key TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL,
+    deadline_micros INTEGER NOT NULL,
+    piece_count INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('waiting','cancelled','expired','granted'))
+);
+CREATE TABLE channel_outbound_rate (
+    session_id TEXT PRIMARY KEY NOT NULL,
+    tokens INTEGER NOT NULL,
+    last_refill_micros INTEGER NOT NULL
 )
 "#;
 
@@ -376,10 +448,48 @@ pub(crate) const CHANNEL_OUTBOUND_SCHEMA_SQL: &str = "CREATE TABLE channel_outbo
     queued_seq INTEGER
 )";
 
-const OWNER_COLUMNS: &[&str] = &["singleton", "schema_version", "schema_discriminator", "owner_jcs", "owner_digest"];
+pub(crate) const CHANNEL_OUTBOUND_ADMISSION_SCHEMA_SQL: &str =
+    "CREATE TABLE channel_outbound_admission (
+    ticket INTEGER PRIMARY KEY AUTOINCREMENT,
+    outbound_key TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL,
+    deadline_micros INTEGER NOT NULL,
+    piece_count INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('waiting','cancelled','expired','granted'))
+)";
+
+pub(crate) const CHANNEL_OUTBOUND_RATE_SCHEMA_SQL: &str = "CREATE TABLE channel_outbound_rate (
+    session_id TEXT PRIMARY KEY NOT NULL,
+    tokens INTEGER NOT NULL,
+    last_refill_micros INTEGER NOT NULL
+)";
+
+const OWNER_COLUMNS: &[&str] = &[
+    "singleton",
+    "schema_version",
+    "schema_discriminator",
+    "owner_jcs",
+    "owner_digest",
+];
 const INTENT_COLUMNS: &[&str] = &["intent_key", "record_digest", "canonical_jcs"];
 const ECHO_COLUMNS: &[&str] = &["echo_key", "record_digest", "canonical_jcs"];
-const OUTBOUND_COLUMNS: &[&str] = &["outbound_key", "record_digest", "canonical_jcs", "state", "session_id", "queued_seq"];
+const OUTBOUND_COLUMNS: &[&str] = &[
+    "outbound_key",
+    "record_digest",
+    "canonical_jcs",
+    "state",
+    "session_id",
+    "queued_seq",
+];
+const OUTBOUND_ADMISSION_COLUMNS: &[&str] = &[
+    "ticket",
+    "outbound_key",
+    "session_id",
+    "deadline_micros",
+    "piece_count",
+    "state",
+];
+const OUTBOUND_RATE_COLUMNS: &[&str] = &["session_id", "tokens", "last_refill_micros"];
 
 /// The sealed store ownership, derived only from a [`ChannelPrincipal`] and
 /// carrying the COMPLETE principal fence facts. Constructed solely inside
@@ -442,11 +552,21 @@ impl From<StoreOwnerBinding> for StoreOwner {
 }
 
 fn map_sqlite(error: rusqlite::Error) -> ChannelError {
-    ChannelError::new(codes::INTERNAL, false, ChannelOutcome::NotApplied, format!("channel store failure: {error}"))
+    ChannelError::new(
+        codes::INTERNAL,
+        false,
+        ChannelOutcome::NotApplied,
+        format!("channel store failure: {error}"),
+    )
 }
 
 fn corrupted(message: &str) -> ChannelError {
-    ChannelError::new(codes::LEDGER_CORRUPT, false, ChannelOutcome::NotApplied, message)
+    ChannelError::new(
+        codes::LEDGER_CORRUPT,
+        false,
+        ChannelOutcome::NotApplied,
+        message,
+    )
 }
 
 fn normalize_sql(sql: &str) -> String {
@@ -455,21 +575,46 @@ fn normalize_sql(sql: &str) -> String {
 
 fn verify_table(connection: &Connection, name: &str, expected: &str) -> Result<(), ChannelError> {
     let row: Option<(String, String)> = connection
-        .query_row("SELECT type, sql FROM sqlite_master WHERE name = ?1", [name], |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_row(
+            "SELECT type, sql FROM sqlite_master WHERE name = ?1",
+            [name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
         .optional()
         .map_err(map_sqlite)?;
     match row {
-        Some((t, actual)) if t == "table" && normalize_sql(&actual) == normalize_sql(expected) => Ok(()),
-        Some(_) => Err(corrupted(&format!("channel store table {name} does not match the exact schema"))),
-        None => Err(ChannelError::new(codes::LEDGER_MIGRATION_REQUIRED, false, ChannelOutcome::NotApplied, format!("channel store table {name} is missing"))),
+        Some((t, actual)) if t == "table" && normalize_sql(&actual) == normalize_sql(expected) => {
+            Ok(())
+        }
+        Some(_) => Err(corrupted(&format!(
+            "channel store table {name} does not match the exact schema"
+        ))),
+        None => Err(ChannelError::new(
+            codes::LEDGER_MIGRATION_REQUIRED,
+            false,
+            ChannelOutcome::NotApplied,
+            format!("channel store table {name} is missing"),
+        )),
     }
 }
 
-fn verify_columns(connection: &Connection, table: &str, expected: &[&str]) -> Result<(), ChannelError> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})")).map_err(map_sqlite)?;
-    let actual = statement.query_map([], |row| row.get::<_, String>(1)).map_err(map_sqlite)?.collect::<Result<Vec<_>, _>>().map_err(map_sqlite)?;
+fn verify_columns(
+    connection: &Connection,
+    table: &str,
+    expected: &[&str],
+) -> Result<(), ChannelError> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(map_sqlite)?;
+    let actual = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(map_sqlite)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_sqlite)?;
     if actual != expected {
-        return Err(corrupted(&format!("channel store table {table} columns are wrong")));
+        return Err(corrupted(&format!(
+            "channel store table {table} columns are wrong"
+        )));
     }
     Ok(())
 }
@@ -478,19 +623,47 @@ pub(crate) fn gate_channel_store_schema(connection: &Connection) -> Result<(), C
     verify_table(connection, CHANNEL_OWNER_TABLE, CHANNEL_OWNER_SCHEMA_SQL)?;
     verify_table(connection, CHANNEL_INTENT_TABLE, CHANNEL_INTENT_SCHEMA_SQL)?;
     verify_table(connection, CHANNEL_ECHO_TABLE, CHANNEL_ECHO_SCHEMA_SQL)?;
-    verify_table(connection, CHANNEL_OUTBOUND_TABLE, CHANNEL_OUTBOUND_SCHEMA_SQL)?;
+    verify_table(
+        connection,
+        CHANNEL_OUTBOUND_TABLE,
+        CHANNEL_OUTBOUND_SCHEMA_SQL,
+    )?;
+    verify_table(
+        connection,
+        CHANNEL_OUTBOUND_ADMISSION_TABLE,
+        CHANNEL_OUTBOUND_ADMISSION_SCHEMA_SQL,
+    )?;
+    verify_table(
+        connection,
+        CHANNEL_OUTBOUND_RATE_TABLE,
+        CHANNEL_OUTBOUND_RATE_SCHEMA_SQL,
+    )?;
     verify_columns(connection, CHANNEL_OWNER_TABLE, OWNER_COLUMNS)?;
     verify_columns(connection, CHANNEL_INTENT_TABLE, INTENT_COLUMNS)?;
     verify_columns(connection, CHANNEL_ECHO_TABLE, ECHO_COLUMNS)?;
-    verify_columns(connection, CHANNEL_OUTBOUND_TABLE, OUTBOUND_COLUMNS)
+    verify_columns(connection, CHANNEL_OUTBOUND_TABLE, OUTBOUND_COLUMNS)?;
+    verify_columns(
+        connection,
+        CHANNEL_OUTBOUND_ADMISSION_TABLE,
+        OUTBOUND_ADMISSION_COLUMNS,
+    )?;
+    verify_columns(
+        connection,
+        CHANNEL_OUTBOUND_RATE_TABLE,
+        OUTBOUND_RATE_COLUMNS,
+    )
 }
 
 #[cfg(feature = "test-support")]
 /// Create the Channel store schema. Test/internal only; production
 /// registration owns schema installation.
 pub fn create_channel_store_schema(connection: &mut Connection) -> Result<(), ChannelError> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(map_sqlite)?;
-    transaction.execute_batch(CHANNEL_STORE_SCHEMA_SQL).map_err(map_sqlite)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_sqlite)?;
+    transaction
+        .execute_batch(CHANNEL_STORE_SCHEMA_SQL)
+        .map_err(map_sqlite)?;
     transaction.commit().map_err(map_sqlite)?;
     gate_channel_store_schema(connection)
 }
@@ -539,20 +712,39 @@ impl<'connection> SqliteChannelStore<'connection> {
     ) -> Result<Self, ChannelError> {
         gate_channel_store_schema(connection)?;
         if config_revision < 1 {
-            return Err(ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "store config revision must be positive"));
+            return Err(ChannelError::new(
+                codes::AUTHENTICATION_FAILED,
+                false,
+                ChannelOutcome::NotApplied,
+                "store config revision must be positive",
+            ));
         }
-        let owner = StoreOwner::from(StoreOwnerBinding { principal: principal.clone(), config_revision });
+        let owner = StoreOwner::from(StoreOwnerBinding {
+            principal: principal.clone(),
+            config_revision,
+        });
         let (owner_text, owner_digest) = owner_canonical(&owner)?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(map_sqlite)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite)?;
         let existing: Option<String> = transaction
-            .query_row("SELECT owner_digest FROM channel_store_owner WHERE singleton = 1", [], |row| row.get(0))
+            .query_row(
+                "SELECT owner_digest FROM channel_store_owner WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
             .optional()
             .map_err(map_sqlite)?;
         match existing {
             Some(stored) if stored == owner_digest => {}
             Some(_) => {
                 drop(transaction);
-                return Err(ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "channel store is bound to a different principal (cross-principal reuse)"));
+                return Err(ChannelError::new(
+                    codes::AUTHENTICATION_FAILED,
+                    false,
+                    ChannelOutcome::NotApplied,
+                    "channel store is bound to a different principal (cross-principal reuse)",
+                ));
             }
             None => {
                 transaction.execute(
@@ -621,30 +813,58 @@ impl<'connection> SqliteChannelStore<'connection> {
     /// facts). Used by the receiver test-support constructor to enforce
     /// store/principal equality.
     #[cfg(feature = "test-support")]
-    pub(crate) fn verify_owner_against(&self, principal: &ChannelPrincipal, config_revision: i64) -> Result<(), ChannelError> {
+    pub(crate) fn verify_owner_against(
+        &self,
+        principal: &ChannelPrincipal,
+        config_revision: i64,
+    ) -> Result<(), ChannelError> {
         self.verify_owner_meta()?;
-        let expected = StoreOwner::from(StoreOwnerBinding { principal: principal.clone(), config_revision });
+        let expected = StoreOwner::from(StoreOwnerBinding {
+            principal: principal.clone(),
+            config_revision,
+        });
         if self.owner != expected {
-            return Err(ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "channel store is bound to a different principal"));
+            return Err(ChannelError::new(
+                codes::AUTHENTICATION_FAILED,
+                false,
+                ChannelOutcome::NotApplied,
+                "channel store is bound to a different principal",
+            ));
         }
         Ok(())
+    }
+    /// Verified identity digest used to bind the one shared outbound gate.
+    pub(crate) fn owner_digest(&self) -> Result<&str, ChannelError> {
+        self.verify_owner_meta()?;
+        Ok(&self.owner_digest)
     }
 
     fn verify_owner_meta(&self) -> Result<(), ChannelError> {
         let row: Option<(String, String)> = self
             .connection
-            .query_row("SELECT owner_digest, owner_jcs FROM channel_store_owner WHERE singleton = 1", [], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_row(
+                "SELECT owner_digest, owner_jcs FROM channel_store_owner WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .optional()
             .map_err(map_sqlite)?;
         let Some((stored_digest, stored_jcs)) = row else {
-            return Err(ChannelError::new(codes::LEDGER_MIGRATION_REQUIRED, false, ChannelOutcome::NotApplied, "channel store owner binding is missing"));
+            return Err(ChannelError::new(
+                codes::LEDGER_MIGRATION_REQUIRED,
+                false,
+                ChannelOutcome::NotApplied,
+                "channel store owner binding is missing",
+            ));
         };
         if stored_digest != self.owner_digest {
             return Err(corrupted("channel store owner binding digest mismatch"));
         }
         let computed = Sha256Digest::compute(stored_jcs.as_bytes()).to_canonical_string();
         if computed != stored_digest {
-            return Err(corrupted("channel store owner binding canonical bytes mismatch"));
+            return Err(corrupted(
+                "channel store owner binding canonical bytes mismatch",
+            ));
         }
         Ok(())
     }
@@ -657,29 +877,50 @@ impl<'connection> SqliteChannelStore<'connection> {
     /// against the full bound principal, and the valid lifecycle/terminal
     /// invariants. A self-consistent semantic tamper (fields edited and the
     /// outer hash recomputed) is caught by the digest/key/owner re-derivation.
-    fn verify_intent(connection: &Connection, intent_key: &str, record: &ChannelIntent, owner: &StoreOwner) -> Result<(), ChannelError> {
+    fn verify_intent(
+        connection: &Connection,
+        intent_key: &str,
+        record: &ChannelIntent,
+        owner: &StoreOwner,
+    ) -> Result<(), ChannelError> {
         // Re-encode and recompute the record digest.
         let text = record.canonical_string()?;
         let recomputed = Sha256Digest::compute(text.as_bytes()).to_canonical_string();
         let stored_digest: String = connection
-            .query_row("SELECT record_digest FROM channel_intent WHERE intent_key = ?1", [intent_key], |row| row.get(0))
+            .query_row(
+                "SELECT record_digest FROM channel_intent WHERE intent_key = ?1",
+                [intent_key],
+                |row| row.get(0),
+            )
             .map_err(map_sqlite)?;
         if recomputed != stored_digest {
             return Err(corrupted("channel intent record digest mismatch"));
         }
         // Table key must equal the record key.
         if record.intent_key != intent_key {
-            return Err(corrupted("channel intent table key does not match the record key"));
+            return Err(corrupted(
+                "channel intent table key does not match the record key",
+            ));
         }
         // Recompute the event key from the record's account + external id.
-        let expected_key = crate::ids::inbound_ingress_key(&record.account, &record.external_event_id);
+        let expected_key =
+            crate::ids::inbound_ingress_key(&record.account, &record.external_event_id);
         if record.intent_key != expected_key {
-            return Err(corrupted("channel intent record key does not match the derived event key"));
+            return Err(corrupted(
+                "channel intent record key does not match the derived event key",
+            ));
         }
         // Recompute the account from the record's principal fields.
-        let expected_account = crate::ids::channel_account(&record.owner, &record.extension_id, &record.module_id, &record.instance_id);
+        let expected_account = crate::ids::channel_account(
+            &record.owner,
+            &record.extension_id,
+            &record.module_id,
+            &record.instance_id,
+        );
         if record.account != expected_account {
-            return Err(corrupted("channel intent record account does not match the derived principal account"));
+            return Err(corrupted(
+                "channel intent record account does not match the derived principal account",
+            ));
         }
         // The stored draft must be strictly canonical (re-encoded
         // byte-identical, exact key sets) and its payload digest recomputed.
@@ -693,25 +934,41 @@ impl<'connection> SqliteChannelStore<'connection> {
         // no divergent copies.
         let facts = derive_draft_facts(record)?;
         if facts.external_event_id != record.external_event_id {
-            return Err(corrupted("channel intent external identity does not match the canonical draft"));
+            return Err(corrupted(
+                "channel intent external identity does not match the canonical draft",
+            ));
         }
         if facts_event_kind(&facts) != record.kind
-            || facts.references_external_event_id.as_deref() != record.references_external_event_id.as_deref()
+            || facts.references_external_event_id.as_deref()
+                != record.references_external_event_id.as_deref()
         {
-            return Err(corrupted("channel intent kind/relation does not match the canonical draft"));
+            return Err(corrupted(
+                "channel intent kind/relation does not match the canonical draft",
+            ));
         }
         // Recompute the operation digest binding full authority incl. graph
         // digest, ordered targets, content, relation, config revision — from
         // the DERIVED facts.
         let recomputed_digest = channel_intent_digest(
-            &record.account, &record.extension_id, &record.module_id, &record.instance_id,
-            record.generation as u64, record.revision, record.graph_revision, &record.graph_digest,
-            record.config_revision, &facts.external_event_id, facts_event_kind(&facts),
-            facts.references_external_event_id.as_deref(), &record.target_page_ids,
+            &record.account,
+            &record.extension_id,
+            &record.module_id,
+            &record.instance_id,
+            record.generation as u64,
+            record.revision,
+            record.graph_revision,
+            &record.graph_digest,
+            record.config_revision,
+            &facts.external_event_id,
+            facts_event_kind(&facts),
+            facts.references_external_event_id.as_deref(),
+            &record.target_page_ids,
             &record.payload_digest,
         );
         if recomputed_digest != record.digest {
-            return Err(corrupted("channel intent operation digest mismatch (semantic tamper)"));
+            return Err(corrupted(
+                "channel intent operation digest mismatch (semantic tamper)",
+            ));
         }
         // Full bound principal equality against the store owner.
         if record.owner != owner.owner
@@ -724,23 +981,31 @@ impl<'connection> SqliteChannelStore<'connection> {
             || record.graph_digest != owner.graph_digest
             || record.account != owner.account
         {
-            return Err(corrupted("channel intent record owner/meta does not match the bound principal"));
+            return Err(corrupted(
+                "channel intent record owner/meta does not match the bound principal",
+            ));
         }
         // Lifecycle/terminal invariants.
         match record.state {
             IntentState::Accepted => {
                 if record.block_id.is_none() || record.rejected_code.is_some() {
-                    return Err(corrupted("accepted channel intent lacks a block id or carries a rejection code"));
+                    return Err(corrupted(
+                        "accepted channel intent lacks a block id or carries a rejection code",
+                    ));
                 }
             }
             IntentState::Rejected => {
                 if record.rejected_code.is_none() || record.block_id.is_some() {
-                    return Err(corrupted("rejected channel intent lacks a rejection code or carries a block id"));
+                    return Err(corrupted(
+                        "rejected channel intent lacks a rejection code or carries a block id",
+                    ));
                 }
             }
             IntentState::Prepared => {
                 if record.block_id.is_some() || record.rejected_code.is_some() {
-                    return Err(corrupted("prepared channel intent already carries a terminal marker"));
+                    return Err(corrupted(
+                        "prepared channel intent already carries a terminal marker",
+                    ));
                 }
             }
         }
@@ -748,12 +1013,16 @@ impl<'connection> SqliteChannelStore<'connection> {
         match record.kind {
             crate::ledger::EventKind::Edit | crate::ledger::EventKind::Delete => {
                 if record.references_external_event_id.is_none() {
-                    return Err(corrupted("edit/delete channel intent lacks a referenced event"));
+                    return Err(corrupted(
+                        "edit/delete channel intent lacks a referenced event",
+                    ));
                 }
             }
             crate::ledger::EventKind::Message => {
                 if record.references_external_event_id.is_some() {
-                    return Err(corrupted("message channel intent carries a referenced event"));
+                    return Err(corrupted(
+                        "message channel intent carries a referenced event",
+                    ));
                 }
             }
         }
@@ -777,13 +1046,21 @@ impl<'connection> SqliteChannelStore<'connection> {
     ) -> Result<(), ChannelError> {
         // Re-encode and recompute the record digest.
         let bytes = dolly_canonical_json::canonicalize(record)
-            .map_err(|e| corrupted(&format!("channel outbound record failed canonicalization: {e}")))?
+            .map_err(|e| {
+                corrupted(&format!(
+                    "channel outbound record failed canonicalization: {e}"
+                ))
+            })?
             .0
             .as_bytes()
             .to_vec();
         let recomputed = Sha256Digest::compute(&bytes).to_canonical_string();
         let stored_digest: String = connection
-            .query_row("SELECT record_digest FROM channel_outbound WHERE outbound_key = ?1", [outbound_key], |row| row.get(0))
+            .query_row(
+                "SELECT record_digest FROM channel_outbound WHERE outbound_key = ?1",
+                [outbound_key],
+                |row| row.get(0),
+            )
             .map_err(map_sqlite)?;
         if recomputed != stored_digest {
             return Err(corrupted("channel outbound record digest mismatch"));
@@ -801,17 +1078,33 @@ impl<'connection> SqliteChannelStore<'connection> {
             || session_id != record.entry.session_id
             || queued_seq != record.entry.queued_seq
         {
-            return Err(corrupted("channel outbound derived columns do not match the canonical record"));
+            return Err(corrupted(
+                "channel outbound derived columns do not match the canonical record",
+            ));
         }
         // Table key must equal the record key and the entry action id.
         if record.outbound_key != outbound_key {
-            return Err(corrupted("channel outbound record key does not match the table key"));
+            return Err(corrupted(
+                "channel outbound record key does not match the table key",
+            ));
         }
         if record.entry.action_id != outbound_key {
-            return Err(corrupted("channel outbound record action id does not match the record key"));
+            return Err(corrupted(
+                "channel outbound record action id does not match the record key",
+            ));
         }
         if record.entry.session_id.is_empty() {
             return Err(corrupted("channel outbound record session is empty"));
+        }
+        if record.activation_id.is_empty()
+            || record.manifest_digest.is_empty()
+            || record.page_id.is_empty()
+            || record.page_seq < 0
+            || record.commit_seq < 0
+        {
+            return Err(corrupted(
+                "channel outbound manifest Delivery coordinates are invalid",
+            ));
         }
         // The committed Action bytes must be strictly canonical JSON.
         let parsed = dolly_canonical_json::parse_core_json(
@@ -825,7 +1118,9 @@ impl<'connection> SqliteChannelStore<'connection> {
             .as_bytes()
             .to_vec();
         if recanon != record.action_jcs.as_bytes() {
-            return Err(corrupted("channel outbound action bytes are not canonically encoded"));
+            return Err(corrupted(
+                "channel outbound action bytes are not canonically encoded",
+            ));
         }
         // Recompute the authority-bound operation digest from the exact
         // committed Action bytes, the targeted module, the config revision,
@@ -843,26 +1138,21 @@ impl<'connection> SqliteChannelStore<'connection> {
             &record.action_jcs,
             &record.target_module_id,
         );
-        let mut identity = serde_json::Map::new();
-        identity.insert(
-            "schema".into(),
-            serde_json::json!("dolly.channel-outbound/manifest-selected/v1"),
+        let recomputed_digest = crate::outbound_committed::manifest_operation_digest(
+            &base_digest,
+            &record.activation_id,
+            &record.manifest_digest,
+            record.occurrence_index,
+            &record.page_id,
+            record.page_seq,
+            record.commit_seq,
+            record.action_index,
+            &record.block_id,
         );
-        identity.insert("base".into(), serde_json::json!(base_digest));
-        identity.insert("activation_id".into(), serde_json::json!(record.activation_id));
-        identity.insert("manifest_digest".into(), serde_json::json!(record.manifest_digest));
-        identity.insert("input_index".into(), serde_json::json!(record.input_index));
-        identity.insert("action_index".into(), serde_json::json!(record.action_index));
-        identity.insert("block_id".into(), serde_json::json!(record.block_id));
-        let recomputed_digest = Sha256Digest::compute(
-            dolly_canonical_json::canonicalize(&serde_json::Value::Object(identity))
-                .expect("identity is canonical JSON")
-                .0
-                .as_bytes(),
-        )
-        .to_canonical_string();
         if recomputed_digest != record.digest {
-            return Err(corrupted("channel outbound operation digest mismatch (semantic tamper)"));
+            return Err(corrupted(
+                "channel outbound operation digest mismatch (semantic tamper)",
+            ));
         }
         // Idempotency-key derivation is deterministic from the action id.
         let expected_key = if record.entry.idempotency_supported {
@@ -871,7 +1161,9 @@ impl<'connection> SqliteChannelStore<'connection> {
             None
         };
         if record.entry.idempotency_key != expected_key {
-            return Err(corrupted("channel outbound idempotency key does not match the action id"));
+            return Err(corrupted(
+                "channel outbound idempotency key does not match the action id",
+            ));
         }
         // Derived account must equal the stored account.
         let expected_account = crate::ids::channel_account(
@@ -881,7 +1173,9 @@ impl<'connection> SqliteChannelStore<'connection> {
             &record.instance_id,
         );
         if record.account != expected_account {
-            return Err(corrupted("channel outbound record account does not match the derived principal account"));
+            return Err(corrupted(
+                "channel outbound record account does not match the derived principal account",
+            ));
         }
         // Full bound principal equality against the store owner.
         if record.owner != owner.owner
@@ -895,20 +1189,28 @@ impl<'connection> SqliteChannelStore<'connection> {
             || record.config_revision != owner.config_revision
             || record.account != owner.account
         {
-            return Err(corrupted("channel outbound record owner/meta does not match the bound principal"));
+            return Err(corrupted(
+                "channel outbound record owner/meta does not match the bound principal",
+            ));
         }
         if !record.target_module_id.is_empty() && record.target_module_id != record.module_id {
             // A committed outbound Action targets the current module; any
             // other target is opposite-direction authority and fails closed.
-            return Err(corrupted("channel outbound record targets a different module"));
+            return Err(corrupted(
+                "channel outbound record targets a different module",
+            ));
         }
         // Prepared-state invariants: a non-terminal row never carries a
         // frozen result, and a Prepared row was never dispatched.
         if !record.entry.state.is_terminal() && record.entry.result_jcs.is_some() {
-            return Err(corrupted("channel outbound non-terminal record carries a frozen result"));
+            return Err(corrupted(
+                "channel outbound non-terminal record carries a frozen result",
+            ));
         }
         if record.entry.state == OutboundState::Prepared && record.entry.dispatched_at.is_some() {
-            return Err(corrupted("channel outbound prepared record is already dispatched"));
+            return Err(corrupted(
+                "channel outbound prepared record is already dispatched",
+            ));
         }
         Ok(())
     }
@@ -917,21 +1219,33 @@ impl<'connection> SqliteChannelStore<'connection> {
         self.verify_owner_meta()?;
         let row: Option<(String, Vec<u8>)> = self
             .connection
-            .query_row("SELECT record_digest, canonical_jcs FROM channel_intent WHERE intent_key = ?1", [intent_key], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_row(
+                "SELECT record_digest, canonical_jcs FROM channel_intent WHERE intent_key = ?1",
+                [intent_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .optional()
             .map_err(map_sqlite)?;
-        let Some((digest, jcs)) = row else { return Ok(None); };
+        let Some((digest, jcs)) = row else {
+            return Ok(None);
+        };
         let computed = Sha256Digest::compute(&jcs).to_canonical_string();
         if computed != digest {
-            return Err(corrupted("channel intent stored digest mismatch (tampered)"));
+            return Err(corrupted(
+                "channel intent stored digest mismatch (tampered)",
+            ));
         }
-        let text = std::str::from_utf8(&jcs).map_err(|_| corrupted("channel intent record is not UTF-8"))?;
+        let text = std::str::from_utf8(&jcs)
+            .map_err(|_| corrupted("channel intent record is not UTF-8"))?;
         let record = ChannelIntent::from_canonical_string(text)?;
         Self::verify_intent(self.connection, intent_key, &record, &self.owner)?;
         Ok(Some(record))
     }
 
-    fn write_intent_row(transaction: &rusqlite::Transaction<'_>, intent: &ChannelIntent) -> Result<(), ChannelError> {
+    fn write_intent_row(
+        transaction: &rusqlite::Transaction<'_>,
+        intent: &ChannelIntent,
+    ) -> Result<(), ChannelError> {
         let text = intent.canonical_string()?;
         let digest = Sha256Digest::compute(text.as_bytes()).to_canonical_string();
         transaction
@@ -951,7 +1265,12 @@ impl<'connection> SqliteChannelStore<'connection> {
     pub fn write_prepared(&mut self, intent: &ChannelIntent) -> Result<(), ChannelError> {
         if self.fail_write_prepared > 0 {
             self.fail_write_prepared -= 1;
-            return Err(ChannelError::new(codes::INTERNAL, false, ChannelOutcome::NotApplied, "injected prepared write failure"));
+            return Err(ChannelError::new(
+                codes::INTERNAL,
+                false,
+                ChannelOutcome::NotApplied,
+                "injected prepared write failure",
+            ));
         }
         self.verify_owner_meta()?;
         if intent.state != IntentState::Prepared {
@@ -962,7 +1281,12 @@ impl<'connection> SqliteChannelStore<'connection> {
         }
         if let Some(existing) = self.load_intent(&intent.intent_key)? {
             if existing.digest != intent.digest {
-                return Err(ChannelError::new(codes::OPERATION_CONFLICT, false, ChannelOutcome::NotApplied, "channel intent key already carries a different operation digest"));
+                return Err(ChannelError::new(
+                    codes::OPERATION_CONFLICT,
+                    false,
+                    ChannelOutcome::NotApplied,
+                    "channel intent key already carries a different operation digest",
+                ));
             }
             if existing.state.is_terminal() {
                 return Ok(()); // terminal outcome already exists
@@ -971,7 +1295,10 @@ impl<'connection> SqliteChannelStore<'connection> {
                 return Ok(());
             }
         }
-        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(map_sqlite)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite)?;
         Self::write_intent_row(&transaction, intent)?;
         transaction.commit().map_err(map_sqlite)
     }
@@ -987,7 +1314,12 @@ impl<'connection> SqliteChannelStore<'connection> {
     ) -> Result<(), ChannelError> {
         if self.fail_commit_outcome > 0 {
             self.fail_commit_outcome -= 1;
-            return Err(ChannelError::new(codes::INTERNAL, false, ChannelOutcome::NotApplied, "injected commit_outcome failure"));
+            return Err(ChannelError::new(
+                codes::INTERNAL,
+                false,
+                ChannelOutcome::NotApplied,
+                "injected commit_outcome failure",
+            ));
         }
         self.verify_owner_meta()?;
         let existing = self
@@ -1006,9 +1338,16 @@ impl<'connection> SqliteChannelStore<'connection> {
                 terminal.state = IntentState::Rejected;
                 terminal.rejected_code = Some(code.to_string());
             }
-            _ => return Err(corrupted("commit_outcome requires exactly one of block_id or rejected_code")),
+            _ => {
+                return Err(corrupted(
+                    "commit_outcome requires exactly one of block_id or rejected_code",
+                ));
+            }
         }
-        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(map_sqlite)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite)?;
         Self::write_intent_row(&transaction, &terminal)?;
         transaction.commit().map_err(map_sqlite)
     }
@@ -1020,15 +1359,31 @@ impl<'connection> SqliteChannelStore<'connection> {
     /// Every non-terminal (`prepared`) intent, for status-first recovery.
     pub fn list_pending(&mut self) -> Result<Vec<ChannelIntent>, ChannelError> {
         self.verify_owner_meta()?;
-        let mut statement = self.connection.prepare("SELECT intent_key, record_digest, canonical_jcs FROM channel_intent").map_err(map_sqlite)?;
-        let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?))).map_err(map_sqlite)?.collect::<Result<Vec<_>, _>>().map_err(map_sqlite)?;
+        let mut statement = self
+            .connection
+            .prepare("SELECT intent_key, record_digest, canonical_jcs FROM channel_intent")
+            .map_err(map_sqlite)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(map_sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlite)?;
         let mut pending = Vec::new();
         for (key, digest, jcs) in rows {
             let computed = Sha256Digest::compute(&jcs).to_canonical_string();
             if computed != digest {
-                return Err(corrupted("channel intent stored digest mismatch (tampered)"));
+                return Err(corrupted(
+                    "channel intent stored digest mismatch (tampered)",
+                ));
             }
-            let text = std::str::from_utf8(&jcs).map_err(|_| corrupted("channel intent record is not UTF-8"))?;
+            let text = std::str::from_utf8(&jcs)
+                .map_err(|_| corrupted("channel intent record is not UTF-8"))?;
             let record = ChannelIntent::from_canonical_string(text)?;
             Self::verify_intent(self.connection, &key, &record, &self.owner)?;
             if record.state == IntentState::Prepared {
@@ -1038,19 +1393,31 @@ impl<'connection> SqliteChannelStore<'connection> {
         Ok(pending)
     }
 
-    fn load_outbound(&mut self, outbound_key: &str) -> Result<Option<DurableOutboundRecord>, ChannelError> {
+    fn load_outbound(
+        &mut self,
+        outbound_key: &str,
+    ) -> Result<Option<DurableOutboundRecord>, ChannelError> {
         self.verify_owner_meta()?;
         let row: Option<(String, Vec<u8>)> = self
             .connection
-            .query_row("SELECT record_digest, canonical_jcs FROM channel_outbound WHERE outbound_key = ?1", [outbound_key], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_row(
+                "SELECT record_digest, canonical_jcs FROM channel_outbound WHERE outbound_key = ?1",
+                [outbound_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .optional()
             .map_err(map_sqlite)?;
-        let Some((digest, jcs)) = row else { return Ok(None); };
+        let Some((digest, jcs)) = row else {
+            return Ok(None);
+        };
         let computed = Sha256Digest::compute(&jcs).to_canonical_string();
         if computed != digest {
-            return Err(corrupted("channel outbound stored digest mismatch (tampered)"));
+            return Err(corrupted(
+                "channel outbound stored digest mismatch (tampered)",
+            ));
         }
-        let text = std::str::from_utf8(&jcs).map_err(|_| corrupted("channel outbound record is not UTF-8"))?;
+        let text = std::str::from_utf8(&jcs)
+            .map_err(|_| corrupted("channel outbound record is not UTF-8"))?;
         let record: DurableOutboundRecord = serde_json::from_str(text)
             .map_err(|_| corrupted("channel outbound record is not a strict canonical record"))?;
         Self::verify_outbound_record(self.connection, outbound_key, &record, &self.owner)?;
@@ -1062,7 +1429,11 @@ impl<'connection> SqliteChannelStore<'connection> {
         record: &DurableOutboundRecord,
     ) -> Result<(Vec<u8>, String), ChannelError> {
         let bytes = dolly_canonical_json::canonicalize(record)
-            .map_err(|e| corrupted(&format!("channel outbound record failed canonicalization: {e}")))?
+            .map_err(|e| {
+                corrupted(&format!(
+                    "channel outbound record failed canonicalization: {e}"
+                ))
+            })?
             .0
             .as_bytes()
             .to_vec();
@@ -1123,16 +1494,26 @@ impl<'connection> SqliteChannelStore<'connection> {
     ) -> Result<OutboundPreparedOutcome, ChannelError> {
         if self.fail_write_prepared_outbound > 0 {
             self.fail_write_prepared_outbound -= 1;
-            return Err(ChannelError::new(codes::INTERNAL, false, ChannelOutcome::NotApplied, "injected durable outbound prepared write failure"));
+            return Err(ChannelError::new(
+                codes::INTERNAL,
+                false,
+                ChannelOutcome::NotApplied,
+                "injected durable outbound prepared write failure",
+            ));
         }
         self.verify_owner_meta()?;
         if record.schema != OUTBOUND_RECORD_SCHEMA || record.version != 1 {
             return Err(corrupted("channel outbound record discriminator mismatch"));
         }
         if record.entry.state != OutboundState::Prepared {
-            return Err(corrupted("insert_prepared_or_replay requires a prepared outbound record"));
+            return Err(corrupted(
+                "insert_prepared_or_replay requires a prepared outbound record",
+            ));
         }
-        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(map_sqlite)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite)?;
         let inserted = Self::insert_outbound_row(&transaction, record)?;
         if inserted {
             transaction.commit().map_err(map_sqlite)?;
@@ -1150,15 +1531,24 @@ impl<'connection> SqliteChannelStore<'connection> {
             .optional()
             .map_err(map_sqlite)?;
         transaction.commit().map_err(map_sqlite)?;
-        let (digest, jcs) = row.ok_or_else(|| corrupted("outbound row existed at insert but vanished on load"))?;
+        let (digest, jcs) =
+            row.ok_or_else(|| corrupted("outbound row existed at insert but vanished on load"))?;
         let computed = Sha256Digest::compute(&jcs).to_canonical_string();
         if computed != digest {
-            return Err(corrupted("channel outbound stored digest mismatch (tampered)"));
+            return Err(corrupted(
+                "channel outbound stored digest mismatch (tampered)",
+            ));
         }
-        let text = std::str::from_utf8(&jcs).map_err(|_| corrupted("channel outbound record is not UTF-8"))?;
+        let text = std::str::from_utf8(&jcs)
+            .map_err(|_| corrupted("channel outbound record is not UTF-8"))?;
         let existing: DurableOutboundRecord = serde_json::from_str(text)
             .map_err(|_| corrupted("channel outbound record is not a strict canonical record"))?;
-        Self::verify_outbound_record(self.connection, &record.outbound_key, &existing, &self.owner)?;
+        Self::verify_outbound_record(
+            self.connection,
+            &record.outbound_key,
+            &existing,
+            &self.owner,
+        )?;
         if existing.digest != record.digest {
             return Err(ChannelError::new(
                 codes::OPERATION_CONFLICT,
@@ -1168,9 +1558,11 @@ impl<'connection> SqliteChannelStore<'connection> {
             ));
         }
         if existing.entry.state.is_terminal() {
-            let result_jcs = existing.entry.result_jcs.clone().ok_or_else(|| {
-                corrupted("terminal outbound record has no frozen result")
-            })?;
+            let result_jcs = existing
+                .entry
+                .result_jcs
+                .clone()
+                .ok_or_else(|| corrupted("terminal outbound record has no frozen result"))?;
             return Ok(OutboundPreparedOutcome::ReplayTerminal {
                 state: existing.entry.state,
                 result_jcs,
@@ -1180,7 +1572,10 @@ impl<'connection> SqliteChannelStore<'connection> {
     }
 
     /// The verified durable outbound record for one action key.
-    pub fn find_outbound(&mut self, outbound_key: &str) -> Result<Option<DurableOutboundRecord>, ChannelError> {
+    pub fn find_outbound(
+        &mut self,
+        outbound_key: &str,
+    ) -> Result<Option<DurableOutboundRecord>, ChannelError> {
         self.load_outbound(outbound_key)
     }
 
@@ -1188,17 +1583,34 @@ impl<'connection> SqliteChannelStore<'connection> {
     /// restart/recovery and the committed-Action pipeline.
     pub fn list_pending_outbound(&mut self) -> Result<Vec<DurableOutboundRecord>, ChannelError> {
         self.verify_owner_meta()?;
-        let mut statement = self.connection.prepare("SELECT outbound_key, record_digest, canonical_jcs FROM channel_outbound").map_err(map_sqlite)?;
-        let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?))).map_err(map_sqlite)?.collect::<Result<Vec<_>, _>>().map_err(map_sqlite)?;
+        let mut statement = self
+            .connection
+            .prepare("SELECT outbound_key, record_digest, canonical_jcs FROM channel_outbound")
+            .map_err(map_sqlite)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(map_sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlite)?;
         let mut pending = Vec::new();
         for (key, digest, jcs) in rows {
             let computed = Sha256Digest::compute(&jcs).to_canonical_string();
             if computed != digest {
-                return Err(corrupted("channel outbound stored digest mismatch (tampered)"));
+                return Err(corrupted(
+                    "channel outbound stored digest mismatch (tampered)",
+                ));
             }
-            let text = std::str::from_utf8(&jcs).map_err(|_| corrupted("channel outbound record is not UTF-8"))?;
-            let record: DurableOutboundRecord = serde_json::from_str(text)
-                .map_err(|_| corrupted("channel outbound record is not a strict canonical record"))?;
+            let text = std::str::from_utf8(&jcs)
+                .map_err(|_| corrupted("channel outbound record is not UTF-8"))?;
+            let record: DurableOutboundRecord = serde_json::from_str(text).map_err(|_| {
+                corrupted("channel outbound record is not a strict canonical record")
+            })?;
             Self::verify_outbound_record(self.connection, &key, &record, &self.owner)?;
             if !record.entry.state.is_terminal() {
                 pending.push(record);
@@ -1207,40 +1619,37 @@ impl<'connection> SqliteChannelStore<'connection> {
         Ok(pending)
     }
 
-    /// Atomically claim the dispatch of one outbound row with a single
-    /// SQLite compare-and-swap: the UPDATE only fires when the durable row's
-    /// current record_digest still equals the loaded+verified digest (which
-    /// encodes the Prepared/Queued state). Exactly one concurrent claimant
-    /// wins (rows-changed == 1); all others see 0 and MUST NOT call the
-    /// transport. The CAS winner transitions to `Dispatched` BEFORE transport
-    /// initiation; a CAS failure (already dispatched, terminal, or missing)
-    /// means zero transport.
-    /// Atomically admit one `Prepared` row into the durable outbound FIFO:
-    /// transitions `Prepared` -> `Queued` with a monotonic `queued_seq`,
-    /// bounded by the configured pending occupancy (`max_pending_per_session`
-    /// and `max_pending_total` over nonterminal Prepared/Queued/Dispatched
-    /// rows). One Immediate transaction: a concurrent admission cannot
-    /// exceed the bound. Returns whether the row was admitted; `false` means
-    /// the queue is at capacity (the caller waits under its deadline, never
-    /// leaks a slot).
+    /// Register/check one durable waiter and, when it is the oldest eligible
+    /// ticket, atomically transition its `Prepared` row to `Queued`. Ticket,
+    /// deadline, cancellation, rate state, combined Waiting+Queued+Dispatched
+    /// bounds, and monotonic `queued_seq` are decided in one Immediate
+    /// transaction. The injected clock is read only after SQLite grants the
+    /// write lock and again immediately before the grant.
     pub(crate) fn admit_to_queue(
         &mut self,
         outbound_key: &str,
         session_id: &str,
-        max_pending_per_session: usize,
-        max_pending_total: usize,
-        waiting_reservations: usize,
-        now: &str,
-    ) -> Result<bool, ChannelError> {
+        piece_count: u64,
+        deadline_micros: i64,
+        limits: crate::config::OutboundLimits,
+        clock: &dyn crate::clock::Clock,
+    ) -> Result<OutboundAdmissionOutcome, ChannelError> {
         self.verify_owner_meta()?;
-        // ONE Immediate transaction: load, occupancy-bound, and transition
-        // Prepared -> Queued atomically so the bound can never be exceeded by
-        // concurrent admissions.
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite)?;
-        let current_state: Option<String> = transaction
+        let lock_time = clock.now();
+        let lock_time_micros = crate::clock::timestamp_total_micros(lock_time.as_str());
+        transaction
+            .execute(
+                "UPDATE channel_outbound_admission
+                 SET state = 'expired'
+                 WHERE state = 'waiting' AND deadline_micros <= ?1",
+                [lock_time_micros],
+            )
+            .map_err(map_sqlite)?;
+        let outbound_state: Option<String> = transaction
             .query_row(
                 "SELECT state FROM channel_outbound WHERE outbound_key = ?1",
                 [outbound_key],
@@ -1248,41 +1657,212 @@ impl<'connection> SqliteChannelStore<'connection> {
             )
             .optional()
             .map_err(map_sqlite)?;
-        let Some(current_state) = current_state else {
-            transaction.commit().map_err(map_sqlite)?;
-            return Ok(false);
+        let Some(outbound_state) = outbound_state else {
+            return Err(corrupted("outbound row missing during durable admission"));
         };
-        if current_state != OutboundState::Prepared.as_str() {
-            // Already Queued by a prior admission or later state: idempotent,
-            // never downgraded.
+        if outbound_state == OutboundState::Queued.as_str()
+            || outbound_state == OutboundState::Dispatched.as_str()
+        {
             transaction.commit().map_err(map_sqlite)?;
-            return Ok(false);
+            return Ok(OutboundAdmissionOutcome::Granted);
         }
-        let nonterminal_filter = "state IN ('queued','dispatched')";
-        let per_session: i64 = transaction
+        if outbound_state != OutboundState::Prepared.as_str() {
+            transaction.commit().map_err(map_sqlite)?;
+            return Ok(OutboundAdmissionOutcome::Cancelled);
+        }
+        let existing: Option<(i64, String, i64, i64, String)> = transaction
             .query_row(
-                &format!("SELECT COUNT(*) FROM channel_outbound WHERE session_id = ?1 AND {nonterminal_filter}"),
-                [session_id],
-                |row| row.get(0),
+                "SELECT ticket, session_id, deadline_micros, piece_count, state
+                 FROM channel_outbound_admission WHERE outbound_key = ?1",
+                [outbound_key],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
+            .optional()
             .map_err(map_sqlite)?;
-        let total: i64 = transaction
+        let piece_count_i64 = i64::try_from(piece_count)
+            .map_err(|_| corrupted("outbound admission piece count is out of range"))?;
+        let (ticket, durable_deadline) = if let Some((
+            ticket,
+            stored_session,
+            stored_deadline,
+            stored_piece_count,
+            state,
+        )) = existing
+        {
+            if stored_session != session_id || stored_piece_count != piece_count_i64 {
+                return Err(corrupted(
+                    "outbound admission ticket does not match its outbound row",
+                ));
+            }
+            match state.as_str() {
+                "cancelled" => {
+                    transaction.commit().map_err(map_sqlite)?;
+                    return Ok(OutboundAdmissionOutcome::Cancelled);
+                }
+                "expired" => {
+                    transaction.commit().map_err(map_sqlite)?;
+                    return Ok(OutboundAdmissionOutcome::Expired);
+                }
+                "granted" => {
+                    return Err(corrupted(
+                        "granted outbound admission still has a Prepared outbound row",
+                    ));
+                }
+                "waiting" => {}
+                _ => return Err(corrupted("outbound admission state is invalid")),
+            }
+            let durable_deadline = stored_deadline.min(deadline_micros);
+            if durable_deadline != stored_deadline {
+                transaction
+                    .execute(
+                        "UPDATE channel_outbound_admission SET deadline_micros = ?2
+                         WHERE ticket = ?1 AND state = 'waiting'",
+                        params![ticket, durable_deadline],
+                    )
+                    .map_err(map_sqlite)?;
+            }
+            (ticket, durable_deadline)
+        } else {
+            if lock_time_micros >= deadline_micros {
+                transaction
+                    .execute(
+                        "INSERT INTO channel_outbound_admission
+                         (outbound_key, session_id, deadline_micros, piece_count, state)
+                         VALUES (?1, ?2, ?3, ?4, 'expired')",
+                        params![outbound_key, session_id, deadline_micros, piece_count_i64],
+                    )
+                    .map_err(map_sqlite)?;
+                transaction.commit().map_err(map_sqlite)?;
+                return Ok(OutboundAdmissionOutcome::Expired);
+            }
+            let (combined_total, combined_session): (i64, i64) = transaction
+                .query_row(
+                    "SELECT
+                       (SELECT COUNT(*) FROM channel_outbound_admission WHERE state = 'waiting')
+                       + (SELECT COUNT(*) FROM channel_outbound WHERE state IN ('queued','dispatched')),
+                       (SELECT COUNT(*) FROM channel_outbound_admission
+                          WHERE state = 'waiting' AND session_id = ?1)
+                       + (SELECT COUNT(*) FROM channel_outbound
+                          WHERE state IN ('queued','dispatched') AND session_id = ?1)",
+                    [session_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(map_sqlite)?;
+            if combined_total as usize >= limits.max_pending_total
+                || combined_session as usize >= limits.max_pending_per_session
+            {
+                transaction.commit().map_err(map_sqlite)?;
+                return Ok(OutboundAdmissionOutcome::Saturated);
+            }
+            transaction
+                .execute(
+                    "INSERT INTO channel_outbound_admission
+                     (outbound_key, session_id, deadline_micros, piece_count, state)
+                     VALUES (?1, ?2, ?3, ?4, 'waiting')",
+                    params![outbound_key, session_id, deadline_micros, piece_count_i64],
+                )
+                .map_err(map_sqlite)?;
+            (transaction.last_insert_rowid(), deadline_micros)
+        };
+        if lock_time_micros >= durable_deadline {
+            transaction
+                .execute(
+                    "UPDATE channel_outbound_admission SET state = 'expired'
+                     WHERE ticket = ?1 AND state = 'waiting'",
+                    [ticket],
+                )
+                .map_err(map_sqlite)?;
+            transaction.commit().map_err(map_sqlite)?;
+            return Ok(OutboundAdmissionOutcome::Expired);
+        }
+        let oldest: i64 = transaction
             .query_row(
-                &format!("SELECT COUNT(*) FROM channel_outbound WHERE {nonterminal_filter}"),
+                "SELECT ticket FROM channel_outbound_admission
+                 WHERE state = 'waiting' ORDER BY ticket LIMIT 1",
                 [],
                 |row| row.get(0),
             )
             .map_err(map_sqlite)?;
-        // ONE combined bound: durable queued/in-flight plus waiting
-        // reservations <= max_pending_per_session; the ledger-wide durable
-        // bound is max_pending_total.
-        if per_session as usize + waiting_reservations >= max_pending_per_session
-            || total as usize >= max_pending_total
-        {
+        if oldest != ticket {
             transaction.commit().map_err(map_sqlite)?;
-            return Ok(false);
+            return Ok(OutboundAdmissionOutcome::Waiting {
+                now_micros: lock_time_micros,
+                wake_at_micros: durable_deadline,
+            });
         }
-        // Load+verify the durable truth inside the same transaction.
+        let grant_time = clock.now();
+        let grant_time_micros = crate::clock::timestamp_total_micros(grant_time.as_str());
+        if grant_time_micros >= durable_deadline {
+            transaction
+                .execute(
+                    "UPDATE channel_outbound_admission SET state = 'expired'
+                     WHERE ticket = ?1 AND state = 'waiting'",
+                    [ticket],
+                )
+                .map_err(map_sqlite)?;
+            transaction.commit().map_err(map_sqlite)?;
+            return Ok(OutboundAdmissionOutcome::Expired);
+        }
+        let rate =
+            i64::try_from(limits.max_pieces_per_second_per_session).unwrap_or(i64::MAX / 1_000_000);
+        let capacity = rate.saturating_mul(1_000_000);
+        let cost = piece_count_i64.saturating_mul(1_000_000);
+        let stored_rate: Option<(i64, i64)> = transaction
+            .query_row(
+                "SELECT tokens, last_refill_micros FROM channel_outbound_rate
+                 WHERE session_id = ?1",
+                [session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(map_sqlite)?;
+        let (mut tokens, last_refill) = stored_rate.unwrap_or((capacity, grant_time_micros));
+        if grant_time_micros >= last_refill {
+            tokens = tokens
+                .saturating_add((grant_time_micros - last_refill).saturating_mul(rate))
+                .min(capacity);
+        }
+        if tokens < cost {
+            transaction
+                .execute(
+                    "INSERT INTO channel_outbound_rate
+                     (session_id, tokens, last_refill_micros) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(session_id) DO UPDATE
+                     SET tokens = excluded.tokens,
+                         last_refill_micros = excluded.last_refill_micros",
+                    params![session_id, tokens, grant_time_micros],
+                )
+                .map_err(map_sqlite)?;
+            let wake_at_micros = if rate > 0 {
+                grant_time_micros.saturating_add((cost - tokens).saturating_add(rate - 1) / rate)
+            } else {
+                durable_deadline
+            };
+            transaction.commit().map_err(map_sqlite)?;
+            return Ok(OutboundAdmissionOutcome::Waiting {
+                now_micros: grant_time_micros,
+                wake_at_micros: wake_at_micros.min(durable_deadline),
+            });
+        }
+        tokens -= cost;
+        transaction
+            .execute(
+                "INSERT INTO channel_outbound_rate
+                 (session_id, tokens, last_refill_micros) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(session_id) DO UPDATE
+                 SET tokens = excluded.tokens,
+                     last_refill_micros = excluded.last_refill_micros",
+                params![session_id, tokens, grant_time_micros],
+            )
+            .map_err(map_sqlite)?;
         let mut record = Self::load_outbound_txn(&transaction, outbound_key, &self.owner)?
             .ok_or_else(|| corrupted("outbound row vanished during queue admission"))?;
         let next_seq: i64 = transaction
@@ -1295,13 +1875,72 @@ impl<'connection> SqliteChannelStore<'connection> {
         record.entry.state = OutboundState::Queued;
         record.entry.queued_seq = Some(next_seq);
         record.entry.attempts.push(AttemptRecord {
-            at: now.to_string(),
+            at: grant_time.as_str().to_string(),
             kind: "enqueue".to_string(),
             detail_digest: Sha256Digest::compute(b"enqueue").to_canonical_string(),
         });
+        if transaction
+            .execute(
+                "UPDATE channel_outbound_admission SET state = 'granted'
+                 WHERE ticket = ?1 AND state = 'waiting'",
+                [ticket],
+            )
+            .map_err(map_sqlite)?
+            != 1
+        {
+            return Err(corrupted(
+                "outbound admission grant lost its waiting ticket",
+            ));
+        }
         Self::update_outbound_row(&transaction, &record)?;
         transaction.commit().map_err(map_sqlite)?;
-        Ok(true)
+        Ok(OutboundAdmissionOutcome::Granted)
+    }
+
+    /// Durably cancel a waiting ticket. Cancellation races with grant under
+    /// the same SQLite write lock, so exactly one transition wins.
+    pub(crate) fn cancel_admission(
+        &mut self,
+        outbound_key: &str,
+        clock: &dyn crate::clock::Clock,
+    ) -> Result<bool, ChannelError> {
+        self.verify_owner_meta()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite)?;
+        let now = crate::clock::timestamp_total_micros(clock.now().as_str());
+        transaction
+            .execute(
+                "UPDATE channel_outbound_admission SET state = 'expired'
+                 WHERE state = 'waiting' AND deadline_micros <= ?1",
+                [now],
+            )
+            .map_err(map_sqlite)?;
+        let changed = transaction
+            .execute(
+                "UPDATE channel_outbound_admission SET state = 'cancelled'
+                 WHERE outbound_key = ?1 AND state = 'waiting'",
+                [outbound_key],
+            )
+            .map_err(map_sqlite)?;
+        transaction.commit().map_err(map_sqlite)?;
+        Ok(changed == 1)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn waiting_admissions(&mut self, session_id: &str) -> Result<usize, ChannelError> {
+        self.verify_owner_meta()?;
+        let count: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM channel_outbound_admission
+                 WHERE state = 'waiting' AND session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite)?;
+        Ok(count as usize)
     }
 
     /// The durable outbound FIFO (reconstructed from nonterminal rows in
@@ -1325,18 +1964,26 @@ impl<'connection> SqliteChannelStore<'connection> {
             )
             .optional()
             .map_err(map_sqlite)?;
-        let Some((digest, jcs)) = row else { return Ok(None); };
+        let Some((digest, jcs)) = row else {
+            return Ok(None);
+        };
         let computed = Sha256Digest::compute(&jcs).to_canonical_string();
         if computed != digest {
-            return Err(corrupted("channel outbound stored digest mismatch (tampered)"));
+            return Err(corrupted(
+                "channel outbound stored digest mismatch (tampered)",
+            ));
         }
-        let text = std::str::from_utf8(&jcs).map_err(|_| corrupted("channel outbound record is not UTF-8"))?;
+        let text = std::str::from_utf8(&jcs)
+            .map_err(|_| corrupted("channel outbound record is not UTF-8"))?;
         let record: DurableOutboundRecord = serde_json::from_str(text)
             .map_err(|_| corrupted("channel outbound record is not a strict canonical record"))?;
         Self::verify_outbound_record(transaction, outbound_key, &record, owner)?;
         Ok(Some(record))
     }
 
+    /// Claim only the minimum durable `queued_seq` for this store/account.
+    /// The verified original record digest and FIFO minimum are both in the
+    /// compare-and-swap predicate under one Immediate transaction.
     pub(crate) fn claim_dispatch(
         &mut self,
         outbound_key: &str,
@@ -1344,29 +1991,37 @@ impl<'connection> SqliteChannelStore<'connection> {
     ) -> Result<DispatchClaim, ChannelError> {
         if self.fail_mark_dispatched > 0 {
             self.fail_mark_dispatched -= 1;
-            return Err(ChannelError::new(codes::INTERNAL, false, ChannelOutcome::NotApplied, "injected dispatched-marker write failure"));
+            return Err(ChannelError::new(
+                codes::INTERNAL,
+                false,
+                ChannelOutcome::NotApplied,
+                "injected dispatched-marker write failure",
+            ));
         }
         self.verify_owner_meta()?;
-        let mut record = self
-            .load_outbound(outbound_key)?
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite)?;
+        let mut record = Self::load_outbound_txn(&transaction, outbound_key, &self.owner)?
             .ok_or_else(|| corrupted("outbound row missing for dispatch CAS"))?;
         if record.entry.state.is_terminal() {
-            return Ok(DispatchClaim::AlreadyTerminal {
+            let outcome = DispatchClaim::AlreadyTerminal {
                 state: record.entry.state,
                 result_jcs: record.entry.result_jcs.clone(),
-            });
+            };
+            transaction.commit().map_err(map_sqlite)?;
+            return Ok(outcome);
         }
         if record.entry.state == OutboundState::Dispatched {
+            transaction.commit().map_err(map_sqlite)?;
             return Ok(DispatchClaim::AlreadyDispatched);
         }
-        // Build the Dispatched record (recomputed canonical bytes + digest
-        // from the loaded+verified durable truth) and remember the EXACT
-        // digest of the row this caller verified BEFORE the CAS.
-        let original_state = record.entry.state;
-        let verified_digest = {
-            let (_, d) = Self::outbound_record_bytes(&record)?;
-            d
-        };
+        if record.entry.state != OutboundState::Queued {
+            transaction.commit().map_err(map_sqlite)?;
+            return Ok(DispatchClaim::LostRace);
+        }
+        let (_, verified_digest) = Self::outbound_record_bytes(&record)?;
         record.entry.state = OutboundState::Dispatched;
         record.entry.dispatched_at = Some(now.to_string());
         record.entry.attempts.push(AttemptRecord {
@@ -1375,36 +2030,28 @@ impl<'connection> SqliteChannelStore<'connection> {
             detail_digest: Sha256Digest::compute(b"dispatch-cas").to_canonical_string(),
         });
         let (bytes, digest) = Self::outbound_record_bytes(&record)?;
-        // Digest-bound single CAS in ONE Immediate transaction: the UPDATE
-        // predicate binds the EXACT verified record digest AND the
-        // Prepared/Queued state. A row that changed between load and CAS (same
-        // state but different bytes) can never win; SQLite serializes the
-        // transaction so exactly one concurrent claimant sees rows-changed==1,
-        // all others see 0 and MUST NOT transport. A CAS failure means zero
-        // transport.
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(map_sqlite)?;
         let changed = transaction
             .execute(
                 "UPDATE channel_outbound
-                 SET record_digest = ?2, canonical_jcs = ?3, state = ?5, queued_seq = ?6
-                 WHERE outbound_key = ?1 AND record_digest = ?7 AND state = ?4",
+                 SET record_digest = ?2, canonical_jcs = ?3,
+                     state = 'dispatched', queued_seq = ?4
+                 WHERE outbound_key = ?1
+                   AND record_digest = ?5
+                   AND state = 'queued'
+                   AND queued_seq = (
+                     SELECT MIN(candidate.queued_seq)
+                     FROM channel_outbound AS candidate
+                     WHERE candidate.state IN ('queued','dispatched')
+                   )",
                 params![
                     outbound_key,
                     digest,
                     bytes.as_slice(),
-                    original_state.as_str(),
-                    record.entry.state.as_str(),
                     record.entry.queued_seq,
                     verified_digest,
                 ],
             )
             .map_err(map_sqlite)?;
-        // Transaction-boundary failpoint: a failure after the UPDATE but
-        // before COMMIT must roll the whole CAS back, leaving the row
-        // Queued/Prepared (verified in tests) so a later claimer can win.
         if self.fail_after_dispatch_cas > 0 {
             self.fail_after_dispatch_cas -= 1;
             drop(transaction);
@@ -1434,19 +2081,31 @@ impl<'connection> SqliteChannelStore<'connection> {
     ) -> Result<(), ChannelError> {
         if self.fail_commit_outbound_terminal > 0 {
             self.fail_commit_outbound_terminal -= 1;
-            return Err(ChannelError::new(codes::INTERNAL, false, ChannelOutcome::NotApplied, "injected outbound terminal commit failure"));
+            return Err(ChannelError::new(
+                codes::INTERNAL,
+                false,
+                ChannelOutcome::NotApplied,
+                "injected outbound terminal commit failure",
+            ));
         }
         self.verify_owner_meta()?;
         if record.schema != OUTBOUND_RECORD_SCHEMA || record.version != 1 {
             return Err(corrupted("channel outbound record discriminator mismatch"));
         }
         if !record.entry.state.is_terminal() {
-            return Err(corrupted("commit_outbound_terminal requires a terminal outbound record"));
+            return Err(corrupted(
+                "commit_outbound_terminal requires a terminal outbound record",
+            ));
         }
-        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(map_sqlite)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite)?;
         Self::update_outbound_row(&transaction, record)?;
         for piece in record.entry.pieces.iter().filter_map(|p| match &p.outcome {
-            Some(PieceOutcome::Confirmed { transport_message_id }) => Some(transport_message_id),
+            Some(PieceOutcome::Confirmed {
+                transport_message_id,
+            }) => Some(transport_message_id),
             _ => None,
         }) {
             let echo = EchoRecord {
@@ -1499,7 +2158,12 @@ impl<'connection> SqliteChannelStore<'connection> {
     ) -> Result<(), ChannelError> {
         self.verify_owner_meta()?;
         if config_revision != self.owner.config_revision {
-            return Err(ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "echo record config revision does not match the bound store principal"));
+            return Err(ChannelError::new(
+                codes::AUTHENTICATION_FAILED,
+                false,
+                ChannelOutcome::NotApplied,
+                "echo record config revision does not match the bound store principal",
+            ));
         }
         let account = principal.account();
         let echo_key = format!("{account}\u{0}{transport_event_id}");
@@ -1526,7 +2190,10 @@ impl<'connection> SqliteChannelStore<'connection> {
             .to_vec();
         let text = String::from_utf8(bytes).expect("canonical encoding is UTF-8");
         let digest = Sha256Digest::compute(text.as_bytes()).to_canonical_string();
-        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(map_sqlite)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite)?;
         transaction
             .execute(
                 "INSERT INTO channel_echo (echo_key, record_digest, canonical_jcs) VALUES (?1, ?2, ?3)
@@ -1543,18 +2210,27 @@ impl<'connection> SqliteChannelStore<'connection> {
     fn verified_echo_id(&self, echo_key: &str) -> Result<String, ChannelError> {
         let row: Option<(String, Vec<u8>)> = self
             .connection
-            .query_row("SELECT record_digest, canonical_jcs FROM channel_echo WHERE echo_key = ?1", [echo_key], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_row(
+                "SELECT record_digest, canonical_jcs FROM channel_echo WHERE echo_key = ?1",
+                [echo_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .optional()
             .map_err(map_sqlite)?;
-        let Some((digest, jcs)) = row else { return Ok("".to_string()); };
+        let Some((digest, jcs)) = row else {
+            return Ok("".to_string());
+        };
         let recomputed = Sha256Digest::compute(&jcs).to_canonical_string();
         if recomputed != digest {
-            return Err(corrupted("channel echo marker record digest mismatch (tampered)"));
+            return Err(corrupted(
+                "channel echo marker record digest mismatch (tampered)",
+            ));
         }
-        let text = std::str::from_utf8(&jcs).map_err(|_| corrupted("channel echo marker is not UTF-8"))?;
+        let text =
+            std::str::from_utf8(&jcs).map_err(|_| corrupted("channel echo marker is not UTF-8"))?;
         // Strict parsing: unknown fields are rejected (deny_unknown_fields).
-        let record: EchoRecord =
-            serde_json::from_str(text).map_err(|_| corrupted("channel echo marker is not a strict canonical record"))?;
+        let record: EchoRecord = serde_json::from_str(text)
+            .map_err(|_| corrupted("channel echo marker is not a strict canonical record"))?;
         // Canonical re-encode must be byte-equal to the stored canonical bytes.
         let recanon = dolly_canonical_json::canonicalize(&record)
             .map_err(|e| corrupted(&format!("channel echo marker failed re-encoding: {e}")))?
@@ -1568,7 +2244,9 @@ impl<'connection> SqliteChannelStore<'connection> {
             return Err(corrupted("channel echo marker schema/version mismatch"));
         }
         if record.echo_key != echo_key {
-            return Err(corrupted("channel echo marker key does not match the table key"));
+            return Err(corrupted(
+                "channel echo marker key does not match the table key",
+            ));
         }
         // Derived key == table key == transport id.
         let derived = format!("{}\u{0}{}", record.account, record.transport_event_id);
@@ -1577,7 +2255,9 @@ impl<'connection> SqliteChannelStore<'connection> {
         }
         // Complete sealed principal equality against the bound store owner.
         if record.config_revision != self.owner.config_revision {
-            return Err(corrupted("channel echo marker config revision does not match the bound store principal"));
+            return Err(corrupted(
+                "channel echo marker config revision does not match the bound store principal",
+            ));
         }
         if record.owner != self.owner.owner
             || record.extension_id != self.owner.extension_id
@@ -1589,7 +2269,9 @@ impl<'connection> SqliteChannelStore<'connection> {
             || record.graph_digest != self.owner.graph_digest
             || record.account != self.owner.account
         {
-            return Err(corrupted("channel echo marker owner/meta does not match the bound principal"));
+            return Err(corrupted(
+                "channel echo marker owner/meta does not match the bound principal",
+            ));
         }
         Ok(record.transport_event_id)
     }
@@ -1597,7 +2279,11 @@ impl<'connection> SqliteChannelStore<'connection> {
     /// Whether a sent-transport echo marker exists for the account+message id,
     /// after full canonical verification.
     #[allow(dead_code)]
-    pub fn is_echo(&mut self, account: &str, transport_event_id: &str) -> Result<bool, ChannelError> {
+    pub fn is_echo(
+        &mut self,
+        account: &str,
+        transport_event_id: &str,
+    ) -> Result<bool, ChannelError> {
         self.verify_owner_meta()?;
         let echo_key = format!("{account}\u{0}{transport_event_id}");
         match self.verified_echo_id(&echo_key)? {
@@ -1611,8 +2297,15 @@ impl<'connection> SqliteChannelStore<'connection> {
     /// malformed or forged echo row fails closed here (never suppresses).
     fn list_verified_echo_keys(&mut self) -> Result<Vec<String>, ChannelError> {
         self.verify_owner_meta()?;
-        let mut statement = self.connection.prepare("SELECT echo_key FROM channel_echo ORDER BY echo_key").map_err(map_sqlite)?;
-        let keys = statement.query_map([], |row| row.get::<_, String>(0)).map_err(map_sqlite)?.collect::<Result<Vec<_>, _>>().map_err(map_sqlite)?;
+        let mut statement = self
+            .connection
+            .prepare("SELECT echo_key FROM channel_echo ORDER BY echo_key")
+            .map_err(map_sqlite)?;
+        let keys = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(map_sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlite)?;
         for key in &keys {
             let _ = self.verified_echo_id(key)?;
         }
@@ -1627,15 +2320,31 @@ impl<'connection> SqliteChannelStore<'connection> {
         self.verify_owner_meta()?;
         let mut ledger = ChannelLedger::new();
         let rows: Vec<(String, String, Vec<u8>)> = {
-            let mut statement = self.connection.prepare("SELECT intent_key, record_digest, canonical_jcs FROM channel_intent").map_err(map_sqlite)?;
-            statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?))).map_err(map_sqlite)?.collect::<Result<Vec<_>, _>>().map_err(map_sqlite)?
+            let mut statement = self
+                .connection
+                .prepare("SELECT intent_key, record_digest, canonical_jcs FROM channel_intent")
+                .map_err(map_sqlite)?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .map_err(map_sqlite)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(map_sqlite)?
         };
         for (key, digest, jcs) in rows {
             let computed = Sha256Digest::compute(&jcs).to_canonical_string();
             if computed != digest {
-                return Err(corrupted("channel intent stored digest mismatch during projection"));
+                return Err(corrupted(
+                    "channel intent stored digest mismatch during projection",
+                ));
             }
-            let text = std::str::from_utf8(&jcs).map_err(|_| corrupted("channel intent record is not UTF-8"))?;
+            let text = std::str::from_utf8(&jcs)
+                .map_err(|_| corrupted("channel intent record is not UTF-8"))?;
             let record = ChannelIntent::from_canonical_string(text)?;
             Self::verify_intent(self.connection, &key, &record, &self.owner)?;
             if record.state == IntentState::Accepted || record.state == IntentState::Rejected {
@@ -1651,7 +2360,11 @@ impl<'connection> SqliteChannelStore<'connection> {
                 // The SessionMap is part of the accepted three-piece durable
                 // ledger state; it is restored here from committed intents so
                 // session ownership survives restart for the outbound path.
-                ledger.insert_session(&record.account, &facts.external_conversation_id, &facts.session_id);
+                ledger.insert_session(
+                    &record.account,
+                    &facts.external_conversation_id,
+                    &facts.session_id,
+                );
                 let entry = InboundEntry {
                     transport_account: record.account.clone(),
                     external_message_id: facts.external_event_id.clone(),
@@ -1679,16 +2392,33 @@ impl<'connection> SqliteChannelStore<'connection> {
         // in-memory outbound ledger; every row is fully verified so the
         // accepted dispatch/recovery/observe pipeline sees the durable truth.
         {
-            let mut statement = self.connection.prepare("SELECT outbound_key, record_digest, canonical_jcs FROM channel_outbound").map_err(map_sqlite)?;
-            let outbound_rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?))).map_err(map_sqlite)?.collect::<Result<Vec<_>, _>>().map_err(map_sqlite)?;
+            let mut statement = self
+                .connection
+                .prepare("SELECT outbound_key, record_digest, canonical_jcs FROM channel_outbound")
+                .map_err(map_sqlite)?;
+            let outbound_rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .map_err(map_sqlite)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(map_sqlite)?;
             for (key, digest, jcs) in outbound_rows {
                 let computed = Sha256Digest::compute(&jcs).to_canonical_string();
                 if computed != digest {
-                    return Err(corrupted("channel outbound stored digest mismatch during projection"));
+                    return Err(corrupted(
+                        "channel outbound stored digest mismatch during projection",
+                    ));
                 }
-                let text = std::str::from_utf8(&jcs).map_err(|_| corrupted("channel outbound record is not UTF-8"))?;
-                let record: DurableOutboundRecord = serde_json::from_str(text)
-                    .map_err(|_| corrupted("channel outbound record is not a strict canonical record"))?;
+                let text = std::str::from_utf8(&jcs)
+                    .map_err(|_| corrupted("channel outbound record is not UTF-8"))?;
+                let record: DurableOutboundRecord = serde_json::from_str(text).map_err(|_| {
+                    corrupted("channel outbound record is not a strict canonical record")
+                })?;
                 Self::verify_outbound_record(self.connection, &key, &record, &self.owner)?;
                 let _ = ledger.insert_outbound(record.entry, 4096);
             }
@@ -1712,13 +2442,63 @@ mod tests {
     use crate::ledger::{EventKind, OutboundPiece, OutboundState};
 
     fn principal() -> ChannelPrincipal {
-        ChannelPrincipal::from_parts("owner-1", "org.dolly.channel", "receiver", "worker-1", 1, 1, 1, "digest-g")
+        ChannelPrincipal::from_parts(
+            "owner-1",
+            "org.dolly.channel",
+            "receiver",
+            "worker-1",
+            1,
+            1,
+            1,
+            "digest-g",
+        )
     }
 
     fn connection() -> Connection {
         let mut connection = Connection::open_in_memory().unwrap();
         create_channel_store_schema(&mut connection).unwrap();
         connection
+    }
+
+    fn admission_clock() -> crate::clock::VirtualClock {
+        crate::clock::VirtualClock::at("2026-08-09T15:00:00.000000Z".parse().unwrap())
+    }
+
+    fn admission_deadline() -> i64 {
+        crate::clock::timestamp_total_micros("2026-08-09T15:01:00.000000Z")
+    }
+
+    #[derive(Clone)]
+    struct SharedClock(std::sync::Arc<std::sync::Mutex<crate::clock::VirtualClock>>);
+
+    impl SharedClock {
+        fn at(value: &str) -> Self {
+            Self(std::sync::Arc::new(std::sync::Mutex::new(
+                crate::clock::VirtualClock::at(value.parse().unwrap()),
+            )))
+        }
+
+        fn advance_seconds(&self, seconds: i64) {
+            self.0.lock().unwrap().advance_seconds(seconds);
+        }
+    }
+
+    impl crate::clock::Clock for SharedClock {
+        fn now(&self) -> dolly_core_domain::Timestamp {
+            crate::clock::Clock::now(&*self.0.lock().unwrap())
+        }
+    }
+
+    static BUSY_TEST: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    static BUSY_SIGNAL: std::sync::LazyLock<std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+    fn signal_sqlite_busy(_: i32) -> bool {
+        if let Some(sender) = BUSY_SIGNAL.lock().unwrap().take() {
+            let _ = sender.send(());
+        }
+        true
     }
 
     /// A canonical draft whose `org.dolly.channel` metadata carries the full
@@ -1728,13 +2508,25 @@ mod tests {
         channel.insert("channel_id".into(), serde_json::json!("web-primary"));
         channel.insert("transport".into(), serde_json::json!("web"));
         channel.insert("session_id".into(), serde_json::json!("session-mapped"));
-        channel.insert("external_conversation_id".into(), serde_json::json!("conv-1"));
-        channel.insert("external_message_id".into(), serde_json::json!(external_message_id));
+        channel.insert(
+            "external_conversation_id".into(),
+            serde_json::json!("conv-1"),
+        );
+        channel.insert(
+            "external_message_id".into(),
+            serde_json::json!(external_message_id),
+        );
         channel.insert("sender_class".into(), serde_json::json!("user"));
-        channel.insert("received_at".into(), serde_json::json!("2026-08-28T00:00:00.000000Z"));
+        channel.insert(
+            "received_at".into(),
+            serde_json::json!("2026-08-28T00:00:00.000000Z"),
+        );
         channel.insert("event_kind".into(), serde_json::json!(kind));
         if let Some(references) = references {
-            channel.insert("references_external_message_id".into(), serde_json::json!(references));
+            channel.insert(
+                "references_external_message_id".into(),
+                serde_json::json!(references),
+            );
         }
         let draft = serde_json::json!({
             "schema": "dolly.block-draft/v1",
@@ -1742,23 +2534,50 @@ mod tests {
             "actions": [],
             "metadata": { "org.dolly.channel": serde_json::Value::Object(channel) }
         });
-        String::from_utf8(dolly_canonical_json::canonicalize(&draft).unwrap().0.as_bytes().to_vec()).expect("draft is UTF-8")
+        String::from_utf8(
+            dolly_canonical_json::canonicalize(&draft)
+                .unwrap()
+                .0
+                .as_bytes()
+                .to_vec(),
+        )
+        .expect("draft is UTF-8")
     }
 
     /// A semantically valid prepared intent (correct key, payload and
     /// operation digests derived from the canonical draft).
-    fn valid_intent(key: &str, account: &str, external_message_id: &str, kind: EventKind, references: Option<&str>) -> ChannelIntent {
+    fn valid_intent(
+        key: &str,
+        account: &str,
+        external_message_id: &str,
+        kind: EventKind,
+        references: Option<&str>,
+    ) -> ChannelIntent {
         let (kind_name, reference_opt) = match kind {
             EventKind::Message => ("message", None),
             EventKind::Edit => ("edit", Some(references.expect("edit requires a reference"))),
-            EventKind::Delete => ("delete", Some(references.expect("delete requires a reference"))),
+            EventKind::Delete => (
+                "delete",
+                Some(references.expect("delete requires a reference")),
+            ),
         };
         let request_jcs = draft(external_message_id, kind_name, reference_opt);
         let payload_digest = crate::host_adapter::payload_digest_of(&request_jcs);
         let digest = channel_intent_digest(
-            account, "org.dolly.channel", "receiver", "worker-1", 1, 1, 1, "digest-g",
-            1, external_message_id, kind, reference_opt,
-            &["page-a".to_string()], &payload_digest,
+            account,
+            "org.dolly.channel",
+            "receiver",
+            "worker-1",
+            1,
+            1,
+            1,
+            "digest-g",
+            1,
+            external_message_id,
+            kind,
+            reference_opt,
+            &["page-a".to_string()],
+            &payload_digest,
         );
         ChannelIntent {
             schema: SCHEMA.to_string(),
@@ -1793,19 +2612,38 @@ mod tests {
             let store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
             drop(store);
         }
-        let other = ChannelPrincipal::from_parts("owner-2", "org.dolly.channel", "receiver", "worker-1", 1, 1, 1, "digest-g");
-        let error = SqliteChannelStore::new(&mut connection, &other, 1).expect_err("cross-principal reuse");
+        let other = ChannelPrincipal::from_parts(
+            "owner-2",
+            "org.dolly.channel",
+            "receiver",
+            "worker-1",
+            1,
+            1,
+            1,
+            "digest-g",
+        );
+        let error =
+            SqliteChannelStore::new(&mut connection, &other, 1).expect_err("cross-principal reuse");
         assert_eq!(error.code, codes::AUTHENTICATION_FAILED);
     }
 
     #[test]
     fn semantic_tamper_with_recomputed_hash_fails_closed() {
         let mut connection = connection();
-        let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
+        let account =
+            crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
         let key = crate::ids::inbound_ingress_key(&account, "msg-1");
         {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-            store.write_prepared(&valid_intent(&key, &account, "msg-1", EventKind::Message, None)).unwrap();
+            store
+                .write_prepared(&valid_intent(
+                    &key,
+                    &account,
+                    "msg-1",
+                    EventKind::Message,
+                    None,
+                ))
+                .unwrap();
             // Sanity: the valid record reads back.
             assert!(store.find_intent(&key).unwrap().is_some());
         }
@@ -1825,7 +2663,9 @@ mod tests {
                 .unwrap();
         }
         let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-        let error = store.find_intent(&key).expect_err("semantic tamper must fail closed");
+        let error = store
+            .find_intent(&key)
+            .expect_err("semantic tamper must fail closed");
         assert_eq!(error.code, codes::LEDGER_CORRUPT);
     }
 
@@ -1835,11 +2675,20 @@ mod tests {
         // the outer hash is recomputed, but the derived facts no longer match
         // the stored key/digest, so verification fails closed.
         let mut connection = connection();
-        let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
+        let account =
+            crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
         let key = crate::ids::inbound_ingress_key(&account, "msg-1");
         {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-            store.write_prepared(&valid_intent(&key, &account, "msg-1", EventKind::Message, None)).unwrap();
+            store
+                .write_prepared(&valid_intent(
+                    &key,
+                    &account,
+                    "msg-1",
+                    EventKind::Message,
+                    None,
+                ))
+                .unwrap();
         }
         // Rewrite the draft metadata to a different external message id.
         let intent = {
@@ -1856,7 +2705,9 @@ mod tests {
         ).unwrap();
         let error = {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-            store.find_intent(&key).expect_err("metadata tamper must fail closed")
+            store
+                .find_intent(&key)
+                .expect_err("metadata tamper must fail closed")
         };
         assert_eq!(error.code, codes::LEDGER_CORRUPT);
     }
@@ -1864,16 +2715,22 @@ mod tests {
     #[test]
     fn project_derives_real_facts_from_the_canonical_draft() {
         let mut connection = connection();
-        let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
+        let account =
+            crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
         let key = crate::ids::inbound_ingress_key(&account, "msg-1");
         let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
         let intent = valid_intent(&key, &account, "msg-1", EventKind::Message, None);
         store.write_prepared(&intent).unwrap();
         store.commit_outcome(&key, Some("block-1"), None).unwrap();
         let ledger = store.project_ledger().unwrap();
-        let entry = ledger.inbound_entry(&account, "msg-1").expect("projected entry");
+        let entry = ledger
+            .inbound_entry(&account, "msg-1")
+            .expect("projected entry");
         assert_eq!(entry.channel_id, "web-primary");
-        assert_eq!(entry.session_id, "session-mapped", "non-default session mapping round-trips exactly");
+        assert_eq!(
+            entry.session_id, "session-mapped",
+            "non-default session mapping round-trips exactly"
+        );
         assert_eq!(entry.external_conversation_id, "conv-1");
         assert_eq!(entry.sender_class, "user");
         assert_eq!(entry.received_at, "2026-08-28T00:00:00.000000Z");
@@ -1884,11 +2741,20 @@ mod tests {
     #[test]
     fn noncanonical_draft_with_recomputed_hash_fails_closed() {
         let mut connection = connection();
-        let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
+        let account =
+            crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
         let key = crate::ids::inbound_ingress_key(&account, "msg-1");
         {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-            store.write_prepared(&valid_intent(&key, &account, "msg-1", EventKind::Message, None)).unwrap();
+            store
+                .write_prepared(&valid_intent(
+                    &key,
+                    &account,
+                    "msg-1",
+                    EventKind::Message,
+                    None,
+                ))
+                .unwrap();
         }
         // Rewrite the stored draft with the SAME canonical value but serialized
         // in a noncanonical key order (object keys unsorted), and recompute the
@@ -1897,14 +2763,14 @@ mod tests {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
             let mut i = store.find_intent(&key).unwrap().unwrap();
             let parsed: serde_json::Value = serde_json::from_str(&i.request_jcs).unwrap();
-        let obj = parsed.as_object().unwrap();
-        let mut reversed = serde_json::Map::new();
-        // insert in reverse order to force noncanonical serialization
-        for k in obj.keys().rev() {
-            reversed.insert(k.clone(), obj[k].clone());
-        }
-        i.request_jcs = serde_json::Value::Object(reversed).to_string();
-        i
+            let obj = parsed.as_object().unwrap();
+            let mut reversed = serde_json::Map::new();
+            // insert in reverse order to force noncanonical serialization
+            for k in obj.keys().rev() {
+                reversed.insert(k.clone(), obj[k].clone());
+            }
+            i.request_jcs = serde_json::Value::Object(reversed).to_string();
+            i
         };
         let _ = &mut intent;
         let canonical = intent.canonical_string().unwrap();
@@ -1915,7 +2781,9 @@ mod tests {
         ).unwrap();
         let error = {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-            store.find_intent(&key).expect_err("noncanonical draft must fail closed")
+            store
+                .find_intent(&key)
+                .expect_err("noncanonical draft must fail closed")
         };
         assert_eq!(error.code, codes::LEDGER_CORRUPT);
     }
@@ -1923,11 +2791,20 @@ mod tests {
     #[test]
     fn unknown_field_draft_with_recomputed_hash_fails_closed() {
         let mut connection = connection();
-        let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
+        let account =
+            crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
         let key = crate::ids::inbound_ingress_key(&account, "msg-1");
         {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-            store.write_prepared(&valid_intent(&key, &account, "msg-1", EventKind::Message, None)).unwrap();
+            store
+                .write_prepared(&valid_intent(
+                    &key,
+                    &account,
+                    "msg-1",
+                    EventKind::Message,
+                    None,
+                ))
+                .unwrap();
         }
         // Inject an unknown field into the channel metadata and recompute the
         // outer hash: strict metadata key-set verification must fail closed.
@@ -1948,7 +2825,9 @@ mod tests {
         ).unwrap();
         let error = {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-            store.find_intent(&key).expect_err("unknown draft field must fail closed")
+            store
+                .find_intent(&key)
+                .expect_err("unknown draft field must fail closed")
         };
         assert_eq!(error.code, codes::LEDGER_CORRUPT);
     }
@@ -1956,11 +2835,20 @@ mod tests {
     #[test]
     fn unknown_top_level_draft_field_fails_closed() {
         let mut connection = connection();
-        let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
+        let account =
+            crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
         let key = crate::ids::inbound_ingress_key(&account, "msg-1");
         {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-            store.write_prepared(&valid_intent(&key, &account, "msg-1", EventKind::Message, None)).unwrap();
+            store
+                .write_prepared(&valid_intent(
+                    &key,
+                    &account,
+                    "msg-1",
+                    EventKind::Message,
+                    None,
+                ))
+                .unwrap();
         }
         let intent = {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
@@ -1978,7 +2866,9 @@ mod tests {
         ).unwrap();
         let error = {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-            store.find_intent(&key).expect_err("unknown top-level draft field must fail closed")
+            store
+                .find_intent(&key)
+                .expect_err("unknown top-level draft field must fail closed")
         };
         assert_eq!(error.code, codes::LEDGER_CORRUPT);
     }
@@ -1989,24 +2879,41 @@ mod tests {
     #[test]
     fn draft_exact_shape_invariants_fail_closed() {
         let mut connection = connection();
-        let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
+        let account =
+            crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
         let key = crate::ids::inbound_ingress_key(&account, "msg-1");
 
         // Each case re-seeds a valid base intent, tampers one invariant in the
         // stored draft, recomputes the outer record hash so the record is
         // self-consistent, and requires exact-shape verification to fail
         // closed. A valid draft always passes.
-        fn tamper_case(connection: &mut Connection, key: &str, account: &str, label: &str,
-            mutate: impl FnOnce(&mut serde_json::Value)) {
-            connection.execute("DELETE FROM channel_intent WHERE intent_key = ?1", [key]).unwrap();
+        fn tamper_case(
+            connection: &mut Connection,
+            key: &str,
+            account: &str,
+            label: &str,
+            mutate: impl FnOnce(&mut serde_json::Value),
+        ) {
+            connection
+                .execute("DELETE FROM channel_intent WHERE intent_key = ?1", [key])
+                .unwrap();
             {
                 let mut store = SqliteChannelStore::new(connection, &principal(), 1).unwrap();
-                store.write_prepared(&valid_intent(key, account, "msg-1", EventKind::Message, None)).unwrap();
+                store
+                    .write_prepared(&valid_intent(
+                        key,
+                        account,
+                        "msg-1",
+                        EventKind::Message,
+                        None,
+                    ))
+                    .unwrap();
             }
             let intent = {
                 let mut store = SqliteChannelStore::new(connection, &principal(), 1).unwrap();
                 let intent = store.find_intent(key).unwrap().expect("base intent");
-                let mut draft: serde_json::Value = serde_json::from_str(&intent.request_jcs).unwrap();
+                let mut draft: serde_json::Value =
+                    serde_json::from_str(&intent.request_jcs).unwrap();
                 mutate(&mut draft);
                 let mut i2 = intent;
                 i2.request_jcs = draft.to_string();
@@ -2020,42 +2927,144 @@ mod tests {
             ).unwrap();
             let error = {
                 let mut store = SqliteChannelStore::new(connection, &principal(), 1).unwrap();
-                store.find_intent(key).expect_err(&format!("{label} must fail closed"))
+                store
+                    .find_intent(key)
+                    .expect_err(&format!("{label} must fail closed"))
             };
             assert_eq!(error.code, codes::LEDGER_CORRUPT);
         }
 
-        tamper_case(&mut connection, &key, &account, "missing root schema", |d| { d.as_object_mut().unwrap().remove("schema"); });
-        tamper_case(&mut connection, &key, &account, "wrong root schema", |d| { d["schema"] = serde_json::json!("dolly.evil/v1"); });
-        tamper_case(&mut connection, &key, &account, "missing root parts", |d| { d.as_object_mut().unwrap().remove("parts"); });
-        tamper_case(&mut connection, &key, &account, "missing root actions", |d| { d.as_object_mut().unwrap().remove("actions"); });
-        tamper_case(&mut connection, &key, &account, "wrong parts type", |d| { d["parts"] = serde_json::json!("text"); });
-        tamper_case(&mut connection, &key, &account, "wrong actions type", |d| { d["actions"] = serde_json::json!({"a": 1}); });
-        tamper_case(&mut connection, &key, &account, "wrong schema type", |d| { d["schema"] = serde_json::json!(1); });
-        tamper_case(&mut connection, &key, &account, "missing channel transport", |d| { d["metadata"]["org.dolly.channel"].as_object_mut().unwrap().remove("transport"); });
-        tamper_case(&mut connection, &key, &account, "missing channel sender_class", |d| { d["metadata"]["org.dolly.channel"].as_object_mut().unwrap().remove("sender_class"); });
-        tamper_case(&mut connection, &key, &account, "missing channel session_id", |d| { d["metadata"]["org.dolly.channel"].as_object_mut().unwrap().remove("session_id"); });
-        tamper_case(&mut connection, &key, &account, "wrong channel transport type", |d| { d["metadata"]["org.dolly.channel"]["transport"] = serde_json::json!(3); });
-        tamper_case(&mut connection, &key, &account, "missing metadata namespace", |d| { d["metadata"].as_object_mut().unwrap().remove("org.dolly.channel"); });
+        tamper_case(
+            &mut connection,
+            &key,
+            &account,
+            "missing root schema",
+            |d| {
+                d.as_object_mut().unwrap().remove("schema");
+            },
+        );
+        tamper_case(&mut connection, &key, &account, "wrong root schema", |d| {
+            d["schema"] = serde_json::json!("dolly.evil/v1");
+        });
+        tamper_case(&mut connection, &key, &account, "missing root parts", |d| {
+            d.as_object_mut().unwrap().remove("parts");
+        });
+        tamper_case(
+            &mut connection,
+            &key,
+            &account,
+            "missing root actions",
+            |d| {
+                d.as_object_mut().unwrap().remove("actions");
+            },
+        );
+        tamper_case(&mut connection, &key, &account, "wrong parts type", |d| {
+            d["parts"] = serde_json::json!("text");
+        });
+        tamper_case(&mut connection, &key, &account, "wrong actions type", |d| {
+            d["actions"] = serde_json::json!({"a": 1});
+        });
+        tamper_case(&mut connection, &key, &account, "wrong schema type", |d| {
+            d["schema"] = serde_json::json!(1);
+        });
+        tamper_case(
+            &mut connection,
+            &key,
+            &account,
+            "missing channel transport",
+            |d| {
+                d["metadata"]["org.dolly.channel"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("transport");
+            },
+        );
+        tamper_case(
+            &mut connection,
+            &key,
+            &account,
+            "missing channel sender_class",
+            |d| {
+                d["metadata"]["org.dolly.channel"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("sender_class");
+            },
+        );
+        tamper_case(
+            &mut connection,
+            &key,
+            &account,
+            "missing channel session_id",
+            |d| {
+                d["metadata"]["org.dolly.channel"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("session_id");
+            },
+        );
+        tamper_case(
+            &mut connection,
+            &key,
+            &account,
+            "wrong channel transport type",
+            |d| {
+                d["metadata"]["org.dolly.channel"]["transport"] = serde_json::json!(3);
+            },
+        );
+        tamper_case(
+            &mut connection,
+            &key,
+            &account,
+            "missing metadata namespace",
+            |d| {
+                d["metadata"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("org.dolly.channel");
+            },
+        );
 
         // A valid, unmodified draft still passes exact-shape verification.
-        connection.execute("DELETE FROM channel_intent WHERE intent_key = ?1", [&key]).unwrap();
+        connection
+            .execute("DELETE FROM channel_intent WHERE intent_key = ?1", [&key])
+            .unwrap();
         {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-            store.write_prepared(&valid_intent(&key, &account, "msg-1", EventKind::Message, None)).unwrap();
+            store
+                .write_prepared(&valid_intent(
+                    &key,
+                    &account,
+                    "msg-1",
+                    EventKind::Message,
+                    None,
+                ))
+                .unwrap();
         }
         let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-        assert!(store.find_intent(&key).unwrap().is_some(), "valid draft must pass");
+        assert!(
+            store.find_intent(&key).unwrap().is_some(),
+            "valid draft must pass"
+        );
     }
 
     #[test]
     fn unknown_metadata_namespace_fails_closed() {
         let mut connection = connection();
-        let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
+        let account =
+            crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
         let key = crate::ids::inbound_ingress_key(&account, "msg-1");
         {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-            store.write_prepared(&valid_intent(&key, &account, "msg-1", EventKind::Message, None)).unwrap();
+            store
+                .write_prepared(&valid_intent(
+                    &key,
+                    &account,
+                    "msg-1",
+                    EventKind::Message,
+                    None,
+                ))
+                .unwrap();
         }
         let intent = {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
@@ -2073,7 +3082,9 @@ mod tests {
         ).unwrap();
         let error = {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-            store.find_intent(&key).expect_err("unknown metadata namespace must fail closed")
+            store
+                .find_intent(&key)
+                .expect_err("unknown metadata namespace must fail closed")
         };
         assert_eq!(error.code, codes::LEDGER_CORRUPT);
     }
@@ -2093,7 +3104,10 @@ mod tests {
         fn resync_from_draft(mut intent: ChannelIntent) -> ChannelIntent {
             let draft: serde_json::Value = serde_json::from_str(&intent.request_jcs).unwrap();
             let channel = &draft["metadata"]["org.dolly.channel"];
-            let kind = match channel.get("event_kind").and_then(serde_json::Value::as_str) {
+            let kind = match channel
+                .get("event_kind")
+                .and_then(serde_json::Value::as_str)
+            {
                 Some("edit") => EventKind::Edit,
                 Some("delete") => EventKind::Delete,
                 _ => EventKind::Message,
@@ -2106,33 +3120,67 @@ mod tests {
             intent.references_external_event_id = references.clone();
             intent.payload_digest = crate::host_adapter::payload_digest_of(&intent.request_jcs);
             intent.digest = channel_intent_digest(
-                &intent.account, "org.dolly.channel", "receiver", "worker-1",
-                1, 1, 1, "digest-g", intent.config_revision, &intent.external_event_id,
-                kind, references.as_deref(), &intent.target_page_ids, &intent.payload_digest,
+                &intent.account,
+                "org.dolly.channel",
+                "receiver",
+                "worker-1",
+                1,
+                1,
+                1,
+                "digest-g",
+                intent.config_revision,
+                &intent.external_event_id,
+                kind,
+                references.as_deref(),
+                &intent.target_page_ids,
+                &intent.payload_digest,
             );
             intent
         }
 
         #[allow(clippy::too_many_arguments)]
-        fn reference_case(connection: &mut Connection, key: &str, account: &str,
-            external_message_id: &str, kind: EventKind, references: Option<&str>, label: &str,
-            mutate: impl FnOnce(&mut serde_json::Value)) {
-            connection.execute("DELETE FROM channel_intent WHERE intent_key = ?1", [key]).unwrap();
+        fn reference_case(
+            connection: &mut Connection,
+            key: &str,
+            account: &str,
+            external_message_id: &str,
+            kind: EventKind,
+            references: Option<&str>,
+            label: &str,
+            mutate: impl FnOnce(&mut serde_json::Value),
+        ) {
+            connection
+                .execute("DELETE FROM channel_intent WHERE intent_key = ?1", [key])
+                .unwrap();
             {
                 let mut store = SqliteChannelStore::new(connection, &principal(), 1).unwrap();
-                store.write_prepared(&valid_intent(key, account, external_message_id, kind, references)).unwrap();
+                store
+                    .write_prepared(&valid_intent(
+                        key,
+                        account,
+                        external_message_id,
+                        kind,
+                        references,
+                    ))
+                    .unwrap();
             }
             let intent = {
                 let mut store = SqliteChannelStore::new(connection, &principal(), 1).unwrap();
                 let intent = store.find_intent(key).unwrap().expect("base intent");
-                let mut draft: serde_json::Value = serde_json::from_str(&intent.request_jcs).unwrap();
+                let mut draft: serde_json::Value =
+                    serde_json::from_str(&intent.request_jcs).unwrap();
                 mutate(&mut draft);
                 let mut i2 = intent;
                 // Re-canonicalize so the stored draft passes canonical byte
                 // equality and reaches the reference/event-kind invariant.
                 i2.request_jcs = String::from_utf8(
-                    dolly_canonical_json::canonicalize(&draft).unwrap().0.as_bytes().to_vec(),
-                ).expect("canonical draft is UTF-8");
+                    dolly_canonical_json::canonicalize(&draft)
+                        .unwrap()
+                        .0
+                        .as_bytes()
+                        .to_vec(),
+                )
+                .expect("canonical draft is UTF-8");
                 resync_from_draft(i2)
             };
             let canonical = intent.canonical_string().unwrap();
@@ -2143,7 +3191,9 @@ mod tests {
             ).unwrap();
             let error = {
                 let mut store = SqliteChannelStore::new(connection, &principal(), 1).unwrap();
-                store.find_intent(key).expect_err(&format!("{label} must fail closed"))
+                store
+                    .find_intent(key)
+                    .expect_err(&format!("{label} must fail closed"))
             };
             assert_eq!(error.code, codes::LEDGER_CORRUPT);
             // The failure must be the optional-reference/event-kind invariant
@@ -2156,60 +3206,182 @@ mod tests {
         }
 
         let mut connection = connection();
-        let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
+        let account =
+            crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
         // Message carrying a present BUT empty reference must fail closed (an
         // empty string is never normalized to None) — with inner+outer digests
         // recomputed, so the failure is the reference invariant itself.
-        reference_case(&mut connection, &crate::ids::inbound_ingress_key(&account, "mref"), &account, "mref", EventKind::Message, None, "empty reference on message",
-            |d| { d["metadata"]["org.dolly.channel"]["references_external_message_id"] = serde_json::json!(""); });
+        reference_case(
+            &mut connection,
+            &crate::ids::inbound_ingress_key(&account, "mref"),
+            &account,
+            "mref",
+            EventKind::Message,
+            None,
+            "empty reference on message",
+            |d| {
+                d["metadata"]["org.dolly.channel"]["references_external_message_id"] =
+                    serde_json::json!("");
+            },
+        );
         // Edit carrying a present BUT empty reference must fail closed.
-        reference_case(&mut connection, &crate::ids::inbound_ingress_key(&account, "eref"), &account, "eref", EventKind::Edit, Some("msg-original"), "empty reference on edit",
-            |d| { d["metadata"]["org.dolly.channel"]["references_external_message_id"] = serde_json::json!(""); });
+        reference_case(
+            &mut connection,
+            &crate::ids::inbound_ingress_key(&account, "eref"),
+            &account,
+            "eref",
+            EventKind::Edit,
+            Some("msg-original"),
+            "empty reference on edit",
+            |d| {
+                d["metadata"]["org.dolly.channel"]["references_external_message_id"] =
+                    serde_json::json!("");
+            },
+        );
         // Delete carrying a present BUT empty reference must fail closed.
-        reference_case(&mut connection, &crate::ids::inbound_ingress_key(&account, "dref"), &account, "dref", EventKind::Delete, Some("msg-original"), "empty reference on delete",
-            |d| { d["metadata"]["org.dolly.channel"]["references_external_message_id"] = serde_json::json!(""); });
+        reference_case(
+            &mut connection,
+            &crate::ids::inbound_ingress_key(&account, "dref"),
+            &account,
+            "dref",
+            EventKind::Delete,
+            Some("msg-original"),
+            "empty reference on delete",
+            |d| {
+                d["metadata"]["org.dolly.channel"]["references_external_message_id"] =
+                    serde_json::json!("");
+            },
+        );
         // A message whose draft illegally GAINS a reference must fail closed
         // (relation shape), with all digests recomputed.
-        reference_case(&mut connection, &crate::ids::inbound_ingress_key(&account, "gref"), &account, "gref", EventKind::Message, None, "message gaining a reference",
-            |d| { d["metadata"]["org.dolly.channel"]["references_external_message_id"] = serde_json::json!("msg-original"); });
+        reference_case(
+            &mut connection,
+            &crate::ids::inbound_ingress_key(&account, "gref"),
+            &account,
+            "gref",
+            EventKind::Message,
+            None,
+            "message gaining a reference",
+            |d| {
+                d["metadata"]["org.dolly.channel"]["references_external_message_id"] =
+                    serde_json::json!("msg-original");
+            },
+        );
         // Present NON-STRING reference (a number) must fail closed.
-        reference_case(&mut connection, &crate::ids::inbound_ingress_key(&account, "nref"), &account, "nref", EventKind::Message, None, "non-string reference",
-            |d| { d["metadata"]["org.dolly.channel"]["references_external_message_id"] = serde_json::json!(5); });
+        reference_case(
+            &mut connection,
+            &crate::ids::inbound_ingress_key(&account, "nref"),
+            &account,
+            "nref",
+            EventKind::Message,
+            None,
+            "non-string reference",
+            |d| {
+                d["metadata"]["org.dolly.channel"]["references_external_message_id"] =
+                    serde_json::json!(5);
+            },
+        );
         // Present NULL reference (distinct from absent) must fail closed.
-        reference_case(&mut connection, &crate::ids::inbound_ingress_key(&account, "nulref"), &account, "nulref", EventKind::Message, None, "null reference",
-            |d| { d["metadata"]["org.dolly.channel"]["references_external_message_id"] = serde_json::Value::Null; });
+        reference_case(
+            &mut connection,
+            &crate::ids::inbound_ingress_key(&account, "nulref"),
+            &account,
+            "nulref",
+            EventKind::Message,
+            None,
+            "null reference",
+            |d| {
+                d["metadata"]["org.dolly.channel"]["references_external_message_id"] =
+                    serde_json::Value::Null;
+            },
+        );
         // Invalid event_kind string must fail closed (event-kind invariant).
-        reference_case(&mut connection, &crate::ids::inbound_ingress_key(&account, "kref"), &account, "kref", EventKind::Message, None, "invalid event_kind string",
-            |d| { d["metadata"]["org.dolly.channel"]["event_kind"] = serde_json::json!("bogus"); });
+        reference_case(
+            &mut connection,
+            &crate::ids::inbound_ingress_key(&account, "kref"),
+            &account,
+            "kref",
+            EventKind::Message,
+            None,
+            "invalid event_kind string",
+            |d| {
+                d["metadata"]["org.dolly.channel"]["event_kind"] = serde_json::json!("bogus");
+            },
+        );
         // Invalid event_kind type must fail closed (event-kind invariant).
-        reference_case(&mut connection, &crate::ids::inbound_ingress_key(&account, "tref"), &account, "tref", EventKind::Message, None, "invalid event_kind type",
-            |d| { d["metadata"]["org.dolly.channel"]["event_kind"] = serde_json::json!(7); });
+        reference_case(
+            &mut connection,
+            &crate::ids::inbound_ingress_key(&account, "tref"),
+            &account,
+            "tref",
+            EventKind::Message,
+            None,
+            "invalid event_kind type",
+            |d| {
+                d["metadata"]["org.dolly.channel"]["event_kind"] = serde_json::json!(7);
+            },
+        );
 
         // Valid absent-message passes.
-        connection.execute("DELETE FROM channel_intent WHERE intent_key = ?1", [&crate::ids::inbound_ingress_key(&account, "vm")]).unwrap();
+        connection
+            .execute(
+                "DELETE FROM channel_intent WHERE intent_key = ?1",
+                [&crate::ids::inbound_ingress_key(&account, "vm")],
+            )
+            .unwrap();
         {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
             let key = crate::ids::inbound_ingress_key(&account, "vm");
-            store.write_prepared(&valid_intent(&key, &account, "vm", EventKind::Message, None)).unwrap();
-            assert!(store.find_intent(&key).unwrap().is_some(), "valid absent-message draft must pass");
+            store
+                .write_prepared(&valid_intent(
+                    &key,
+                    &account,
+                    "vm",
+                    EventKind::Message,
+                    None,
+                ))
+                .unwrap();
+            assert!(
+                store.find_intent(&key).unwrap().is_some(),
+                "valid absent-message draft must pass"
+            );
         }
         // Valid nonempty edit/delete pass.
         for (kind, suffix) in [(EventKind::Edit, "ve"), (EventKind::Delete, "vd")] {
-            connection.execute("DELETE FROM channel_intent WHERE intent_key = ?1", [&crate::ids::inbound_ingress_key(&account, suffix)]).unwrap();
+            connection
+                .execute(
+                    "DELETE FROM channel_intent WHERE intent_key = ?1",
+                    [&crate::ids::inbound_ingress_key(&account, suffix)],
+                )
+                .unwrap();
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
             let key = crate::ids::inbound_ingress_key(&account, suffix);
-            store.write_prepared(&valid_intent(&key, &account, suffix, kind, Some("msg-original"))).unwrap();
-            assert!(store.find_intent(&key).unwrap().is_some(), "valid {kind:?} draft must pass");
+            store
+                .write_prepared(&valid_intent(
+                    &key,
+                    &account,
+                    suffix,
+                    kind,
+                    Some("msg-original"),
+                ))
+                .unwrap();
+            assert!(
+                store.find_intent(&key).unwrap().is_some(),
+                "valid {kind:?} draft must pass"
+            );
         }
     }
 
     #[test]
     fn echo_markers_survive_reopen_and_forgery_fails_closed() {
         let mut connection = connection();
-        let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
+        let account =
+            crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
         {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-            store.record_echo(&principal(), 1, "transport-msg-1").unwrap();
+            store
+                .record_echo(&principal(), 1, "transport-msg-1")
+                .unwrap();
             assert!(store.is_echo(&account, "transport-msg-1").unwrap());
         }
         {
@@ -2224,9 +3396,13 @@ mod tests {
         // forged marker must NEVER suppress (project_ledger errors).
         {
             let echo_key = format!("{account}\u{0}transport-msg-1");
-            let row: (String, Vec<u8>) = connection.query_row(
-                "SELECT record_digest, canonical_jcs FROM channel_echo WHERE echo_key = ?1",
-                [&echo_key], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            let row: (String, Vec<u8>) = connection
+                .query_row(
+                    "SELECT record_digest, canonical_jcs FROM channel_echo WHERE echo_key = ?1",
+                    [&echo_key],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
             let text = String::from_utf8(row.1).unwrap();
             let mut record: serde_json::Value = serde_json::from_str(&text).unwrap();
             record["transport_event_id"] = serde_json::json!("forged-id");
@@ -2237,7 +3413,9 @@ mod tests {
                 rusqlite::params![digest, forged.as_bytes(), echo_key],
             ).unwrap();
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-            let err = store.project_ledger().expect_err("forged echo must fail closed");
+            let err = store
+                .project_ledger()
+                .expect_err("forged echo must fail closed");
             assert_eq!(err.code, codes::LEDGER_CORRUPT);
         }
     }
@@ -2284,7 +3462,11 @@ mod tests {
             }
         });
         String::from_utf8(
-            dolly_canonical_json::canonicalize(&action).unwrap().0.as_bytes().to_vec(),
+            dolly_canonical_json::canonicalize(&action)
+                .unwrap()
+                .0
+                .as_bytes()
+                .to_vec(),
         )
         .expect("canonical action is UTF-8")
     }
@@ -2292,29 +3474,38 @@ mod tests {
     /// A semantically valid durable Prepared outbound record bound to the
     /// test store owner and config revision, with the authority-bound digest
     /// recomputed from the canonical Action bytes.
-    fn valid_outbound_record(action_id: &str, session_id: &str, target: &str, text: &str) -> DurableOutboundRecord {
+    fn valid_outbound_record(
+        action_id: &str,
+        session_id: &str,
+        target: &str,
+        text: &str,
+    ) -> DurableOutboundRecord {
         let action_jcs = send_action_jcs(action_id, session_id, target, text);
         let account = outbound_account();
         let base_digest = crate::host_adapter::outbound_operation_digest(
-            "org.dolly.channel", "receiver", "worker-1", 1, 1, 1, "digest-g",
-            1, &account, &action_jcs, target,
+            "org.dolly.channel",
+            "receiver",
+            "worker-1",
+            1,
+            1,
+            1,
+            "digest-g",
+            1,
+            &account,
+            &action_jcs,
+            target,
         );
-        // Extended manifest-selected digest (matches verify_outbound_record).
-        let mut identity = serde_json::Map::new();
-        identity.insert("schema".into(), serde_json::json!("dolly.channel-outbound/manifest-selected/v1"));
-        identity.insert("base".into(), serde_json::json!(base_digest));
-        identity.insert("activation_id".into(), serde_json::json!("activation-test"));
-        identity.insert("manifest_digest".into(), serde_json::json!("sha256:manifest-test"));
-        identity.insert("input_index".into(), serde_json::json!(0usize));
-        identity.insert("action_index".into(), serde_json::json!(0usize));
-        identity.insert("block_id".into(), serde_json::json!("block-test"));
-        let digest = Sha256Digest::compute(
-            dolly_canonical_json::canonicalize(&serde_json::Value::Object(identity))
-                .expect("identity is canonical JSON")
-                .0
-                .as_bytes(),
-        )
-        .to_canonical_string();
+        let digest = crate::outbound_committed::manifest_operation_digest(
+            &base_digest,
+            "activation-test",
+            "sha256:manifest-test",
+            0,
+            "page-test",
+            1,
+            1,
+            0,
+            "block-test",
+        );
         DurableOutboundRecord {
             schema: OUTBOUND_RECORD_SCHEMA.to_string(),
             version: 1,
@@ -2323,7 +3514,10 @@ mod tests {
             action_jcs,
             activation_id: "activation-test".to_string(),
             manifest_digest: "sha256:manifest-test".to_string(),
-            input_index: 0,
+            occurrence_index: 0,
+            page_id: "page-test".to_string(),
+            page_seq: 1,
+            commit_seq: 1,
             action_index: 0,
             block_id: "block-test".to_string(),
             target_module_id: target.to_string(),
@@ -2379,15 +3573,23 @@ mod tests {
         );
         // Same key + different content (different text) conflicts before enqueue.
         let changed = valid_outbound_record(action_id, "session-main", "receiver", "Different.");
-        let error = store.insert_prepared_or_replay(&changed).expect_err("different content must conflict");
+        let error = store
+            .insert_prepared_or_replay(&changed)
+            .expect_err("different content must conflict");
         assert_eq!(error.code, codes::OPERATION_CONFLICT);
         // The durable row is unchanged by the conflict attempt.
-        let loaded = store.find_outbound(action_id).unwrap().expect("durable row");
+        let loaded = store
+            .find_outbound(action_id)
+            .unwrap()
+            .expect("durable row");
         assert_eq!(loaded.entry.pieces[0].text, "Hello.");
         // Reopen (restart) still sees the durable Prepared row.
         drop(store);
         let mut reopened = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-        let again = reopened.find_outbound(action_id).unwrap().expect("survives restart");
+        let again = reopened
+            .find_outbound(action_id)
+            .unwrap()
+            .expect("survives restart");
         assert_eq!(again.entry.state, OutboundState::Prepared);
         assert_eq!(again.digest, first.digest);
         assert_eq!(reopened.list_pending_outbound().unwrap().len(), 1);
@@ -2405,9 +3607,13 @@ mod tests {
         }
         // Re-hash a tampered canonical record: change the targeted module and
         // recompute the outer hash. Full verification must fail closed.
-        let row: (String, Vec<u8>) = connection.query_row(
-            "SELECT record_digest, canonical_jcs FROM channel_outbound WHERE outbound_key = ?1",
-            [action_id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        let row: (String, Vec<u8>) = connection
+            .query_row(
+                "SELECT record_digest, canonical_jcs FROM channel_outbound WHERE outbound_key = ?1",
+                [action_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         let text = String::from_utf8(row.1).unwrap();
         let mut forged: serde_json::Value = serde_json::from_str(&text).unwrap();
         forged["target_module_id"] = serde_json::json!("receiver-other");
@@ -2418,7 +3624,9 @@ mod tests {
             rusqlite::params![digest, forged.as_bytes(), action_id],
         ).unwrap();
         let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-        let err = store.find_outbound(action_id).expect_err("semantic tamper must fail closed");
+        let err = store
+            .find_outbound(action_id)
+            .expect_err("semantic tamper must fail closed");
         assert_eq!(err.code, codes::LEDGER_CORRUPT);
     }
 
@@ -2429,9 +3637,14 @@ mod tests {
         let record = valid_outbound_record(action_id, "session-main", "receiver", "Hello.");
         let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
         store.inject_write_prepared_outbound_failure(1);
-        let err = store.insert_prepared_or_replay(&record).expect_err("injected write failure");
+        let err = store
+            .insert_prepared_or_replay(&record)
+            .expect_err("injected write failure");
         assert_eq!(err.code, codes::INTERNAL);
-        assert!(store.find_outbound(action_id).unwrap().is_none(), "no durable row after a failed pre-admission write");
+        assert!(
+            store.find_outbound(action_id).unwrap().is_none(),
+            "no durable row after a failed pre-admission write"
+        );
     }
     #[test]
     fn fifo_pending_reconstructs_the_durable_queue_after_restart() {
@@ -2443,12 +3656,25 @@ mod tests {
             ("0198ab31-6c44-7e8a-b2bb-000000000302", "second"),
         ] {
             store
-                .insert_prepared_or_replay(&valid_outbound_record(action_id, "session-main", "receiver", text))
+                .insert_prepared_or_replay(&valid_outbound_record(
+                    action_id,
+                    "session-main",
+                    "receiver",
+                    text,
+                ))
                 .unwrap();
-            assert!(
+            assert_eq!(
                 store
-                    .admit_to_queue(action_id, "session-main", 8, 64, 0, "2026-08-09T15:00:00.000000Z")
+                    .admit_to_queue(
+                        action_id,
+                        "session-main",
+                        1,
+                        admission_deadline(),
+                        crate::config::OutboundLimits::default(),
+                        &admission_clock(),
+                    )
                     .unwrap(),
+                OutboundAdmissionOutcome::Granted,
                 "admission succeeds"
             );
         }
@@ -2496,24 +3722,45 @@ mod tests {
             create_channel_store_schema(&mut conn).unwrap();
             let mut store = SqliteChannelStore::new(&mut conn, &principal(), 1).unwrap();
             store
-                .insert_prepared_or_replay(&valid_outbound_record(action_id, "session-main", "receiver", "hi"))
+                .insert_prepared_or_replay(&valid_outbound_record(
+                    action_id,
+                    "session-main",
+                    "receiver",
+                    "hi",
+                ))
                 .unwrap();
-            store
-                .admit_to_queue(action_id, "session-main", 8, 64, 0, "2026-08-09T15:00:00.000000Z")
-                .unwrap();
+            assert_eq!(
+                store
+                    .admit_to_queue(
+                        action_id,
+                        "session-main",
+                        1,
+                        admission_deadline(),
+                        crate::config::OutboundLimits::default(),
+                        &admission_clock(),
+                    )
+                    .unwrap(),
+                OutboundAdmissionOutcome::Granted,
+            );
         }
         // Two INDEPENDENT SQLite connections race the dispatch CAS on the SAME
         // row simultaneously. Exactly one must Win; the loser sees LostRace.
         let conn_path = path.clone();
         let wins = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
         let mut handles = Vec::new();
         for _ in 0..2 {
             let wins = std::sync::Arc::clone(&wins);
             let conn_path = conn_path.clone();
+            let start = std::sync::Arc::clone(&start);
             handles.push(std::thread::spawn(move || {
                 let mut conn = Connection::open(&conn_path).unwrap();
                 let mut store = SqliteChannelStore::new(&mut conn, &principal(), 1).unwrap();
-                match store.claim_dispatch(action_id, "2026-08-09T15:00:00.000000Z").unwrap() {
+                start.wait();
+                match store
+                    .claim_dispatch(action_id, "2026-08-09T15:00:00.000000Z")
+                    .unwrap()
+                {
                     DispatchClaim::Won(_) => {
                         *wins.lock().unwrap() += 1;
                     }
@@ -2522,10 +3769,15 @@ mod tests {
                 }
             }));
         }
+        start.wait();
         for h in handles {
             h.join().unwrap();
         }
-        assert_eq!(*wins.lock().unwrap(), 1, "exactly one concurrent claimant wins");
+        assert_eq!(
+            *wins.lock().unwrap(),
+            1,
+            "exactly one concurrent claimant wins"
+        );
         // The winner's Dispatched transition is durable and the CAS was bound
         // to the verified row digest (state + bytes advanced atomically).
         let mut s3conn = Connection::open(&path).unwrap();
@@ -2541,11 +3793,26 @@ mod tests {
         let action_id = "0198ab31-6c44-7e8a-b2bb-000000000304";
         let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
         store
-            .insert_prepared_or_replay(&valid_outbound_record(action_id, "session-main", "receiver", "hi"))
+            .insert_prepared_or_replay(&valid_outbound_record(
+                action_id,
+                "session-main",
+                "receiver",
+                "hi",
+            ))
             .unwrap();
-        store
-            .admit_to_queue(action_id, "session-main", 8, 64, 0, "2026-08-09T15:00:00.000000Z")
-            .unwrap();
+        assert_eq!(
+            store
+                .admit_to_queue(
+                    action_id,
+                    "session-main",
+                    1,
+                    admission_deadline(),
+                    crate::config::OutboundLimits::default(),
+                    &admission_clock(),
+                )
+                .unwrap(),
+            OutboundAdmissionOutcome::Granted,
+        );
         // Crash AFTER the CAS UPDATE but BEFORE COMMIT: the whole transaction
         // must roll back, leaving the row durably Queued (never a half-applied
         // Dispatched marker, never a leaked winner).
@@ -2555,10 +3822,17 @@ mod tests {
             .expect_err("transaction-boundary failure propagates");
         assert_eq!(err.code, codes::INTERNAL);
         let record = store.find_outbound(action_id).unwrap().unwrap();
-        assert_eq!(record.entry.state, OutboundState::Queued, "CAS rolled back atomically");
+        assert_eq!(
+            record.entry.state,
+            OutboundState::Queued,
+            "CAS rolled back atomically"
+        );
         assert!(record.entry.dispatched_at.is_none());
         // A later clean claimer still wins exactly once (no leaked state).
-        match store.claim_dispatch(action_id, "2026-08-09T15:00:01.000000Z").unwrap() {
+        match store
+            .claim_dispatch(action_id, "2026-08-09T15:00:01.000000Z")
+            .unwrap()
+        {
             DispatchClaim::Won(_) => {}
             other => panic!("later claimer must win after rollback, got {other:?}"),
         }
@@ -2566,5 +3840,412 @@ mod tests {
         assert_eq!(record.entry.state, OutboundState::Dispatched);
     }
 
+    fn admission_limits(
+        total: usize,
+        per_session: usize,
+        rate: u64,
+    ) -> crate::config::OutboundLimits {
+        crate::config::OutboundLimits {
+            max_pending_per_session: per_session,
+            max_pending_total: total,
+            max_pieces_per_second_per_session: rate,
+            ..crate::config::OutboundLimits::default()
+        }
+    }
 
+    #[test]
+    fn durable_waiting_rate_state_and_combined_bounds_are_atomic() {
+        let mut connection = connection();
+        let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+        let clock = SharedClock::at("2026-08-09T15:00:00.000000Z");
+        let deadline = crate::clock::timestamp_total_micros("2026-08-09T15:00:10.000000Z");
+        let limits = admission_limits(2, 2, 1);
+        let ids = [
+            "0198ab31-6c44-7e8a-b2bb-000000000401",
+            "0198ab31-6c44-7e8a-b2bb-000000000402",
+            "0198ab31-6c44-7e8a-b2bb-000000000403",
+        ];
+        for id in ids {
+            store
+                .insert_prepared_or_replay(&valid_outbound_record(
+                    id,
+                    "session-main",
+                    "receiver",
+                    id,
+                ))
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .admit_to_queue(ids[0], "session-main", 1, deadline, limits, &clock)
+                .unwrap(),
+            OutboundAdmissionOutcome::Granted
+        );
+        assert!(matches!(
+            store
+                .admit_to_queue(ids[1], "session-main", 1, deadline, limits, &clock)
+                .unwrap(),
+            OutboundAdmissionOutcome::Waiting { .. }
+        ));
+        assert_eq!(store.waiting_admissions("session-main").unwrap(), 1);
+        assert_eq!(
+            store
+                .admit_to_queue(ids[2], "session-main", 1, deadline, limits, &clock)
+                .unwrap(),
+            OutboundAdmissionOutcome::Saturated,
+            "Waiting+Queued+Dispatched never exceeds the configured bound",
+        );
+        clock.advance_seconds(1);
+        assert_eq!(
+            store
+                .admit_to_queue(ids[1], "session-main", 1, deadline, limits, &clock)
+                .unwrap(),
+            OutboundAdmissionOutcome::Granted
+        );
+        assert_eq!(store.waiting_admissions("session-main").unwrap(), 0);
+        let fifo: Vec<String> = store
+            .fifo_pending()
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.entry.state == OutboundState::Queued)
+            .map(|record| record.outbound_key)
+            .collect();
+        assert_eq!(fifo, ids[..2]);
+    }
+
+    #[test]
+    fn durable_admission_enforces_per_session_and_global_combined_bounds() {
+        let mut connection = connection();
+        let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+        let clock = admission_clock();
+        let limits = admission_limits(2, 1, 10);
+        let ids = [
+            "0198ab31-6c44-7e8a-b2bb-000000000409",
+            "0198ab31-6c44-7e8a-b2bb-000000000410",
+            "0198ab31-6c44-7e8a-b2bb-000000000411",
+            "0198ab31-6c44-7e8a-b2bb-000000000412",
+        ];
+        for (id, session) in [
+            (ids[0], "session-a"),
+            (ids[1], "session-a"),
+            (ids[2], "session-b"),
+            (ids[3], "session-c"),
+        ] {
+            store
+                .insert_prepared_or_replay(&valid_outbound_record(id, session, "receiver", id))
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .admit_to_queue(ids[0], "session-a", 1, admission_deadline(), limits, &clock,)
+                .unwrap(),
+            OutboundAdmissionOutcome::Granted
+        );
+        assert_eq!(
+            store
+                .admit_to_queue(ids[1], "session-a", 1, admission_deadline(), limits, &clock,)
+                .unwrap(),
+            OutboundAdmissionOutcome::Saturated,
+            "per-session combined bound is independent",
+        );
+        assert_eq!(
+            store
+                .admit_to_queue(ids[2], "session-b", 1, admission_deadline(), limits, &clock,)
+                .unwrap(),
+            OutboundAdmissionOutcome::Granted
+        );
+        assert_eq!(
+            store
+                .admit_to_queue(ids[3], "session-c", 1, admission_deadline(), limits, &clock,)
+                .unwrap(),
+            OutboundAdmissionOutcome::Saturated,
+            "global combined bound is independent",
+        );
+    }
+
+    #[test]
+    fn database_lock_deadline_crossing_cannot_grant_late() {
+        let _serial = BUSY_TEST.lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("deadline.sqlite3");
+        let action_id = "0198ab31-6c44-7e8a-b2bb-000000000404";
+        {
+            let mut setup = Connection::open(&path).unwrap();
+            create_channel_store_schema(&mut setup).unwrap();
+            SqliteChannelStore::new(&mut setup, &principal(), 1)
+                .unwrap()
+                .insert_prepared_or_replay(&valid_outbound_record(
+                    action_id,
+                    "session-main",
+                    "receiver",
+                    "deadline",
+                ))
+                .unwrap();
+        }
+        let clock = SharedClock::at("2026-08-09T15:00:00.000000Z");
+        let deadline = crate::clock::timestamp_total_micros("2026-08-09T15:00:01.000000Z");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let thread_path = path.clone();
+        let thread_clock = clock.clone();
+        let contender = std::thread::spawn(move || {
+            let mut connection = Connection::open(thread_path).unwrap();
+            connection.busy_handler(Some(signal_sqlite_busy)).unwrap();
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+            ready_tx.send(()).unwrap();
+            start_rx.recv().unwrap();
+            store
+                .admit_to_queue(
+                    action_id,
+                    "session-main",
+                    1,
+                    deadline,
+                    admission_limits(4, 4, 10),
+                    &thread_clock,
+                )
+                .unwrap()
+        });
+        ready_rx.recv().unwrap();
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+        *BUSY_SIGNAL.lock().unwrap() = Some(busy_tx);
+        start_tx.send(()).unwrap();
+        busy_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("SQLite reports the contender blocked on the write lock");
+        clock.advance_seconds(2);
+        blocker.execute_batch("COMMIT").unwrap();
+        assert_eq!(contender.join().unwrap(), OutboundAdmissionOutcome::Expired);
+        let mut verify_connection = Connection::open(&path).unwrap();
+        let mut verify = SqliteChannelStore::new(&mut verify_connection, &principal(), 1).unwrap();
+        assert_eq!(
+            verify
+                .find_outbound(action_id)
+                .unwrap()
+                .unwrap()
+                .entry
+                .state,
+            OutboundState::Prepared,
+        );
+    }
+
+    #[test]
+    fn cancel_and_grant_race_has_one_durable_winner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cancel.sqlite3");
+        let first = "0198ab31-6c44-7e8a-b2bb-000000000405";
+        let waiting = "0198ab31-6c44-7e8a-b2bb-000000000406";
+        let clock = SharedClock::at("2026-08-09T15:00:00.000000Z");
+        let deadline = crate::clock::timestamp_total_micros("2026-08-09T15:00:10.000000Z");
+        let limits = admission_limits(4, 4, 1);
+        {
+            let mut connection = Connection::open(&path).unwrap();
+            create_channel_store_schema(&mut connection).unwrap();
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+            for id in [first, waiting] {
+                store
+                    .insert_prepared_or_replay(&valid_outbound_record(
+                        id,
+                        "session-main",
+                        "receiver",
+                        id,
+                    ))
+                    .unwrap();
+            }
+            assert_eq!(
+                store
+                    .admit_to_queue(first, "session-main", 1, deadline, limits, &clock)
+                    .unwrap(),
+                OutboundAdmissionOutcome::Granted
+            );
+            assert!(matches!(
+                store
+                    .admit_to_queue(waiting, "session-main", 1, deadline, limits, &clock)
+                    .unwrap(),
+                OutboundAdmissionOutcome::Waiting { .. }
+            ));
+        }
+        clock.advance_seconds(1);
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let grant_path = path.clone();
+        let grant_clock = clock.clone();
+        let grant_start = std::sync::Arc::clone(&start);
+        let grant = std::thread::spawn(move || {
+            let mut connection = Connection::open(grant_path).unwrap();
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+            grant_start.wait();
+            store
+                .admit_to_queue(waiting, "session-main", 1, deadline, limits, &grant_clock)
+                .unwrap()
+        });
+        let cancel_path = path.clone();
+        let cancel_clock = clock.clone();
+        let cancel_start = std::sync::Arc::clone(&start);
+        let cancel = std::thread::spawn(move || {
+            let mut connection = Connection::open(cancel_path).unwrap();
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+            cancel_start.wait();
+            store.cancel_admission(waiting, &cancel_clock).unwrap()
+        });
+        start.wait();
+        let granted = grant.join().unwrap();
+        let cancelled = cancel.join().unwrap();
+        assert!(
+            matches!(
+                (&granted, cancelled),
+                (OutboundAdmissionOutcome::Granted, false)
+                    | (OutboundAdmissionOutcome::Cancelled, true)
+            ),
+            "SQLite serializes grant and cancel to exactly one winner: {granted:?}/{cancelled}",
+        );
+        let mut verify_connection = Connection::open(&path).unwrap();
+        let mut verify = SqliteChannelStore::new(&mut verify_connection, &principal(), 1).unwrap();
+        let state = verify.find_outbound(waiting).unwrap().unwrap().entry.state;
+        assert_eq!(
+            state,
+            if cancelled {
+                OutboundState::Prepared
+            } else {
+                OutboundState::Queued
+            }
+        );
+    }
+
+    #[test]
+    fn dispatch_claims_minimum_queued_sequence_across_consumers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("fifo.sqlite3");
+        let first = "0198ab31-6c44-7e8a-b2bb-000000000407";
+        let second = "0198ab31-6c44-7e8a-b2bb-000000000408";
+        {
+            let mut connection = Connection::open(&path).unwrap();
+            create_channel_store_schema(&mut connection).unwrap();
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+            for id in [first, second] {
+                store
+                    .insert_prepared_or_replay(&valid_outbound_record(
+                        id,
+                        "session-main",
+                        "receiver",
+                        id,
+                    ))
+                    .unwrap();
+                assert_eq!(
+                    store
+                        .admit_to_queue(
+                            id,
+                            "session-main",
+                            1,
+                            admission_deadline(),
+                            admission_limits(4, 4, 10),
+                            &admission_clock(),
+                        )
+                        .unwrap(),
+                    OutboundAdmissionOutcome::Granted
+                );
+            }
+        }
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut handles = Vec::new();
+        for id in [first, second] {
+            let path = path.clone();
+            let start = std::sync::Arc::clone(&start);
+            handles.push(std::thread::spawn(move || {
+                let mut connection = Connection::open(path).unwrap();
+                let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+                start.wait();
+                (
+                    id,
+                    store
+                        .claim_dispatch(id, "2026-08-09T15:00:00.000000Z")
+                        .unwrap(),
+                )
+            }));
+        }
+        start.wait();
+        let mut first_result = None;
+        let mut second_result = None;
+        for handle in handles {
+            let (id, result) = handle.join().unwrap();
+            if id == first {
+                first_result = Some(result);
+            } else {
+                second_result = Some(result);
+            }
+        }
+        assert!(matches!(first_result, Some(DispatchClaim::Won(_))));
+        assert!(matches!(second_result, Some(DispatchClaim::LostRace)));
+
+        let mut connection = Connection::open(&path).unwrap();
+        let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+        let mut first_record = store.find_outbound(first).unwrap().unwrap();
+        first_record.entry.state = OutboundState::Failed;
+        first_record.entry.result_jcs = Some("{}".to_string());
+        for piece in &mut first_record.entry.pieces {
+            piece.outcome = Some(crate::ledger::PieceOutcome::Rejected {
+                code: "TEST_TERMINAL".to_string(),
+            });
+        }
+        store.commit_outbound_terminal(&first_record).unwrap();
+        assert!(matches!(
+            store
+                .claim_dispatch(second, "2026-08-09T15:00:01.000000Z")
+                .unwrap(),
+            DispatchClaim::Won(_)
+        ));
+    }
+
+    #[test]
+    fn oldest_durable_waiting_ticket_blocks_later_eligible_ticket() {
+        let mut connection = connection();
+        let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+        let clock = SharedClock::at("2026-08-09T15:00:00.000000Z");
+        let deadline =
+            crate::clock::timestamp_total_micros("2026-08-09T15:00:10.000000Z");
+        let limits = admission_limits(3, 2, 1);
+        let active = "0198ab31-6c44-7e8a-b2bb-000000000413";
+        let oldest = "0198ab31-6c44-7e8a-b2bb-000000000414";
+        let later = "0198ab31-6c44-7e8a-b2bb-000000000415";
+        for (id, session) in [
+            (active, "session-a"),
+            (oldest, "session-a"),
+            (later, "session-b"),
+        ] {
+            store
+                .insert_prepared_or_replay(&valid_outbound_record(
+                    id, session, "receiver", id,
+                ))
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .admit_to_queue(active, "session-a", 1, deadline, limits, &clock)
+                .unwrap(),
+            OutboundAdmissionOutcome::Granted
+        );
+        assert!(matches!(
+            store
+                .admit_to_queue(oldest, "session-a", 1, deadline, limits, &clock)
+                .unwrap(),
+            OutboundAdmissionOutcome::Waiting { .. }
+        ));
+        assert!(matches!(
+            store
+                .admit_to_queue(later, "session-b", 1, deadline, limits, &clock)
+                .unwrap(),
+            OutboundAdmissionOutcome::Waiting { .. }
+        ));
+        assert!(store.cancel_admission(oldest, &clock).unwrap());
+        assert_eq!(
+            store
+                .admit_to_queue(later, "session-b", 1, deadline, limits, &clock)
+                .unwrap(),
+            OutboundAdmissionOutcome::Granted
+        );
+        assert_eq!(
+            store.find_outbound(oldest).unwrap().unwrap().entry.state,
+            OutboundState::Prepared,
+        );
+    }
 }

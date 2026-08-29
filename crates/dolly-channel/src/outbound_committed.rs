@@ -1,19 +1,15 @@
 //! Manifest-selected committed targeted-Action boundary (seam D).
 //!
-//! Authority is EXACTLY a targeted `org.dolly.channel.send` Action inside an
-//! immutable committed Block that was delivered through a configured Page and
-//! selected into the configured Module's persisted
-//! `ActivationManifest.input_items` (spec: ActivationManifest and
-//! Page-Delivery-Subscription). The Action identity binds `action_id`,
-//! `activation_id`, `manifest_digest`, the input occurrence (the input
-//! item's index in Manifest Delivery order), `block_id`, and the action's
-//! index within the Block's `body.actions`.
+//! Authority is exactly a targeted `org.dolly.channel.send` Action inside an
+//! immutable committed Block selected by the one current
+//! `ActivationManifest` for the configured module. The identity binds the
+//! normative persisted manifest digest, the exact Delivery occurrence
+//! (`page_id`, `page_seq`, `commit_seq`, and occurrence index), the Block, and
+//! the Action's index within `body.actions`.
 //!
-//! Only `CoreSnapshot.activations[*].manifest` may mint this identity;
-//! `CoreSnapshot.blocks`, `IngressCommitted` journal membership, `ingress`,
-//! `runtime_events`, or graph-descriptor membership alone NEVER mint send
-//! authority. [`CommittedSendAction`] is private-construction-only: no caller
-//! can feed a Block or Action into the pipeline.
+//! Only that current manifest may mint this identity. `CoreSnapshot.blocks`,
+//! `IngressCommitted` journal membership, `ingress`, `runtime_events`, or
+//! graph-descriptor membership alone never mint send authority.
 
 use crate::config::ChannelConfig;
 use crate::error::{ChannelError, ChannelOutcome, codes};
@@ -22,48 +18,39 @@ use crate::outbound::{SendAction, authorize_send, parse_send_action_at};
 use crate::principal::ChannelPrincipal;
 use serde_json::Value;
 
-/// One targeted `org.dolly.channel.send` Action selected from the configured
-/// Module's persisted ActivationManifest. Private construction only: produced
-/// solely by [`CommittedSendAction::from_manifest_input`] from an immutable
-/// committed Block frozen in `manifest.input_items`; every field is derived,
-/// no caller-shaped Action/Block/transport authority reaches it.
+/// One targeted `org.dolly.channel.send` Action selected from the current
+/// module `ActivationManifest`. Construction is crate-private and every field
+/// is derived from the frozen manifest bytes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommittedSendAction {
-    /// The parsed, name- and shape-verified send Action.
     pub(crate) action: SendAction,
-    /// The committed Block identity this Action was selected from.
     pub(crate) block_id: String,
-    /// The activation whose persisted manifest selected the input.
     pub(crate) activation_id: String,
-    /// Deterministic digest of the frozen manifest bytes (tamper-evident).
+    /// Persisted `manifest_digest`, verified by hashing the manifest with that
+    /// field removed.
     pub(crate) manifest_digest: String,
-    /// The input item's index in Manifest Delivery order.
-    pub(crate) input_index: usize,
-    /// The send Action's index within `body.actions` of the frozen Block.
+    pub(crate) occurrence_index: usize,
+    pub(crate) page_id: String,
+    pub(crate) page_seq: i64,
+    pub(crate) commit_seq: i64,
     pub(crate) action_index: usize,
-    /// The account-owned session the send is authorized into.
     pub(crate) session_id: String,
-    /// The v1 text pieces (validated here, used by dispatch).
     pub(crate) pieces: Vec<OutboundPiece>,
-    /// Canonical bytes of the frozen `body.actions[action_index]` object.
     pub(crate) action_jcs: String,
-    /// Authority-bound operation digest: full principal fences + targeted
-    /// module + canonical committed Action bytes + exact Manifest coordinates.
-    /// The same `action_id` under a different target/content/config/
-    /// base-identity conflicts before enqueue.
     pub(crate) operation_digest: String,
 }
 
 impl CommittedSendAction {
-    /// Construct one committed targeted send from a frozen ActivationManifest
-    /// input item. `item` is the manifest `input_items[input_index]` element
-    /// (`{block, occurrences, occurrence_count}`, in immutable Manifest
-    /// Delivery order) and `action_index` is the index of the send Action in
-    /// the frozen Block's `body.actions`. This is the ONLY construction path.
+    /// Construct from one exact Delivery occurrence in a frozen manifest
+    /// input item. The manifest digest is the normative persisted digest:
+    /// canonicalize and hash the manifest only after removing its
+    /// `manifest_digest` field.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_manifest_input(
         manifest: &Value,
         item: &Value,
-        input_index: usize,
+        occurrence_index: usize,
+        occurrence: &Value,
         action_index: usize,
         principal: &ChannelPrincipal,
         config: &ChannelConfig,
@@ -82,10 +69,23 @@ impl CommittedSendAction {
             .and_then(Value::as_str)
             .ok_or_else(|| rejected("manifest has no activation_id"))?
             .to_string();
-        let fragment = dolly_canonical_json::canonicalize(manifest)
-            .map_err(|e| rejected(&format!("manifest is not canonical JSON: {e}")))?;
-        let manifest_digest =
-            dolly_canonical_json::Sha256Digest::compute(fragment.0.as_bytes()).to_canonical_string();
+        let manifest_digest = verified_manifest_digest(manifest)?;
+        let page_id = occurrence
+            .get("page_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| rejected("manifest Delivery occurrence has no page_id"))?
+            .to_string();
+        let page_seq = occurrence
+            .get("page_seq")
+            .and_then(Value::as_i64)
+            .filter(|value| *value >= 0)
+            .ok_or_else(|| rejected("manifest Delivery occurrence has invalid page_seq"))?;
+        let commit_seq = occurrence
+            .get("commit_seq")
+            .and_then(Value::as_i64)
+            .filter(|value| *value >= 0)
+            .ok_or_else(|| rejected("manifest Delivery occurrence has invalid commit_seq"))?;
         let block = item
             .get("block")
             .ok_or_else(|| rejected("manifest input item has no frozen block"))?;
@@ -94,11 +94,7 @@ impl CommittedSendAction {
             .and_then(Value::as_str)
             .ok_or_else(|| rejected("frozen block has no id"))?
             .to_string();
-        // The action at the manifest-selected index of the frozen Block's
-        // `body.actions` (Action array order is part of the identity).
         let action = parse_send_action_at(block, action_index)?;
-        // Name/target/contract/schema/session validation (authority checks
-        // shared with the dispatch layer; no caller input reaches them).
         let authorized = authorize_send(config, ledger, &action)?;
         let action_obj = block
             .get("body")
@@ -115,6 +111,48 @@ impl CommittedSendAction {
                     "frozen block has no action at the manifest-selected index",
                 )
             })?;
+        let binding = action_obj
+            .get("contract_binding")
+            .ok_or_else(|| rejected("frozen action has no contract_binding"))?;
+        let manifest_descriptor_revision = manifest
+            .get("descriptor_revision")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| rejected("manifest has no descriptor_revision"))?;
+        let action_contract = binding
+            .get("action_contract")
+            .ok_or_else(|| rejected("frozen Action binding has no action_contract"))?;
+        let contract_digest = dolly_canonical_json::canonicalize(action_contract)
+            .map_err(|_| rejected("frozen Action contract is not canonical JSON"))?
+            .1
+            .to_canonical_string();
+        if binding.get("module_id").and_then(Value::as_str) != Some(config.module_id.as_str())
+            || binding.get("descriptor_revision").and_then(Value::as_i64)
+                != Some(manifest_descriptor_revision)
+            || binding
+                .get("action_contract_digest")
+                .and_then(Value::as_str)
+                != Some(contract_digest.as_str())
+            || action_contract.get("name").and_then(Value::as_str)
+                != Some(crate::config::SEND_ACTION_NAME)
+            || action_contract
+                .get("arguments_schema")
+                .and_then(|schema| schema.get("uri"))
+                .and_then(Value::as_str)
+                != Some("https://dolly.example/spec/0.1/schemas/channel-send.schema.json")
+            || action_contract
+                .get("result_schema")
+                .and_then(|schema| schema.get("uri"))
+                .and_then(Value::as_str)
+                != Some("https://dolly.example/spec/0.1/schemas/channel-send-result.schema.json")
+            || action_contract
+                .get("side_effect_class")
+                .and_then(Value::as_str)
+                != Some("idempotent_write")
+        {
+            return Err(rejected(
+                "frozen Action contract binding does not match the manifest-selected module descriptor",
+            ));
+        }
         let action_jcs = String::from_utf8(
             dolly_canonical_json::canonicalize(&action_obj)
                 .map_err(|_| rejected("frozen action is not canonical JSON"))?
@@ -136,33 +174,26 @@ impl CommittedSendAction {
             &action_jcs,
             &action.target_module_id,
         );
-        // Bind the exact Manifest coordinates into the operation identity so
-        // a same action_id under a different Activation/Manifest/occurrence
-        // conflicts before enqueue.
-        let mut identity = serde_json::Map::new();
-        identity.insert(
-            "schema".into(),
-            serde_json::json!("dolly.channel-outbound/manifest-selected/v1"),
+        let operation_digest = manifest_operation_digest(
+            &base_digest,
+            &activation_id,
+            &manifest_digest,
+            occurrence_index,
+            &page_id,
+            page_seq,
+            commit_seq,
+            action_index,
+            &block_id,
         );
-        identity.insert("base".into(), serde_json::json!(base_digest));
-        identity.insert("activation_id".into(), serde_json::json!(activation_id));
-        identity.insert("manifest_digest".into(), serde_json::json!(manifest_digest));
-        identity.insert("input_index".into(), serde_json::json!(input_index));
-        identity.insert("action_index".into(), serde_json::json!(action_index));
-        identity.insert("block_id".into(), serde_json::json!(block_id));
-        let operation_digest = dolly_canonical_json::Sha256Digest::compute(
-            dolly_canonical_json::canonicalize(&serde_json::Value::Object(identity))
-                .expect("identity is canonical JSON")
-                .0
-                .as_bytes(),
-        )
-        .to_canonical_string();
-        Ok(CommittedSendAction {
+        Ok(Self {
             action,
             block_id,
             activation_id,
             manifest_digest,
-            input_index,
+            occurrence_index,
+            page_id,
+            page_seq,
+            commit_seq,
             action_index,
             session_id: authorized.session_id,
             pieces: authorized.pieces,
@@ -170,4 +201,67 @@ impl CommittedSendAction {
             operation_digest,
         })
     }
+}
+
+/// Verify and return the normative digest carried by a manifest. The digest
+/// field is excluded from its own digest input.
+pub(crate) fn verified_manifest_digest(manifest: &Value) -> Result<String, ChannelError> {
+    let rejected = |message: &str| {
+        ChannelError::new(
+            codes::AUTHORIZATION_FAILED,
+            false,
+            ChannelOutcome::NotApplied,
+            message,
+        )
+    };
+    let persisted = manifest
+        .get("manifest_digest")
+        .and_then(Value::as_str)
+        .ok_or_else(|| rejected("manifest has no persisted manifest_digest"))?;
+    let mut digestable = manifest.clone();
+    digestable
+        .as_object_mut()
+        .ok_or_else(|| rejected("manifest is not an object"))?
+        .remove("manifest_digest");
+    let computed = dolly_canonical_json::canonicalize(&digestable)
+        .map_err(|error| rejected(&format!("manifest is not canonical JSON: {error}")))?
+        .1
+        .to_canonical_string();
+    if computed != persisted {
+        return Err(rejected(
+            "manifest_digest does not match the frozen manifest bytes",
+        ));
+    }
+    Ok(persisted.to_string())
+}
+
+/// Digest the exact Manifest-selected action coordinates.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn manifest_operation_digest(
+    base_digest: &str,
+    activation_id: &str,
+    manifest_digest: &str,
+    occurrence_index: usize,
+    page_id: &str,
+    page_seq: i64,
+    commit_seq: i64,
+    action_index: usize,
+    block_id: &str,
+) -> String {
+    let identity = serde_json::json!({
+        "schema": "dolly.channel-outbound/manifest-selected/v1",
+        "base": base_digest,
+        "activation_id": activation_id,
+        "manifest_digest": manifest_digest,
+        "occurrence_index": occurrence_index,
+        "page_id": page_id,
+        "page_seq": page_seq,
+        "commit_seq": commit_seq,
+        "action_index": action_index,
+        "block_id": block_id,
+    });
+    dolly_canonical_json::canonicalize(&identity)
+        .expect("manifest action identity is canonical JSON")
+        .1
+        .to_canonical_string()
 }

@@ -17,7 +17,7 @@
 //! implement to feed arbitrary Blocks or `SendAction`s into the transport
 //! path.
 
-use dolly_core_reducer::CoreSnapshot;
+use dolly_core_reducer::{ActivationState, CoreSnapshot, InstanceMode};
 use dolly_storage::{HostCapabilityGrant, HostConnectionAuthority, SqliteCoreStore};
 use serde_json::Value;
 
@@ -29,8 +29,16 @@ use crate::outbound::{SendDispatchResult, build_prepared_entry, transport_and_se
 use crate::outbound_committed::CommittedSendAction;
 use crate::outbound_queue::OutboundQueueGate;
 use crate::principal::ChannelPrincipal;
-use crate::store::{DispatchClaim, DurableOutboundRecord, OutboundPreparedOutcome, SqliteChannelStore};
-
+use crate::store::{
+    DispatchClaim, DurableOutboundRecord, OutboundPreparedOutcome, SqliteChannelStore,
+};
+/// The one currently executing activation and its frozen manifest.
+struct AuthoritativeManifest {
+    activation_id: String,
+    digest: String,
+    manifest: Value,
+    configured_pages: std::collections::BTreeSet<String>,
+}
 
 /// The closed outcome of processing one committed Action.
 #[derive(Debug, Clone, PartialEq)]
@@ -67,9 +75,8 @@ pub struct OutboundConsumer<'store, 'core, 'principal> {
     /// waiter gate AND the configured per-session rate limiters, so
     /// constructors never create independent gates/buckets.
     gate: std::sync::Arc<OutboundQueueGate>,
-    /// Test-support: barrier hook called at every effect boundary
-    /// ("after_queue_wait", "before_transport", "before_commit") so fence
-    /// changes can be raced deterministically without sleeps.
+    /// Test-support barrier invoked immediately before each post-blocking
+    /// authority check.
     #[cfg(feature = "test-support")]
     effect_hook: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
     authority: &'principal HostConnectionAuthority,
@@ -77,52 +84,21 @@ pub struct OutboundConsumer<'store, 'core, 'principal> {
     principal: ChannelPrincipal,
 }
 
-    /// Admission result of one Action.
-    enum AdmitResult {
-        /// The Action was durably admitted (row `Queued`) and awaits the
-        /// dispatch CAS in FIFO order.
-        Admitted(CommittedSendAction),
-        /// No transport is needed/possible for this Action on this pass;
-        /// its terminal/refused outcome is final for the pass.
-        Outcome(ConsumerOutcome),
-    }
+/// Admission result of one Action.
+enum AdmitResult {
+    /// The Action was durably admitted (row `Queued`) and awaits the
+    /// dispatch CAS in FIFO order.
+    Admitted(CommittedSendAction),
+    /// No transport is needed/possible for this Action on this pass;
+    /// its terminal/refused outcome is final for the pass.
+    Outcome(ConsumerOutcome),
+}
 
 impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
-    /// Bind the consumer to the opaque current Host authority and capability
-    /// grant, open the module-scoped store under the same principal, open the
-    /// authoritative Runtime Core snapshot reader, and build the bounded
-    /// queue from the configured outbound limits. Every durable effect
-    /// re-verifies the full principal against the store.
-    /// Test/dev convenience: builds ONE injected gate for the consumer's
-    /// account+config, then delegates to [`Self::new`]. Production callers
-    /// MUST inject their own identity-enforced gate (the consumer never
-    /// constructs a gate or limiter in the production path).
-    #[cfg(feature = "test-support")]
-    pub fn new_dev(
-        config: ChannelConfig,
-        clock: Box<dyn Clock>,
-        module_connection: &'store mut rusqlite::Connection,
-        runtime_connection: &'core mut rusqlite::Connection,
-        transport: Box<dyn crate::transport::ChannelTransport>,
-        authority: &'principal HostConnectionAuthority,
-        grant: &'principal HostCapabilityGrant,
-    ) -> Result<Self, ChannelError> {
-        let principal = ChannelPrincipal::from_authority_grant(authority, grant)?;
-        let gate = std::sync::Arc::new(OutboundQueueGate::new(
-            principal.account(),
-            config.outbound_limits,
-        ));
-        Self::new(
-            config,
-            clock,
-            module_connection,
-            runtime_connection,
-            gate,
-            transport,
-            authority,
-            grant,
-        )
-    }
+    /// Open the module store and accept only a gate created by
+    /// [`OutboundQueueGate::register`] for the exact same store owner,
+    /// account, config revision, and limits. No consumer constructor creates
+    /// admission or rate state.
 
     pub fn new(
         config: ChannelConfig,
@@ -151,20 +127,15 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 "channel config Module does not match the granted Module",
             ));
         }
-        // Identity-enforced gate: the injected gate must belong to the SAME
-        // store/account this consumer is bound to. The gate is integrator-
-        // owned (ONE per store/account); the consumer never constructs one.
-        if gate.account() != principal.account() {
-            return Err(ChannelError::new(
-                codes::AUTHENTICATION_FAILED,
-                false,
-                ChannelOutcome::NotApplied,
-                "injected outbound gate belongs to a different account",
-            ));
-        }
         let mut config = config;
         config.transport_account = principal.account().to_string();
         let store = SqliteChannelStore::new(module_connection, &principal, config.revision)?;
+        gate.verify_identity(
+            &store,
+            principal.account(),
+            config.revision,
+            config.outbound_limits,
+        )?;
         let core = SqliteCoreStore::new(runtime_connection).map_err(|error| {
             ChannelError::new(
                 codes::INTERNAL,
@@ -204,6 +175,7 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
         clock: Box<dyn Clock>,
         store: SqliteChannelStore<'store>,
         runtime_connection: &'core mut rusqlite::Connection,
+        gate: std::sync::Arc<OutboundQueueGate>,
         transport: Box<dyn crate::transport::ChannelTransport>,
         authority: &'principal HostConnectionAuthority,
         grant: &'principal HostCapabilityGrant,
@@ -228,6 +200,12 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
         let mut config = config;
         config.transport_account = principal.account().to_string();
         store.verify_owner_against(&principal, config.revision)?;
+        gate.verify_identity(
+            &store,
+            principal.account(),
+            config.revision,
+            config.outbound_limits,
+        )?;
         let core = SqliteCoreStore::new(runtime_connection).map_err(|error| {
             ChannelError::new(
                 codes::INTERNAL,
@@ -244,10 +222,6 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 "the outbound transport must be idempotency-keyed (durable idempotency keys are required before any transport effect)",
             ));
         }
-        let gate = std::sync::Arc::new(OutboundQueueGate::new(
-            principal.account(),
-            config.outbound_limits,
-        ));
         Ok(Self {
             config,
             clock,
@@ -263,10 +237,17 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
         })
     }
 
-    /// The single shared gate+limiter seam for worker sharing (SAME account
-    /// enforced by identity).
+    /// Shared notification gate for additional consumers of this exact store
+    /// identity.
     pub fn gate(&self) -> std::sync::Arc<OutboundQueueGate> {
         std::sync::Arc::clone(&self.gate)
+    }
+
+    /// Durably cancel an admission that is still Waiting. A concurrent grant
+    /// serializes on the same SQLite lock, so cancellation never rolls back a
+    /// Queued row.
+    pub fn cancel_pending(&mut self, action_key: &str) -> Result<bool, ChannelError> {
+        self.gate.cancel(&mut self.store, action_key, &*self.clock)
     }
 
     /// Test-support: install a barrier hook invoked at each effect boundary.
@@ -356,6 +337,330 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
             )),
         }
     }
+    /// Load the one activation that is currently authorized to execute this
+    /// module. Persisted historical activations are ignored: the selected
+    /// manifest must match the current grant, live dispatched activation,
+    /// live lease, current graph descriptor, and the frozen Channel config.
+    fn authoritative_manifest(&mut self) -> Result<Option<AuthoritativeManifest>, ChannelError> {
+        self.revalidate_current_grant()?;
+        let snapshot = self.core.snapshot().map_err(|error| {
+            ChannelError::new(
+                codes::INTERNAL,
+                false,
+                ChannelOutcome::NotApplied,
+                format!("authoritative core snapshot unavailable: {error}"),
+            )
+        })?;
+        let rejected = |message: &str| {
+            ChannelError::new(
+                codes::AUTHENTICATION_FAILED,
+                false,
+                ChannelOutcome::NotApplied,
+                message,
+            )
+        };
+        if snapshot.mode != InstanceMode::Running {
+            return Err(rejected(
+                "Core is not running; no activation may produce a Channel effect",
+            ));
+        }
+        if snapshot.graph.get("revision").and_then(Value::as_i64)
+            != Some(self.grant.graph_revision())
+            || snapshot.graph.get("digest").and_then(Value::as_str)
+                != Some(self.grant.graph_digest())
+        {
+            return Err(rejected(
+                "the current graph does not match the capability grant",
+            ));
+        }
+        let descriptor = snapshot
+            .graph
+            .get("graph")
+            .and_then(|graph| graph.get("descriptors"))
+            .and_then(Value::as_object)
+            .and_then(|descriptors| descriptors.get(&self.config.module_id))
+            .ok_or_else(|| {
+                rejected("the current graph has no descriptor for the Channel module")
+            })?;
+        if descriptor
+            .get("descriptor_revision")
+            .and_then(Value::as_i64)
+            != Some(self.grant.descriptor_revision())
+            || descriptor
+                .get("source_descriptor_digest")
+                .and_then(Value::as_str)
+                != Some(self.grant.descriptor_digest())
+        {
+            return Err(rejected(
+                "the current module descriptor does not match the capability grant",
+            ));
+        }
+        let frozen_config =
+            serde_json::to_value(&self.config).expect("validated Channel config serializes");
+        let frozen_config_digest = dolly_canonical_json::canonicalize(&frozen_config)
+            .map_err(|_| rejected("the Channel config is not canonical JSON"))?
+            .1
+            .to_canonical_string();
+        let mut selected = Vec::new();
+        for (activation_id, activation) in &snapshot.activations {
+            let Some(manifest) = activation.manifest.as_ref() else {
+                continue;
+            };
+            if manifest.get("module_id").and_then(Value::as_str)
+                != Some(self.config.module_id.as_str())
+                || manifest.get("manifest_digest").and_then(Value::as_str)
+                    != Some(self.grant.manifest_digest())
+            {
+                continue;
+            }
+            let digest = crate::outbound_committed::verified_manifest_digest(manifest)
+                .map_err(|_| rejected("the current manifest digest is invalid"))?;
+            if manifest.get("activation_id").and_then(Value::as_str) != Some(activation_id.as_str())
+                || manifest.get("reason").and_then(Value::as_str) != Some("input")
+                || manifest.get("graph_revision").and_then(Value::as_i64)
+                    != Some(self.grant.graph_revision())
+                || manifest.get("config_revision").and_then(Value::as_i64)
+                    != Some(self.config.revision)
+                || manifest.get("config_revision").and_then(Value::as_i64)
+                    != Some(self.grant.manifest_revision())
+                || manifest.get("descriptor_revision").and_then(Value::as_i64)
+                    != Some(self.grant.descriptor_revision())
+                || manifest.get("effective_config") != Some(&frozen_config)
+                || manifest
+                    .get("effective_config_digest")
+                    .and_then(Value::as_str)
+                    != Some(frozen_config_digest.as_str())
+                || activation.state != ActivationState::Dispatched
+                || activation.extension_generation != Some(self.grant.extension_generation())
+            {
+                return Err(rejected(
+                    "the grant-selected manifest is not the current dispatched activation/config",
+                ));
+            }
+            let live_lease_count = snapshot
+                .leases
+                .values()
+                .filter(|lease| {
+                    lease.get("activation_id").and_then(Value::as_str)
+                        == Some(activation_id.as_str())
+                        && lease.get("manifest_digest").and_then(Value::as_str)
+                            == Some(digest.as_str())
+                        && lease.get("extension_generation").and_then(Value::as_i64)
+                            == Some(self.grant.extension_generation())
+                        && lease.get("extension_connection_id").and_then(Value::as_str)
+                            == Some(self.grant.extension_connection_id())
+                        && lease.get("worker_epoch").and_then(Value::as_i64)
+                            == Some(self.grant.worker_epoch_fence())
+                        && lease.get("state").and_then(Value::as_str) == Some("leased")
+                        && matches!(
+                            lease.get("dispatch_state").and_then(Value::as_str),
+                            Some("started" | "transport_started")
+                        )
+                })
+                .count();
+            if live_lease_count != 1 {
+                return Err(rejected(
+                    "the grant-selected manifest does not have exactly one current live lease",
+                ));
+            }
+            selected.push((activation_id.clone(), digest, manifest.clone()));
+        }
+        if selected.len() > 1 {
+            return Err(rejected(
+                "the current grant selects more than one authoritative Channel activation",
+            ));
+        }
+        let Some((activation_id, digest, manifest)) = selected.pop() else {
+            return Ok(None);
+        };
+        Ok(Some(AuthoritativeManifest {
+            activation_id,
+            digest,
+            configured_pages: configured_input_pages(&snapshot, &self.config.module_id),
+            manifest,
+        }))
+    }
+
+    fn revalidate_committed_action(
+        &mut self,
+        committed: &CommittedSendAction,
+    ) -> Result<(), ChannelError> {
+        let current = self.authoritative_manifest()?.ok_or_else(|| {
+            ChannelError::new(
+                codes::AUTHENTICATION_FAILED,
+                false,
+                ChannelOutcome::NotApplied,
+                "the manifest that authorized this send is no longer current",
+            )
+        })?;
+        if current.activation_id != committed.activation_id
+            || current.digest != committed.manifest_digest
+        {
+            return Err(ChannelError::new(
+                codes::AUTHENTICATION_FAILED,
+                false,
+                ChannelOutcome::NotApplied,
+                "the manifest that authorized this send is no longer current",
+            ));
+        }
+        Ok(())
+    }
+
+    fn revalidate_durable_record(
+        &mut self,
+        record: &DurableOutboundRecord,
+    ) -> Result<(), ChannelError> {
+        let current = self.authoritative_manifest()?.ok_or_else(|| {
+            ChannelError::new(
+                codes::AUTHENTICATION_FAILED,
+                false,
+                ChannelOutcome::NotApplied,
+                "the manifest that authorized this durable send is no longer current",
+            )
+        })?;
+        if current.activation_id != record.activation_id
+            || current.digest != record.manifest_digest
+            || record.config_revision != self.config.revision
+        {
+            return Err(ChannelError::new(
+                codes::AUTHENTICATION_FAILED,
+                false,
+                ChannelOutcome::NotApplied,
+                "the manifest that authorized this durable send is no longer current",
+            ));
+        }
+        Ok(())
+    }
+    /// Validate a status response completely before changing the projected
+    /// entry. Confirmed identifiers and Partial ordinals must form exact,
+    /// non-empty, duplicate-free sets.
+    fn settle_status(
+        &mut self,
+        record: &DurableOutboundRecord,
+        status: crate::transport::TransportStatusResult,
+    ) -> Result<Option<OutboundEntry>, ChannelError> {
+        let action_id = &record.outbound_key;
+        let invalid = |message: &str| {
+            ChannelError::new(
+                codes::MALFORMED_EVENT,
+                false,
+                ChannelOutcome::NotApplied,
+                format!("invalid transport status for {action_id}: {message}"),
+            )
+        };
+        let expected: std::collections::BTreeSet<u32> =
+            (0..record.entry.pieces.len() as u32).collect();
+        let actual: std::collections::BTreeSet<u32> = record
+            .entry
+            .pieces
+            .iter()
+            .map(|piece| piece.ordinal)
+            .collect();
+        if actual != expected || actual.len() != record.entry.pieces.len() {
+            return Err(invalid(
+                "durable piece ordinals are not exact and contiguous",
+            ));
+        }
+        let mut entry = record.entry.clone();
+        match status {
+            crate::transport::TransportStatusResult::Confirmed { message_ids } => {
+                if message_ids.len() != expected.len() || message_ids.iter().any(String::is_empty) {
+                    return Err(invalid(
+                        "Confirmed IDs are missing, empty, gapped, or out of range",
+                    ));
+                }
+                let unique: std::collections::BTreeSet<&str> =
+                    message_ids.iter().map(String::as_str).collect();
+                if unique.len() != message_ids.len() {
+                    return Err(invalid("Confirmed IDs contain duplicates"));
+                }
+                for piece in &mut entry.pieces {
+                    let id = message_ids[piece.ordinal as usize].clone();
+                    piece.transport_message_id = Some(id.clone());
+                    piece.outcome = Some(crate::ledger::PieceOutcome::Confirmed {
+                        transport_message_id: id,
+                    });
+                }
+            }
+            crate::transport::TransportStatusResult::Partial { pieces } => {
+                if pieces.len() != expected.len() {
+                    return Err(invalid(
+                        "Partial outcomes are missing, gapped, or out of range",
+                    ));
+                }
+                let observed: std::collections::BTreeSet<u32> =
+                    pieces.iter().map(|piece| piece.ordinal()).collect();
+                if observed != expected || observed.len() != pieces.len() {
+                    return Err(invalid(
+                        "Partial ordinals are duplicate, gapped, or out of range",
+                    ));
+                }
+                let confirmed_ids: Vec<&str> = pieces
+                    .iter()
+                    .filter_map(|piece| match piece {
+                        crate::transport::TransportPieceOutcome::Confirmed {
+                            message_id, ..
+                        } => Some(message_id.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if confirmed_ids.iter().any(|id| id.is_empty())
+                    || confirmed_ids
+                        .iter()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        != confirmed_ids.len()
+                {
+                    return Err(invalid("Partial confirmed IDs are empty or duplicate"));
+                }
+                for observation in pieces {
+                    let ordinal = observation.ordinal();
+                    let piece = &mut entry.pieces[ordinal as usize];
+                    match observation {
+                        crate::transport::TransportPieceOutcome::Confirmed {
+                            message_id, ..
+                        } => {
+                            piece.transport_message_id = Some(message_id.clone());
+                            piece.outcome = Some(crate::ledger::PieceOutcome::Confirmed {
+                                transport_message_id: message_id,
+                            });
+                        }
+                        crate::transport::TransportPieceOutcome::Rejected { code, .. } => {
+                            piece.outcome = Some(crate::ledger::PieceOutcome::Rejected { code });
+                        }
+                        crate::transport::TransportPieceOutcome::Unknown { .. } => {
+                            piece.outcome = Some(crate::ledger::PieceOutcome::Unknown);
+                        }
+                    }
+                }
+            }
+            crate::transport::TransportStatusResult::Rejected { code } => {
+                for piece in &mut entry.pieces {
+                    if piece.outcome.is_none() {
+                        piece.outcome =
+                            Some(crate::ledger::PieceOutcome::Rejected { code: code.clone() });
+                    }
+                }
+            }
+            crate::transport::TransportStatusResult::Unknown => return Ok(None),
+        }
+        let mut ledger = self.store.project_ledger()?;
+        if let Some(existing) = ledger.outbound.get_mut(action_id) {
+            *existing = entry;
+        }
+        let result = crate::outbound::settle_from_outbound_entry(
+            &self.config,
+            &mut ledger,
+            action_id,
+            self.clock.now().as_str(),
+        );
+        Ok(match result {
+            crate::outbound::SendDispatchResult::Terminal { .. } => {
+                ledger.outbound_entry(action_id).cloned()
+            }
+            _ => None,
+        })
+    }
 
     pub fn consume(&mut self, caller_deadline: &str) -> Result<Vec<ConsumerOutcome>, ChannelError> {
         // Fresh authority: re-derive the sealed principal and consult the
@@ -395,98 +700,70 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
         Ok(outcomes)
     }
 
-
-    /// Select the committed, targeted `org.dolly.channel.send` Actions from
-    /// the authoritative immutable Core journal/operation snapshot, bound to
-    /// the exact sealed principal. Only Blocks whose commit is recorded in
-    /// the journal and whose body carries a channel send Action targeting the
-    /// configured module are returned; everything else is skipped (never
-    /// caller-shaped, never a generic Block scan).
-    /// Select the committed, targeted `org.dolly.channel.send` Actions from
-    /// the configured Module's persisted ActivationManifest (Commit 1):
-    /// iterate `CoreSnapshot.activations[*].manifest` input_items in Manifest
-    /// Delivery order, then each Action in `body.actions` order, and construct
-    /// [`CommittedSendAction`] only from a frozen committed Block delivered
-    /// through a configured input Page. `CoreSnapshot.blocks`, journal,
-    /// ingress, runtime_events, and graph-descriptor membership alone never
-    /// mint send authority.
-    fn committed_targeted_actions(
-        &mut self,
-    ) -> Result<Vec<CommittedSendAction>, ChannelError> {
-        let snapshot = self.core.snapshot().map_err(|error| {
-            ChannelError::new(
-                codes::INTERNAL,
-                false,
-                ChannelOutcome::NotApplied,
-                format!("authoritative core snapshot unavailable: {error}"),
-            )
-        })?;
+    /// Select targeted sends only from the one current manifest. Input items
+    /// retain manifest order; each Action retains `body.actions` order. The
+    /// first configured Delivery occurrence supplies the exact durable
+    /// occurrence coordinates. No generic Core Block or event collection is
+    /// consulted.
+    fn committed_targeted_actions(&mut self) -> Result<Vec<CommittedSendAction>, ChannelError> {
+        let Some(authority) = self.authoritative_manifest()? else {
+            return Ok(Vec::new());
+        };
         let ledger = self.store.project_ledger()?;
-        // Configured input Pages for this module (frozen graph bytes are
-        // interpretation authority; they never mint identity by themselves).
-        let configured_pages = configured_input_pages(&snapshot, &self.config.module_id);
+        let input_items = authority
+            .manifest
+            .get("input_items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                ChannelError::new(
+                    codes::AUTHORIZATION_FAILED,
+                    false,
+                    ChannelOutcome::NotApplied,
+                    "the current manifest has no input_items array",
+                )
+            })?;
         let mut actions = Vec::new();
-        for activation in snapshot.activations.values() {
-            let Some(manifest) = &activation.manifest else { continue };
-            if manifest.get("module_id").and_then(Value::as_str) != Some(self.config.module_id.as_str()) {
-                continue;
-            }
-            if manifest.get("reason").and_then(Value::as_str) != Some("input") {
-                continue;
-            }
-            let Some(input_items) = manifest.get("input_items").and_then(Value::as_array) else {
+        for item in input_items {
+            let Some((occurrence_index, occurrence)) = item
+                .get("occurrences")
+                .and_then(Value::as_array)
+                .and_then(|occurrences| {
+                    occurrences.iter().enumerate().find(|(_, occurrence)| {
+                        occurrence
+                            .get("page_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|page| authority.configured_pages.contains(page))
+                    })
+                })
+            else {
                 continue;
             };
-            for (input_index, item) in input_items.iter().enumerate() {
-                // The frozen Block must have been delivered through a
-                // configured input Page (an occurrence on a configured Page).
-                let delivered_on_configured_page = item
-                    .get("occurrences")
-                    .and_then(Value::as_array)
-                    .map(|occurrences| {
-                        occurrences.iter().any(|occ| {
-                            occ.get("page_id")
-                                .and_then(Value::as_str)
-                                .map(|page| configured_pages.contains(page))
-                                .unwrap_or(false)
-                        })
-                    })
-                    .unwrap_or(false);
-                if !delivered_on_configured_page {
+            let Some(actions_in_block) = item
+                .get("block")
+                .and_then(|block| block.get("body"))
+                .and_then(Value::as_object)
+                .and_then(|body| body.get("actions"))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for (action_index, action) in actions_in_block.iter().enumerate() {
+                if action.get("name").and_then(Value::as_str)
+                    != Some(crate::config::SEND_ACTION_NAME)
+                {
                     continue;
                 }
-                let Some(actions_in_block) = item
-                    .get("block")
-                    .and_then(|b| b.get("body"))
-                    .and_then(Value::as_object)
-                    .and_then(|body| body.get("actions"))
-                    .and_then(Value::as_array)
-                else {
-                    continue;
-                };
-                for (action_index, action) in actions_in_block.iter().enumerate() {
-                    if action.get("name").and_then(Value::as_str)
-                        != Some(crate::config::SEND_ACTION_NAME)
-                    {
-                        continue;
-                    }
-                    match CommittedSendAction::from_manifest_input(
-                        manifest,
-                        item,
-                        input_index,
-                        action_index,
-                        &self.principal,
-                        &self.config,
-                        &ledger,
-                    ) {
-                        Ok(action) => actions.push(action),
-                        Err(_) => {
-                            // An input carrying a channel send name but failing
-                            // the sealed authority/contract/session validation
-                            // is skipped (zero effect), never enqueued or
-                            // transported.
-                        }
-                    }
+                if let Ok(action) = CommittedSendAction::from_manifest_input(
+                    &authority.manifest,
+                    item,
+                    occurrence_index,
+                    occurrence,
+                    action_index,
+                    &self.principal,
+                    &self.config,
+                    &ledger,
+                ) {
+                    actions.push(action);
                 }
             }
         }
@@ -503,165 +780,31 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
     /// the row `Dispatched` for the next reconcile (never age-promoted).
     /// Returns the number of durable rows still unresolved.
     pub fn reconcile(&mut self) -> Result<usize, ChannelError> {
-        // Fresh authority BEFORE any recovery/effect.
-        self.revalidate_current_grant()?;
         let pending = self.store.list_pending_outbound()?;
         let mut remaining = 0;
         for record in pending {
-            let action_id = record.outbound_key.clone();
-            if record.entry.state == OutboundState::Dispatched {
-                // Status-first: query the exact transport-side outcome.
-                let status = self.transport.status(
-                    &crate::transport::TransportStatusRequest {
-                        action_id: action_id.clone(),
-                        idempotency_key: record.entry.idempotency_key.clone(),
-                    },
-                );
-                let settled = match status {
-                    crate::transport::TransportStatusResult::Confirmed { message_ids } => {
-                        // Reject BEFORE frozen-envelope settlement: the status
-                        // must carry EXACTLY one real, non-empty, unique
-                        // transport id per piece (missing, empty, duplicate,
-                        // gapped, or out-of-range IDs are NEVER fabricated).
-                        let len_ok = message_ids.len() == record.entry.pieces.len();
-                        let no_dup = (1..message_ids.len())
-                            .all(|i| !message_ids[..i].contains(&message_ids[i]));
-                        let all_ids = len_ok
-                            && no_dup
-                            && record.entry.pieces.iter().all(|p| {
-                                message_ids
-                                    .get(p.ordinal as usize)
-                                    .map(|id| !id.is_empty())
-                                    .unwrap_or(false)
-                            });
-                        if !all_ids {
-                            None
-                        } else {
-                        let mut entry = record.entry.clone();
-                        for piece in entry.pieces.iter_mut() {
-                            let id = message_ids[piece.ordinal as usize].clone();
-                            piece.transport_message_id = Some(id.clone());
-                            piece.outcome = Some(crate::ledger::PieceOutcome::Confirmed {
-                                transport_message_id: id,
-                            });
-                        }
-                        // Settle via the shared logic so the frozen result
-                        // and echo markers are built identically to the
-                        // dispatch path.
-                        let mut ledger = self.store.project_ledger()?;
-                        if let Some(e) = ledger.outbound.get_mut(&action_id) {
-                            *e = entry;
-                        }
-                        let result = crate::outbound::settle_from_outbound_entry(
-                            &self.config, &mut ledger, &action_id,
-                            self.clock.now().as_str(),
-                        );
-                        match result {
-                            crate::outbound::SendDispatchResult::Terminal { .. } => {
-                                ledger.outbound_entry(&action_id).cloned()
-                            }
-                            _ => None,
-                        }
-                        }
-                    }
-                    crate::transport::TransportStatusResult::Partial { pieces } => {
-                        if pieces.len() != record.entry.pieces.len() {
-                            // Gapped/out-of-range per-piece outcomes: reject
-                            // the whole settle before envelope settlement.
-                            None
-                        } else {
-                        let mut entry = record.entry.clone();
-                        let mut reject_partial = false;
-                        let mut confirmed_ids: Vec<String> = Vec::new();
-                        for obs in pieces {
-                            if let Some(piece) = entry.pieces.iter_mut().find(|p| p.ordinal == obs.ordinal()) {
-                                match obs {
-                                    crate::transport::TransportPieceOutcome::Confirmed { message_id, .. } => {
-                                        if message_id.is_empty() || confirmed_ids.contains(&message_id) {
-                                            // Malformed/duplicate id: reject the
-                                            // whole settle (never fabricate).
-                                            reject_partial = true;
-                                            continue;
-                                        }
-                                        confirmed_ids.push(message_id.clone());
-                                        piece.transport_message_id = Some(message_id.clone());
-                                        piece.outcome = Some(crate::ledger::PieceOutcome::Confirmed {
-                                            transport_message_id: message_id,
-                                        });
-                                    }
-                                    crate::transport::TransportPieceOutcome::Rejected { code, .. } => {
-                                        piece.outcome = Some(crate::ledger::PieceOutcome::Rejected { code });
-                                    }
-                                    crate::transport::TransportPieceOutcome::Unknown { .. } => {
-                                        piece.outcome = Some(crate::ledger::PieceOutcome::Unknown);
-                                    }
-                                }
-                            }
-                        }
-                        // Settle via the shared settle logic (partial/failed/unknown).
-                        let mut ledger = self.store.project_ledger()?;
-                        if let Some(e) = ledger.outbound.get_mut(&action_id) {
-                            *e = entry;
-                        }
-                        if reject_partial {
-                            None
-                        } else {
-                        let result = crate::outbound::settle_from_outbound_entry(
-                            &self.config, &mut ledger, &action_id,
-                            self.clock.now().as_str(),
-                        );
-                        match result {
-                            crate::outbound::SendDispatchResult::Terminal { .. } => {
-                                ledger.outbound_entry(&action_id).cloned()
-                            }
-                            _ => None,
-                        }
-                        }
-                        }
-                    }
-                    crate::transport::TransportStatusResult::Rejected { code } => {
-                        // Settle through the shared frozen envelope builder:
-                        // a terminal failure must carry the exact result_jcs,
-                        // never a fabricated terminal row without one.
-                        let mut entry = record.entry.clone();
-                        for piece in entry.pieces.iter_mut() {
-                            if piece.outcome.is_none() {
-                                piece.outcome = Some(crate::ledger::PieceOutcome::Rejected { code: code.clone() });
-                            }
-                        }
-                        let mut ledger = self.store.project_ledger()?;
-                        if let Some(e) = ledger.outbound.get_mut(&action_id) {
-                            *e = entry;
-                        }
-                        let result = crate::outbound::settle_from_outbound_entry(
-                            &self.config, &mut ledger, &action_id,
-                            self.clock.now().as_str(),
-                        );
-                        match result {
-                            crate::outbound::SendDispatchResult::Terminal { .. } => {
-                                ledger.outbound_entry(&action_id).cloned()
-                            }
-                            _ => None,
-                        }
-                    }
-                    crate::transport::TransportStatusResult::Unknown => {
-                        // The transport does not know; the row stays
-                        // Dispatched. Never age-guess, never resend.
-                        None
-                    }
-                };
-                if let Some(entry) = settled {
-                    // Fresh authority immediately before the recovery effect.
-                    self.revalidate_current_grant()?;
-                    let terminal_record = self.build_terminal_record_from_entry(&record, &entry);
-                    self.store.commit_outbound_terminal(&terminal_record)?;
-                } else {
-                    remaining += 1;
-                }
-            } else {
-                // Prepared/Queued rows: owned by consume (never dispatched).
+            if record.entry.state != OutboundState::Dispatched {
                 remaining += 1;
+                continue;
             }
+            let request = crate::transport::TransportStatusRequest {
+                action_id: record.outbound_key.clone(),
+                idempotency_key: record.entry.idempotency_key.clone(),
+            };
+            self.effect_ts("before_status");
+            self.revalidate_durable_record(&record)?;
+            let status = self.transport.status(&request);
+            self.effect_ts("after_status");
+            self.revalidate_durable_record(&record)?;
+            let Some(entry) = self.settle_status(&record, status)? else {
+                remaining += 1;
+                continue;
+            };
+            let terminal_record = self.build_terminal_record_from_entry(&record, &entry);
+            self.effect_ts("before_terminal_commit");
+            self.revalidate_durable_record(&record)?;
+            self.store.commit_outbound_terminal(&terminal_record)?;
+            self.gate.wake_all();
         }
         Ok(remaining)
     }
@@ -679,10 +822,7 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
     }
 
     /// Build the durable `Prepared` record for one verified committed Action.
-    fn build_prepared_record(
-        &self,
-        committed: &CommittedSendAction,
-    ) -> DurableOutboundRecord {
+    fn build_prepared_record(&self, committed: &CommittedSendAction) -> DurableOutboundRecord {
         let entry = build_prepared_entry(
             &self.config,
             &*self.clock,
@@ -699,7 +839,10 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
             action_jcs: committed.action_jcs.clone(),
             activation_id: committed.activation_id.clone(),
             manifest_digest: committed.manifest_digest.clone(),
-            input_index: committed.input_index,
+            occurrence_index: committed.occurrence_index,
+            page_id: committed.page_id.clone(),
+            page_seq: committed.page_seq,
+            commit_seq: committed.commit_seq,
             action_index: committed.action_index,
             block_id: committed.block_id.clone(),
             target_module_id: committed.action.target_module_id.clone(),
@@ -763,8 +906,8 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
             }
             Err(error) => return Err(error),
         }
-        // 1b. Fresh authority immediately after the durable prepare.
-        self.revalidate_current_grant()?;
+        // Fresh execution authority immediately after the durable prepare.
+        self.revalidate_committed_action(committed)?;
         // 2a. Surviving durable row: only a `Prepared`/`Queued` row may be
         //    dispatched. A `Dispatched`/terminal row is owned by status-first
         //    recovery and must never re-enter the queue or the transport.
@@ -777,15 +920,16 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 action_id: committed.action.action_id.clone(),
             }));
         }
-        // 2b. Configured piece/token rate limiting (one combined limiter in
-        //    the gate). A rate refusal is deterministic + retryable; the row
-        //    stays Prepared (never queued, never leaked) and is re-attempted
-        //    on a later pass.
+        // Ticket, deadline, rate bucket, combined occupancy, and queue grant
+        // are durable and serialized by one SQLite admission transaction.
         if durable.entry.state == OutboundState::Prepared {
-            if let Err(error) = self.gate.admit_rate(
+            if let Err(error) = self.gate.admit(
+                &mut self.store,
                 &committed.session_id,
+                &committed.action.action_id,
                 committed.pieces.len() as u64,
-                crate::clock::timestamp_total_micros(self.clock.now().as_str()),
+                crate::clock::timestamp_total_micros(caller_deadline),
+                &*self.clock,
             ) {
                 return Ok(AdmitResult::Outcome(ConsumerOutcome::Rejected {
                     action_id: committed.action.action_id.clone(),
@@ -793,37 +937,9 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 }));
             }
         }
-        // 2c. Caller-deadline durable admission via the SINGLE gate (combined
-        //    occupancy bound + ticket FIFO + exact deadline). A row already
-        //    Queued (prior pass) skips re-admission and proceeds to the CAS.
-        if durable.entry.state == OutboundState::Prepared {
-            let session_key = format!("{}\u{0}{}", self.principal.account(), committed.session_id);
-            let session = committed.session_id.clone();
-            let action_key = committed.action.action_id.clone();
-            match self.gate.admit(
-                &mut self.store,
-                &session_key,
-                &session,
-                &action_key,
-                crate::clock::timestamp_total_micros(caller_deadline),
-                &*self.clock,
-            ) {
-                Ok(_slot) => {}
-                Err(error) => {
-                    return Ok(AdmitResult::Outcome(ConsumerOutcome::Rejected {
-                        action_id: committed.action.action_id.clone(),
-                        error,
-                    }));
-                }
-            }
-        }
-        // 2d. Fresh authority AFTER the queue wait AND deadline recheck: a
-        //    grant revoked while this admission waited, or a deadline burned
-        //    past the admit attempt, refuses the effect immediately. The row
-        //    (if just admitted) stays durably Queued and is drained by FIFO
-        //    on a later claim; zero transport now.
+        // Fresh execution authority after the queue wait.
         self.effect_ts("after_queue_wait");
-        self.revalidate_current_grant()?;
+        self.revalidate_committed_action(committed)?;
         if crate::clock::timestamp_total_micros(self.clock.now().as_str())
             >= crate::clock::timestamp_total_micros(caller_deadline)
         {
@@ -850,12 +966,16 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
         committed: &CommittedSendAction,
         _durable: &DurableOutboundRecord,
     ) -> Result<ConsumerOutcome, ChannelError> {
-        // Fresh authority IMMEDIATELY before the transport effect.
-        self.revalidate_current_grant()?;
+        self.revalidate_committed_action(committed)?;
         let now = self.clock.now().as_str().to_string();
         let dispatch_claim = self.store.claim_dispatch(&committed.action.action_id, &now);
         match dispatch_claim {
             Ok(DispatchClaim::Won(_won_record)) => {
+                // SQLite lock acquisition and the dispatch compare-and-swap
+                // are blocking. Recheck the same current manifest after the
+                // claim and immediately before the transport send.
+                self.effect_ts("after_dispatch_cas");
+                self.revalidate_committed_action(committed)?;
                 // This caller won the CAS: drive the transport + settle.
                 if ledger.outbound_entry(&committed.action.action_id).is_none() {
                     let entry = build_prepared_entry(
@@ -866,10 +986,8 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                         committed.pieces.clone(),
                         true,
                     );
-                    let _ = ledger.insert_outbound(
-                        entry,
-                        self.config.ledger_bounds.outbound_max_entries,
-                    );
+                    let _ = ledger
+                        .insert_outbound(entry, self.config.ledger_bounds.outbound_max_entries);
                 }
                 let result = transport_and_settle(
                     &self.config,
@@ -886,10 +1004,8 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                             .cloned()
                             .expect("settled outbound row");
                         let record = self.build_terminal_record(committed, &entry);
-                        // Fresh authority immediately before the recovery/
-                        // result effect.
-                        self.effect_ts("before_commit");
-                        self.revalidate_current_grant()?;
+                        self.effect_ts("before_terminal_commit");
+                        self.revalidate_committed_action(committed)?;
                         self.store.commit_outbound_terminal(&record)?;
                         // Terminal release frees durable occupancy; wake every
                         // waiting admission.
@@ -947,11 +1063,11 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
 /// it validates which Page delivered a manifest-selected Block, it never
 /// mints identity). The operable graph wrapper is `{digest, graph, revision}`;
 /// the installed document is under `graph`.
-fn configured_input_pages(snapshot: &CoreSnapshot, module_id: &str) -> std::collections::BTreeSet<String> {
-    let document = snapshot
-        .graph
-        .get("graph")
-        .unwrap_or(&snapshot.graph);
+fn configured_input_pages(
+    snapshot: &CoreSnapshot,
+    module_id: &str,
+) -> std::collections::BTreeSet<String> {
+    let document = snapshot.graph.get("graph").unwrap_or(&snapshot.graph);
     let mut out = std::collections::BTreeSet::new();
     if let Some(map) = document.get("input_pages").and_then(Value::as_object) {
         if let Some(pages) = map.get(module_id).and_then(Value::as_array) {
