@@ -82,7 +82,8 @@ pub fn graph_with_outputs(module_ids: &[&str], receiver_input_pages: &[&str], re
     }
     json!({"receiving_module": "receiver", "input_pages": {"receiver": receiver_input_pages},
         "output_pages": output_pages, "subscriptions": {}, "descriptors": descriptors,
-        "authorized_metadata_namespaces": [], "authorized_action_names": []})
+        "authorized_metadata_namespaces": [],
+        "authorized_action_names": ["org.dolly.channel.send"]})
 }
 
 pub fn configured(store: &mut SqliteCoreStore<'_>, mark: &str, revision: i64) {

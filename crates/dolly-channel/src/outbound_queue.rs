@@ -18,6 +18,7 @@ use std::sync::{Condvar, Mutex};
 
 use crate::clock::{Clock, timestamp_total_micros};
 use crate::error::{ChannelError, ChannelDeliveryOutcome, ChannelOutcome, codes};
+use crate::rate_limit::TokenBucket;
 
 fn lock_guard(inner: &Mutex<QueueInner>) -> std::sync::MutexGuard<'_, QueueInner> {
     inner.lock().unwrap_or_else(|poison| poison.into_inner())
@@ -44,6 +45,7 @@ impl PendingQueueSlot {
     }
 }
 
+#[allow(dead_code)]
 struct Waiter {
     ticket: u64,
     session_key: String,
@@ -343,5 +345,111 @@ mod tests {
             .expect("capacity available grants immediately");
         assert_eq!(slot.action_key(), "action-2");
         assert_eq!(slot.session_key(), "acc\0s1");
+    }
+}
+
+
+/// The single runtime-owned outbound gate+limiter per store/account (C): ONE
+/// default-built instance per account, injected into consumers and enforced by
+/// identity. It owns the waiter gate (bounded exact-deadline admission) AND
+/// the configured per-session token buckets, so constructors never create
+/// independent gates or rate limiters. The durable FIFO/occupancy lives in
+/// the store; this gate applies the caller deadline, FIFO tickets,
+/// cancellation, wake-on-release, and the one combined occupancy bound
+/// (durable queued/in-flight + waiting reservations <= max_pending).
+pub struct OutboundQueueGate {
+    account: String,
+    limits: crate::config::OutboundLimits,
+    gate: BoundedPendingQueue,
+    rate_buckets: Mutex<BTreeMap<String, TokenBucket>>,
+}
+
+impl OutboundQueueGate {
+    /// Build the ONE gate for a store/account. `principal_account` is the
+    /// identity the gate is enforced against.
+    pub fn new(principal_account: &str, limits: crate::config::OutboundLimits) -> Self {
+        Self {
+            account: principal_account.to_string(),
+            limits,
+            gate: BoundedPendingQueue::new(
+                limits.max_pending_per_session,
+                limits.max_pending_total,
+            ),
+            rate_buckets: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// The account this gate belongs to.
+    pub fn account(&self) -> &str {
+        &self.account
+    }
+
+    /// Admit one action into the durable queue: the caller deadline is the
+    /// single admission decision (checked before AND after the durable admit
+    /// attempt), the waiter FIFO is ticket-ordered, and the one combined
+    /// occupancy bound (durable + waiting) is enforced. Returns the granted
+    /// durable marker, or a retryable backpressure/authority error with zero
+    /// durable change.
+    pub fn admit(
+        &self,
+        store: &mut crate::store::SqliteChannelStore<'_>,
+        session_key: &str,
+        session_id: &str,
+        action_key: &str,
+        deadline_micros: i64,
+        clock: &dyn Clock,
+    ) -> Result<PendingQueueSlot, ChannelError> {
+        // The waiting reservations are a snapshot taken BEFORE admission; the
+        // gate holds its waiter ledger lock while calling admit_fn, so the
+        // count can't be re-read inside the closure (non-reentrant mutex).
+        let waiting = self.gate.waiting(session_key);
+        self.gate.admit(
+            || {
+                store.admit_to_queue(
+                    action_key,
+                    session_id,
+                    self.limits.max_pending_per_session,
+                    self.limits.max_pending_total,
+                    waiting,
+                    clock.now().as_str(),
+                )
+            },
+            session_key,
+            action_key,
+            deadline_micros,
+            clock,
+        )
+    }
+
+    /// Configured piece/token per-session rate limiting. Refusal is
+    /// deterministic + retryable and consumes no queue occupancy.
+    pub fn admit_rate(
+        &self,
+        session_id: &str,
+        piece_count: u64,
+        now_micros: i64,
+    ) -> Result<(), ChannelError> {
+        let mut buckets = self.rate_buckets.lock().unwrap_or_else(|p| p.into_inner());
+        let bucket = buckets.entry(session_id.to_string()).or_default();
+        if bucket.try_take(now_micros, self.limits.max_pieces_per_second_per_session, piece_count) {
+            Ok(())
+        } else {
+            Err(ChannelError::new(
+                codes::RATE_LIMITED,
+                true,
+                ChannelOutcome::NotApplied,
+                "per-session piece rate exceeded; retry after the bucket refills",
+            ))
+        }
+    }
+
+    /// Wake every waiting admission after a terminal release frees durable
+    /// occupancy.
+    pub fn wake_all(&self) {
+        self.gate.wake_all();
+    }
+
+    pub fn waiting(&self, session_key: &str) -> usize {
+        self.gate.waiting(session_key)
     }
 }

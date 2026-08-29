@@ -29,7 +29,7 @@ use dolly_channel::transport::{
     ChannelTransport, TransportSendRequest, TransportSendResult, TransportPieceOutcome,
 };
 use dolly_core_reducer::{CoreCommand, EnvironmentInput, IngressCommand, TransitionOutcome};
-use dolly_storage::{SqliteCoreStore, SqliteHostIngressStore};
+use dolly_storage::{SqliteCoreStore, SqliteHostIngressStore, create_host_ingress_schema};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -180,7 +180,7 @@ fn commit_block(
         .transact(
             &CoreCommand::Ingress(IngressCommand {
                 command_id: format!("{mark}-{key}"),
-                runtime_source: "model/web-channel".to_string(),
+                runtime_source: MODULE_ID.to_string(),
                 ingress_key: key.to_string(),
                 operation_digest,
                 block_id: block_id.to_string(),
@@ -603,7 +603,7 @@ fn bounded_queue_waits_then_expires_and_releases_no_slot() {
     // burns past (a background task advances the SHARED clock and wakes the
     // gate), then backpressures with zero transport and no leaked slot.
     let advance_clock = clock.clone();
-    let queue_wake = consumer.queue();
+    let queue_wake = consumer.gate();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(300));
         advance_clock.advance_seconds(4);
@@ -1138,4 +1138,346 @@ fn status_first_settles_rejected_and_unknown_exactly() {
     let e2 = ledger.outbound_entry(a2).expect("durable a2");
     assert_eq!(e2.state, OutboundState::Dispatched, "unknown is never age-guessed");
     assert!(e2.result_jcs.is_none(), "no fabricated terminal result");
+}
+
+/// A: exact transition binding. A committed Block carrying a channel send
+/// body but emitted by a runtime_source that is NOT a current graph module
+/// (arbitrary CoreCommand::Ingress) must never mint downstream send
+/// authority — zero durable rows, zero transport.
+#[test]
+fn generic_ingress_from_non_graph_source_cannot_mint_send_authority() {
+    let mut fixture = setup("consumer-exact-transition");
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000818";
+    // Commit with a NON-graph runtime_source ("model/web-channel" / "attacker").
+    let block = send_block_for(MODULE_ID, action_id, &fixture.session, &["hi"]);
+    let operation_digest = dolly_canonical_json::canonicalize(&block).unwrap().1.to_canonical_string();
+    {
+        let mut store = SqliteCoreStore::new(&mut fixture.harness.connection).unwrap();
+        let transition = store
+            .transact(
+                &CoreCommand::Ingress(IngressCommand {
+                    command_id: "consumer-exact-transition-foreign".to_string(),
+                    runtime_source: "attacker".to_string(),
+                    ingress_key: "foreign-ing".to_string(),
+                    operation_digest,
+                    block_id: format!("{action_id}-block"),
+                    block,
+                    pages: vec!["page-a".to_string()],
+                }),
+                &EnvironmentInput {
+                    now: CHANNEL_NOW.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(transition.outcome, TransitionOutcome::Committed);
+    }
+    let transport = SharedTransport::new(true);
+    transport.push(TransportSendResult::AllConfirmed {
+        message_ids: vec!["m-foreign".to_string()],
+    });
+    let mut module_conn = reopen_module_store(&fixture);
+    let mut consumer = OutboundConsumer::new(
+        channel_config(),
+        Box::new(channel_clock()),
+        &mut module_conn,
+        &mut fixture.harness.connection,
+        Box::new(transport.clone()),
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .expect("consumer");
+    let outcomes = consumer.consume(&far_deadline()).expect("consume");
+    assert_eq!(outcomes.len(), 0, "a foreign-source send Block never becomes an action");
+    assert_eq!(transport.calls().len(), 0, "zero transport effect");
+    assert!(
+        consumer.pending_outbound().unwrap().is_empty(),
+        "zero durable outbound rows"
+    );
+}
+
+/// A: revoke after the queue wait, immediately before the transport effect.
+/// The runtime DB is FILE-backed so a second connection can revoke the grant
+/// while the consumer's admission is blocked at the durable boundary; the
+/// post-wait revalidation must refuse with zero transport for the waiting
+/// action.
+#[test]
+fn revoke_after_queue_wait_refuses_before_transport_effect() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let runtime_path = dir.path().join("runtime.sqlite3");
+    // File-backed harness = common::g4 RuntimeHarness::build over a file.
+    let (mut runtime, authority, grant, _graph_digest) = {
+        let mut connection = Connection::open(&runtime_path).unwrap();
+        let authority = {
+            let mut store = SqliteCoreStore::new(&mut connection).unwrap();
+            configured(&mut store, "consumer-revoke-after-wait", 1);
+            let body = graph(&[MODULE_ID, MODULE_OTHER], &[]);
+            let graph_digest = digest(&body);
+            install_graph(&mut store, "consumer-revoke-after-wait", 1, &body);
+            let authority = store.bootstrap_host_connection().unwrap();
+            install_grant(&mut store, &authority, MODULE_ID, 1, 1, &graph_digest, &["host.ingress.submit"]);
+            install_grant(&mut store, &authority, MODULE_OTHER, 1, 1, &graph_digest, &["host.ingress.submit"]);
+            authority
+        };
+        create_host_ingress_schema(&mut connection).unwrap();
+        let grant = {
+            let store = SqliteCoreStore::new(&mut connection).unwrap();
+            store
+                .current_host_capability_grant(&authority, EXTENSION_ID, MODULE_ID)
+                .unwrap()
+                .unwrap()
+        };
+        (connection, authority, grant, String::new())
+    };
+    let module_path = dir.path().join("channel.sqlite3");
+    {
+        let mut module_conn = Connection::open(&module_path).unwrap();
+        create_channel_store_schema(&mut module_conn).unwrap();
+        let host = SqliteHostIngressStore::new(&mut runtime).unwrap();
+        let mut receiver = InboundReceiver::new(
+            channel_config(),
+            Box::new(channel_clock()),
+            &mut module_conn,
+            host,
+            &authority,
+            &grant,
+        )
+        .expect("receiver");
+        match receiver.ingest_event(&sealed_event(&authority, &grant, "conv-1", "in-rw", "hi")) {
+            IngressOutcome::Committed { .. } => {}
+            other => panic!("premise must commit: {other:?}"),
+        }
+    }
+    let account = dolly_channel::ids::channel_account(
+        authority.extension_connection_id(),
+        grant.extension_id(),
+        grant.module_id(),
+        authority.worker_epoch().as_str(),
+    );
+    let session = dolly_channel::ids::dolly_session_id(&account, "conv-1");
+    let principal = dolly_channel::ChannelPrincipal::from_authority_grant(&authority, &grant).unwrap();
+    let a1 = "0198ab31-6c44-7e8a-b2bb-000000000819";
+    let a2 = "0198ab31-6c44-7e8a-b2bb-000000000820";
+    for (i, (action, msg)) in [(a1, "m-hold"), (a2, "m-wait")].into_iter().enumerate() {
+        let block = send_block_for(MODULE_ID, action, &session, &[msg]);
+        let operation_digest = dolly_canonical_json::canonicalize(&block)
+            .unwrap()
+            .1
+            .to_canonical_string();
+        let mut store = SqliteCoreStore::new(&mut runtime).unwrap();
+        let transition = store
+            .transact(
+                &CoreCommand::Ingress(IngressCommand {
+                    command_id: format!("rw-{i}"),
+                    runtime_source: MODULE_ID.to_string(),
+                    ingress_key: format!("ing-{i}"),
+                    operation_digest,
+                    block_id: format!("{action}-block"),
+                    block,
+                    pages: vec!["page-a".to_string()],
+                }),
+                &EnvironmentInput {
+                    now: CHANNEL_NOW.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(transition.outcome, TransitionOutcome::Committed);
+    }
+    let config = ChannelConfigBuilder::new("web", "account-a", MODULE_ID, 1)
+        .target_pages(&["page-a"])
+        .max_pending_per_session(1)
+        .build();
+    let clock = SharedClock::at(CHANNEL_NOW);
+    let transport = SharedTransport::new(true);
+    transport.push(TransportSendResult::Timeout); // a1 holds the one slot
+    let mut module_conn = Connection::open(&module_path).unwrap();
+    let mut consumer = OutboundConsumer::new(
+        config,
+        Box::new(clock.clone()),
+        &mut module_conn,
+        &mut runtime,
+        Box::new(transport.clone()),
+        &authority,
+        &grant,
+    )
+    .expect("consumer");
+    // While a2 is blocked waiting for durable capacity, a second connection
+    // revokes the grant (the assert happens through the consumer's own post-
+    // wait revalidation), then wakes the gate.
+    let queue_wake = consumer.gate();
+    let advance_clock = clock.clone();
+    let revoke_conn_path = runtime_path.clone();
+    let authority2 = authority.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        {
+            let mut conn = Connection::open(&revoke_conn_path).unwrap();
+            let mut store = SqliteCoreStore::new(&mut conn).unwrap();
+            store
+                .revoke_host_capability_grant(&authority2, dolly_channel::EXTENSION_ID, MODULE_ID)
+                .unwrap();
+        }
+        advance_clock.advance_seconds(6);
+        queue_wake.wake_all();
+    });
+    // The pass must fail closed when a grant is revoked during/after the
+    // queue wait: either the whole consume returns CHANNEL_AUTHENTICATION_FAILED
+    // (the revoke landed before the next revalidation), or the waiting action
+    // is refused at its post-wait revalidation. Either way the waiting action
+    // must never reach the transport after revocation.
+    let results = consumer.consume(&timestamp_plus_seconds(CHANNEL_NOW, 4));
+    match results {
+        Err(error) => {
+            assert_eq!(error.code, codes::AUTHENTICATION_FAILED);
+        }
+        Ok(outcomes) => {
+            let refused = outcomes
+                .iter()
+                .filter(|o| {
+                    matches!(
+                        o,
+                        dolly_channel::ConsumerOutcome::Rejected { error, .. }
+                            if error.code == codes::AUTHENTICATION_FAILED
+                    )
+                })
+                .count();
+            assert!(
+                refused >= 1,
+                "the waiting action must be refused after the grant is revoked"
+            );
+        }
+    }
+    // The waiting action (a2) is never transported after the revocation; the
+    // only permissible transport call is a1 racing ahead of the revoke fire,
+    // and even then it must be bounded to that single action.
+    assert!(
+        transport.calls().len() <= 1,
+        "no transport effect after revocation for the waiting action"
+    );
+    drop(consumer);
+    let _ = (module_path, principal);
+}
+
+/// C: dispatch drains the durable FIFO in queued_seq order — the transport
+/// call order equals the durable queued_seq order of the admitted rows, and
+/// every row got a strict increasing durable sequence, never reordered by the
+/// snapshot iteration.
+#[test]
+fn dispatch_drains_durable_fifo_order() {
+    let mut fixture = setup("consumer-fifo-order");
+    // Block ids chosen so snapshot (BTreeMap, lexicographic) orders a2 first.
+    let a1 = "0198ab31-6c44-7e8a-b2bb-000000000901"; // block id sorts later
+    let a2 = "0198ab31-6c44-7e8a-b2bb-000000000900"; // block id sorts earlier
+    commit_block(
+        &mut fixture.harness.connection,
+        "consumer-fifo-order",
+        "ing-a1",
+        &format!("{a1}-block"),
+        send_block_for(MODULE_ID, a1, &fixture.session, &["first"]),
+        vec!["page-a".to_string()],
+    );
+    commit_block(
+        &mut fixture.harness.connection,
+        "consumer-fifo-order",
+        "ing-a2",
+        &format!("{a2}-block"),
+        send_block_for(MODULE_ID, a2, &fixture.session, &["second"]),
+        vec!["page-a".to_string()],
+    );
+    let transport = SharedTransport::new(true);
+    transport.push(TransportSendResult::AllConfirmed {
+        message_ids: vec!["fifo-1".to_string()],
+    });
+    transport.push(TransportSendResult::AllConfirmed {
+        message_ids: vec!["fifo-2".to_string()],
+    });
+    let mut module_conn = reopen_module_store(&fixture);
+    let mut consumer = OutboundConsumer::new(
+        channel_config(),
+        Box::new(channel_clock()),
+        &mut module_conn,
+        &mut fixture.harness.connection,
+        Box::new(transport.clone()),
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .expect("consumer");
+    let outcomes = consumer.consume(&far_deadline()).expect("consume");
+    assert_eq!(outcomes.len(), 2, "both admitted+dispatched");
+    let calls = transport.calls();
+    assert_eq!(calls.len(), 2, "two transports");
+    // Transport order must equal the durable queued_seq order.
+    assert_eq!(calls[0].action_id, a2, "first durable FIFO row");
+    assert_eq!(calls[1].action_id, a1, "second durable FIFO row");
+    // The durable sequences are strict and increasing in admission order.
+    drop(consumer);
+    let mut reopen_conn = Connection::open(&fixture.module_path).unwrap();
+    let mut reopened = SqliteChannelStore::new(&mut reopen_conn, &fixture.principal, 1).unwrap();
+    let seq1 = reopened.find_outbound(a2).unwrap().unwrap().entry.queued_seq;
+    let seq2 = reopened.find_outbound(a1).unwrap().unwrap().entry.queued_seq;
+    assert!(seq1.unwrap() < seq2.unwrap(), "queued_seq strictly increasing");
+}
+
+/// C/5: a Confirmed/Partial transport status with a MISSING transport id must
+/// be rejected BEFORE frozen-envelope settlement — never fabricate IDs — and
+/// the row stays Dispatched for a later status resolution.
+#[test]
+fn malformed_status_with_missing_id_is_rejected_before_settle() {
+    let mut fixture = setup("consumer-malformed-status");
+    let a1 = "0198ab31-6c44-7e8a-b2bb-000000000902";
+    commit_block(
+        &mut fixture.harness.connection,
+        "consumer-malformed-status",
+        "ing-1",
+        &format!("{a1}-block"),
+        send_block_for(MODULE_ID, a1, &fixture.session, &["hi"]),
+        vec!["page-a".to_string()],
+    );
+    let transport = SharedTransport::new(true);
+    transport.push(TransportSendResult::Timeout); // -> Dispatched
+    let mut module_conn = reopen_module_store(&fixture);
+    {
+        let mut consumer = OutboundConsumer::new(
+            channel_config(),
+            Box::new(channel_clock()),
+            &mut module_conn,
+            &mut fixture.harness.connection,
+            Box::new(transport.clone()),
+            &fixture.harness.authority,
+            &fixture.harness.grant,
+        )
+        .expect("consumer");
+        let outcomes = consumer.consume(&far_deadline()).unwrap();
+        assert!(matches!(
+            &outcomes[0],
+            dolly_channel::ConsumerOutcome::Pending { .. }
+        ));
+        drop(consumer);
+    }
+    // Confirmed status with a MISSING id for the single piece (empty vector):
+    // must NOT fabricate "confirmed-0"; the row must stay Dispatched.
+    transport.push_status(
+        a1,
+        dolly_channel::transport::TransportStatusResult::Confirmed {
+            message_ids: vec![],
+        },
+    );
+    let mut consumer2 = OutboundConsumer::new(
+        channel_config(),
+        Box::new(channel_clock()),
+        &mut module_conn,
+        &mut fixture.harness.connection,
+        Box::new(transport.clone()),
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .expect("consumer");
+    let remaining = consumer2.reconcile().unwrap();
+    assert_eq!(remaining, 1, "malformed status must not settle the row");
+    let ledger = consumer2.ledger().unwrap();
+    let entry = ledger.outbound_entry(a1).unwrap();
+    assert_eq!(entry.state, OutboundState::Dispatched, "no settle on malformed status");
+    assert!(entry.pieces.iter().all(|p| p.transport_message_id.is_none()),
+        "no fabricated transport ids");
 }
