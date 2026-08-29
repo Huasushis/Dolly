@@ -1072,7 +1072,7 @@ impl<'connection> SqliteChannelStore<'connection> {
         if record.entry.state != OutboundState::Prepared {
             return Err(corrupted("insert_prepared_or_replay requires a prepared outbound record"));
         }
-        let mut transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(map_sqlite)?;
+        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(map_sqlite)?;
         let inserted = Self::insert_outbound_row(&transaction, record)?;
         if inserted {
             transaction.commit().map_err(map_sqlite)?;
@@ -1120,6 +1120,7 @@ impl<'connection> SqliteChannelStore<'connection> {
     }
 
     /// The verified durable outbound record for one action key.
+    #[cfg(feature = "test-support")]
     pub fn find_outbound(&mut self, outbound_key: &str) -> Result<Option<DurableOutboundRecord>, ChannelError> {
         self.load_outbound(outbound_key)
     }

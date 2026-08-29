@@ -1,4 +1,5 @@
 //! Exact positive text round-trip evidence and denied-path zero-effect proof.
+#![cfg(feature = "test-support")]
 
 mod common;
 

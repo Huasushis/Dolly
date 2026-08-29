@@ -1,4 +1,5 @@
 //! Outbound effect-ledger RED/GREEN evidence.
+#![cfg(feature = "test-support")]
 
 mod common;
 
