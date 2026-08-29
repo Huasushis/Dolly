@@ -18,6 +18,7 @@
 //! path.
 
 use dolly_core_reducer::CoreSnapshot;
+use std::collections::BTreeMap;
 use dolly_storage::{HostCapabilityGrant, HostConnectionAuthority, SqliteCoreStore};
 use serde_json::Value;
 
@@ -28,6 +29,7 @@ use crate::ledger::{ChannelLedger, OutboundEntry, OutboundState};
 use crate::outbound::{SendDispatchResult, build_prepared_entry, transport_and_settle};
 use crate::outbound_committed::{CommittedSendAction, committed_send_from_block};
 use crate::outbound_queue::BoundedPendingQueue;
+use crate::rate_limit::TokenBucket;
 use crate::principal::ChannelPrincipal;
 use crate::store::{DispatchClaim, DurableOutboundRecord, OutboundPreparedOutcome, SqliteChannelStore};
 
@@ -90,6 +92,9 @@ pub struct OutboundConsumer<'store, 'core, 'principal> {
     core: SqliteCoreStore<'core>,
     transport: Box<dyn crate::transport::ChannelTransport>,
     queue: std::sync::Arc<BoundedPendingQueue>,
+    /// Per-session token buckets (configured piece rate) applied BEFORE the
+    /// dispatch CAS / transport effect.
+    rate_buckets: BTreeMap<String, TokenBucket>,
     authority: &'principal HostConnectionAuthority,
     grant: &'principal HostCapabilityGrant,
     principal: ChannelPrincipal,
@@ -138,6 +143,14 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 format!("core snapshot store unavailable: {error}"),
             )
         })?;
+        if !transport.idempotency_supported() {
+            return Err(ChannelError::new(
+                codes::AUTHENTICATION_FAILED,
+                false,
+                ChannelOutcome::NotApplied,
+                "the outbound transport must be idempotency-keyed (durable idempotency keys are required before any transport effect)",
+            ));
+        }
         let queue = std::sync::Arc::new(BoundedPendingQueue::new());
         Ok(Self {
             config,
@@ -146,6 +159,7 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
             core,
             transport,
             queue,
+            rate_buckets: BTreeMap::new(),
             authority,
             grant,
             principal,
@@ -192,6 +206,14 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 format!("core snapshot store unavailable: {error}"),
             )
         })?;
+        if !transport.idempotency_supported() {
+            return Err(ChannelError::new(
+                codes::AUTHENTICATION_FAILED,
+                false,
+                ChannelOutcome::NotApplied,
+                "the outbound transport must be idempotency-keyed (durable idempotency keys are required before any transport effect)",
+            ));
+        }
         let queue = std::sync::Arc::new(BoundedPendingQueue::new());
         Ok(Self {
             config,
@@ -200,6 +222,7 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
             core,
             transport,
             queue,
+            rate_buckets: BTreeMap::new(),
             authority,
             grant,
             principal,
@@ -434,14 +457,29 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                         }
                     }
                     crate::transport::TransportStatusResult::Rejected { code } => {
+                        // Settle through the shared frozen envelope builder:
+                        // a terminal failure must carry the exact result_jcs,
+                        // never a fabricated terminal row without one.
                         let mut entry = record.entry.clone();
                         for piece in entry.pieces.iter_mut() {
                             if piece.outcome.is_none() {
                                 piece.outcome = Some(crate::ledger::PieceOutcome::Rejected { code: code.clone() });
                             }
                         }
-                        entry.state = OutboundState::Failed;
-                        Some(entry)
+                        let mut ledger = self.store.project_ledger()?;
+                        if let Some(e) = ledger.outbound.get_mut(&action_id) {
+                            *e = entry;
+                        }
+                        let result = crate::outbound::settle_from_outbound_entry(
+                            &self.config, &mut ledger, &action_id,
+                            self.clock.now().as_str(),
+                        );
+                        match result {
+                            crate::outbound::SendDispatchResult::Terminal { .. } => {
+                                ledger.outbound_entry(&action_id).cloned()
+                            }
+                            _ => None,
+                        }
                     }
                     crate::transport::TransportStatusResult::Unknown => {
                         // The transport does not know; the row stays
@@ -479,7 +517,6 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
     fn build_prepared_record(
         &self,
         committed: &CommittedSendAction,
-        idempotency_supported: bool,
     ) -> DurableOutboundRecord {
         let entry = build_prepared_entry(
             &self.config,
@@ -487,7 +524,7 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
             &committed.action,
             &committed.session_id,
             committed.pieces.clone(),
-            idempotency_supported,
+            true,
         );
         DurableOutboundRecord {
             schema: crate::store::OUTBOUND_RECORD_SCHEMA.to_string(),
@@ -517,7 +554,7 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
         committed: &CommittedSendAction,
         entry: &OutboundEntry,
     ) -> DurableOutboundRecord {
-        let mut record = self.build_prepared_record(committed, entry.idempotency_supported);
+        let mut record = self.build_prepared_record(committed);
         record.entry = entry.clone();
         record
     }
@@ -534,9 +571,9 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
         //    inserts; an existing key with the same digest replays (terminal
         //    returns the frozen result with zero re-dispatch, non-terminal is
         //    returned unchanged); a different digest conflicts before enqueue
-        //    and changes nothing.
-        let idempotency_supported = self.transport.idempotency_supported();
-        let prepared = self.build_prepared_record(&committed, idempotency_supported);
+        //    and changes nothing. The durable idempotency key is always
+        //    present (item 3) and the transport is status-capable (item 2).
+        let prepared = self.build_prepared_record(&committed);
         match self.store.insert_prepared_or_replay(&prepared) {
             Ok(OutboundPreparedOutcome::ReplayTerminal { state, result_jcs }) => {
                 return Ok(ConsumerOutcome::Terminal {
@@ -602,6 +639,33 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
         };
         }
 
+        // 2b. Configured piece/token rate limiting BEFORE any transport
+        //    effect. A rate refusal is deterministic and retryable; the row
+        //    stays durably Queued (never leaked) and is claimed on a later
+        //    pass when tokens refill.
+        {
+            let now_micros = crate::clock::timestamp_total_micros(self.clock.now().as_str());
+            let bucket = self
+                .rate_buckets
+                .entry(committed.session_id.clone())
+                .or_default();
+            if !bucket.try_take(
+                now_micros,
+                self.config.outbound_limits.max_pieces_per_second_per_session,
+                committed.pieces.len() as u64,
+            ) {
+                return Ok(ConsumerOutcome::Rejected {
+                    action_id: committed.action.action_id.clone(),
+                    error: crate::error::ChannelError::new(
+                        codes::RATE_LIMITED,
+                        true,
+                        ChannelOutcome::NotApplied,
+                        "per-session piece rate exceeded; retry after the bucket refills",
+                    ),
+                });
+            }
+        }
+
         // 3. Atomic dispatch CAS: exactly one claimant wins the
         //    Prepared/Queued -> Dispatched transition. The CAS winner is the
         //    ONLY one authorized to call the transport; all others
@@ -621,7 +685,7 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                         &committed.action,
                         &committed.session_id,
                         committed.pieces.clone(),
-                        idempotency_supported,
+                        true,
                     );
                     let _ = ledger.insert_outbound(
                         entry,
@@ -634,7 +698,7 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                     &mut *self.transport,
                     &committed.action.action_id,
                     &now,
-                    idempotency_supported,
+                    true,
                 );
                 match result {
                     SendDispatchResult::Terminal { state, result } => {

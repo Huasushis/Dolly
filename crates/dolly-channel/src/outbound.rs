@@ -460,14 +460,15 @@ pub(crate) fn build_prepared_entry(
     action: &SendAction,
     session_id: &str,
     pieces: Vec<OutboundPiece>,
-    idempotency_supported: bool,
+    _idempotency_supported: bool,
 ) -> OutboundEntry {
     let now = clock.now().as_str().to_string();
-    let idempotency_key = if idempotency_supported {
-        Some(ids::outbound_idempotency_key(&action.action_id))
-    } else {
-        None
-    };
+    // A durable idempotency key is ALWAYS derived and persisted with the
+    // Prepared row (item 3): the production path requires idempotency-keyed,
+    // status-capable transports, and the raw conformance surface keeps the
+    // key for the same invariant.
+    let idempotency_supported = true;
+    let idempotency_key = Some(ids::outbound_idempotency_key(&action.action_id));
     OutboundEntry {
         action_id: action.action_id.clone(),
         session_id: session_id.to_string(),
