@@ -267,31 +267,144 @@ impl<'connection, 'principal, S: CommittedActionSource>
 
     /// Status-first restart/lost-response recovery of the durable outbound
     /// ledger: never re-dispatches a row that may have reached the
-    /// transport, never reports false success. Stale Dispatched rows are
-    /// reconciled to the frozen `unknown`/`partial` result (atomically with
-    /// their echo markers) and their queue slots released. Returns the number
-    /// of durable rows still unresolved.
+    /// transport, never reports false success, never age-guesses to
+    /// `unknown`. Every `Dispatched` row is settled by calling
+    /// [`ChannelTransport::status`] with the original idempotency key: the
+    /// exact transport-side outcome (confirmed/partial/rejected/unknown)
+    /// settles the terminal state. `TransportStatusResult::Unknown` leaves
+    /// the row `Dispatched` for the next reconcile (never age-promoted).
+    /// Returns the number of durable rows still unresolved.
     pub fn reconcile(&mut self) -> Result<usize, ChannelError> {
-        let mut ledger = self.store.project_ledger()?;
-        let recovered = recover_outbound(&self.config, &*self.clock, &mut ledger);
-        for action_id in recovered {
-            let settled = ledger
-                .outbound_entry(&action_id)
-                .filter(|e| e.state.is_terminal())
-                .cloned();
-            if let Some(entry) = settled {
-                let mut record = self
-                    .store
-                    .find_outbound(&action_id)?
-                    .expect("recovered durable row");
-                record.entry = entry;
-                self.store.commit_outbound_terminal(&record)?;
-                self.pending_slots.remove(&action_id);
+        // Revalidate the current sealed authority/grant BEFORE any recovery.
+        let current_principal = ChannelPrincipal::from_authority_grant(self.authority, self.grant)?;
+        if current_principal != self.principal {
+            return Err(ChannelError::new(
+                codes::AUTHENTICATION_FAILED,
+                false,
+                ChannelOutcome::NotApplied,
+                "the current authority/grant fences changed since the outbound consumer opened",
+            ));
+        }
+        let pending = self.store.list_pending_outbound()?;
+        let mut remaining = 0;
+        for record in pending {
+            let action_id = record.outbound_key.clone();
+            if record.entry.state == OutboundState::Dispatched {
+                // Status-first: query the exact transport-side outcome.
+                let status = self.transport.status(
+                    &crate::transport::TransportStatusRequest {
+                        action_id: action_id.clone(),
+                        idempotency_key: record.entry.idempotency_key.clone(),
+                    },
+                );
+                let settled = match status {
+                    crate::transport::TransportStatusResult::Confirmed { message_ids } => {
+                        let mut entry = record.entry.clone();
+                        for piece in entry.pieces.iter_mut() {
+                            let id = message_ids
+                                .get(piece.ordinal as usize)
+                                .cloned()
+                                .unwrap_or_else(|| format!("confirmed-{}", piece.ordinal));
+                            piece.transport_message_id = Some(id.clone());
+                            piece.outcome = Some(crate::ledger::PieceOutcome::Confirmed {
+                                transport_message_id: id,
+                            });
+                        }
+                        // Settle via the shared logic so the frozen result
+                        // and echo markers are built identically to the
+                        // dispatch path.
+                        let mut ledger = self.store.project_ledger()?;
+                        if let Some(e) = ledger.outbound.get_mut(&action_id) {
+                            *e = entry;
+                        }
+                        let result = crate::outbound::settle_from_outbound_entry(
+                            &self.config, &mut ledger, &action_id,
+                            self.clock.now().as_str(),
+                        );
+                        match result {
+                            crate::outbound::SendDispatchResult::Terminal { .. } => {
+                                ledger.outbound_entry(&action_id).cloned()
+                            }
+                            _ => None,
+                        }
+                    }
+                    crate::transport::TransportStatusResult::Partial { pieces } => {
+                        let mut entry = record.entry.clone();
+                        for obs in pieces {
+                            if let Some(piece) = entry.pieces.iter_mut().find(|p| p.ordinal == obs.ordinal()) {
+                                match obs {
+                                    crate::transport::TransportPieceOutcome::Confirmed { message_id, .. } => {
+                                        piece.transport_message_id = Some(message_id.clone());
+                                        piece.outcome = Some(crate::ledger::PieceOutcome::Confirmed {
+                                            transport_message_id: message_id,
+                                        });
+                                    }
+                                    crate::transport::TransportPieceOutcome::Rejected { code, .. } => {
+                                        piece.outcome = Some(crate::ledger::PieceOutcome::Rejected { code });
+                                    }
+                                    crate::transport::TransportPieceOutcome::Unknown { .. } => {
+                                        piece.outcome = Some(crate::ledger::PieceOutcome::Unknown);
+                                    }
+                                }
+                            }
+                        }
+                        // Settle via the shared settle logic (partial/failed/unknown).
+                        let mut ledger = self.store.project_ledger()?;
+                        if let Some(e) = ledger.outbound.get_mut(&action_id) {
+                            *e = entry;
+                        }
+                        let result = crate::outbound::settle_from_outbound_entry(
+                            &self.config, &mut ledger, &action_id,
+                            self.clock.now().as_str(),
+                        );
+                        match result {
+                            crate::outbound::SendDispatchResult::Terminal { .. } => {
+                                ledger.outbound_entry(&action_id).cloned()
+                            }
+                            _ => None,
+                        }
+                    }
+                    crate::transport::TransportStatusResult::Rejected { code } => {
+                        let mut entry = record.entry.clone();
+                        for piece in entry.pieces.iter_mut() {
+                            if piece.outcome.is_none() {
+                                piece.outcome = Some(crate::ledger::PieceOutcome::Rejected { code: code.clone() });
+                            }
+                        }
+                        entry.state = OutboundState::Failed;
+                        Some(entry)
+                    }
+                    crate::transport::TransportStatusResult::Unknown => {
+                        // The transport does not know; the row stays
+                        // Dispatched. Never age-guess, never resend.
+                        None
+                    }
+                };
+                if let Some(entry) = settled {
+                    let terminal_record = self.build_terminal_record_from_entry(&record, &entry);
+                    self.store.commit_outbound_terminal(&terminal_record)?;
+                    self.pending_slots.remove(&action_id);
+                } else {
+                    remaining += 1;
+                }
+            } else {
+                // Prepared/Queued rows: owned by consume (never dispatched).
+                remaining += 1;
             }
         }
-        // Remainder: Prepared rows never dispatched (owned by consume) plus
-        // Dispatched rows still inside the unknown window.
-        Ok(self.store.list_pending_outbound()?.len())
+        Ok(remaining)
+    }
+
+    /// Build a terminal record from a prior durable record and a settled
+    /// entry, preserving the authority and committed Action bytes.
+    fn build_terminal_record_from_entry(
+        &self,
+        prior: &DurableOutboundRecord,
+        entry: &crate::ledger::OutboundEntry,
+    ) -> DurableOutboundRecord {
+        let mut record = prior.clone();
+        record.entry = entry.clone();
+        record
     }
 
     /// Build the durable `Prepared` record for one verified committed Action.

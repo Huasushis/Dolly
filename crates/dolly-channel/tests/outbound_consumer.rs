@@ -46,6 +46,7 @@ struct SharedTransport {
 struct SharedInner {
     script: Vec<TransportSendResult>,
     calls: Vec<TransportSendRequest>,
+    status_script: Vec<(String, dolly_channel::transport::TransportStatusResult)>,
 }
 
 impl SharedTransport {
@@ -69,6 +70,14 @@ impl SharedTransport {
             .calls
             .clone()
     }
+
+    fn push_status(&self, action_id: &str, result: dolly_channel::transport::TransportStatusResult) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .status_script
+            .push((action_id.to_string(), result));
+    }
 }
 
 impl ChannelTransport for SharedTransport {
@@ -85,6 +94,20 @@ impl ChannelTransport for SharedTransport {
             return TransportSendResult::Timeout;
         }
         inner.script.remove(0)
+    }
+    fn status(&mut self, request: &dolly_channel::transport::TransportStatusRequest) -> dolly_channel::transport::TransportStatusResult {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let pos = inner
+            .status_script
+            .iter()
+            .position(|(id, _)| id == &request.action_id);
+        match pos {
+            Some(idx) => inner.status_script.remove(idx).1,
+            None => dolly_channel::transport::TransportStatusResult::Unknown,
+        }
     }
 }
 
@@ -687,7 +710,7 @@ fn crash_after_prepared_before_dispatch_redispatch_and_never_duplicates() {
 }
 
 #[test]
-fn crash_after_dispatch_marker_never_blind_resends_and_reconciles_to_unknown() {
+fn crash_after_dispatch_marker_never_blind_resends_and_reconciles_status_first() {
     let mut fixture = setup("consumer-crash-dispatched");
     let action_id = "0198ab31-6c44-7e8a-b2bb-000000000810";
     commit_block(
@@ -749,15 +772,22 @@ fn crash_after_dispatch_marker_never_blind_resends_and_reconciles_to_unknown() {
     }
     assert_eq!(transport.calls().len(), 1, "no blind resend of a dispatched send");
 
-    // Phase C: status-first recovery after the unknown window reconciles the
-    // row to a frozen `unknown` (never `failed`, never success).
+    // Phase C: status-first recovery. The transport confirmed the send in
+    // Phase A (AllConfirmed); the terminal commit failed (crash), leaving
+    // the row Dispatched. Reconcile queries transport.status() and the
+    // transport reports Confirmed — the row settles to Confirmed (never
+    // blind-resent, never age-guessed to unknown).
+    transport.push_status(
+        action_id,
+        dolly_channel::transport::TransportStatusResult::Confirmed {
+            message_ids: vec!["m-result-crash".to_string()],
+        },
+    );
     {
-        let mut clock = channel_clock();
-        clock.advance_seconds(channel_config().outbound_limits.unknown_after_seconds as i64 + 1);
         let source = SnapshotCommittedActionSource::new(&mut fixture.harness.connection).unwrap();
         let mut consumer3 = OutboundConsumer::new(
             channel_config(),
-            Box::new(clock),
+            Box::new(channel_clock()),
             &mut module_conn,
             source,
             Box::new(transport.clone()),
@@ -766,15 +796,12 @@ fn crash_after_dispatch_marker_never_blind_resends_and_reconciles_to_unknown() {
         )
         .expect("consumer");
         let remaining = consumer3.reconcile().expect("reconcile");
-        assert_eq!(remaining, 0, "reconcile converged");
+        assert_eq!(remaining, 0, "status-first reconcile converged");
         let ledger = consumer3.ledger().unwrap();
         let entry = ledger.outbound_entry(action_id).expect("durable row");
-        assert_eq!(entry.state, OutboundState::Unknown);
+        assert_eq!(entry.state, OutboundState::Confirmed, "status-first settle to Confirmed");
         let envelope: Value = serde_json::from_str(entry.result_jcs.as_deref().unwrap()).unwrap();
-        assert_eq!(envelope["status"], "unknown");
-        assert_eq!(envelope["error"]["code"], "CHANNEL_TRANSPORT_TIMEOUT");
-        assert_eq!(envelope["error"]["outcome"], "unknown");
-        assert_eq!(envelope["result"], Value::Null);
+        assert_eq!(envelope["status"], "succeeded");
     }
     assert_eq!(transport.calls().len(), 1, "recovery never re-dispatches");
 }
