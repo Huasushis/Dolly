@@ -213,9 +213,13 @@ version = "0.1.0"
 dependencies = [
  "dolly-canonical-json",
  "dolly-core-domain",
+ "dolly-core-reducer",
  "dolly-schema",
+ "dolly-storage",
+ "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 
@@ -321,10 +325,10 @@ dependencies = [
  "dolly-protocol",
  "dolly-schema",
  "dolly-storage",
- "dolly-worker",
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 

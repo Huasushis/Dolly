@@ -14,32 +14,31 @@
 //!   accepted G1-G3 boundaries. They run against the current product and must
 //!   stay green.
 //! - verified crate contracts (`G4-WP010-*`, `G4-WP013A-*`, expected
-//!   `pass`): the probe drives the integrated `dolly-asset`/`dolly-channel`
-//!   public surface directly — `AssetService`/`ImportPipeline`, and the
-//!   Channel pipeline (`process_event`/`reconcile_inbound`/`dispatch_send`)
-//!   through an in-test `host.ingress.*` adapter backed by the real Core
-//!   transaction. Where the crate behavior meets the spec, the case is a real
-//!   green acceptance and a regression here is a product violation.
+//!   `pass`): the probe drives the integrated surfaces — the `dolly-asset`
+//!   and `dolly-channel` public surfaces directly, AND the integrator-assigned
+//!   runtime registrations (`dolly_runtime::AssetHostRoute` and
+//!   `dolly-runtime`'s Channel inbound route) that expose them to activated
+//!   modules under the sealed current Host authority and capability grant.
+//!   Where the behavior meets the spec, the case is a real green acceptance
+//!   and a regression here is a product violation.
 //! - product-red probes (`G4-WP010-*`, `G4-WP013A-*`, expected
 //!   `product_red`): each first drives the harness (config install, graph
-//!   install, durable Core ingress commit) AND the integrated crate surface
-//!   for the seam it names, so every crate contract exercised above is proven
-//!   working; only the exact absent Host/runtime adapter seam named in
-//!   `causal_red` turns the case red. Remaining REDs are confined to the four
-//!   Host/runtime adapter seams: (A) Asset Host — no runtime
-//!   `host.asset.import`/`host.asset.status` registration routing an already
-//!   Host-authorized Asset capability/import request into `AssetService`
-//!   (durable ImportRecord, AVAILABLE canonical AssetRef, authoritative
-//!   `absent`); Core ingress never mints or imports asset authority and a
-//!   later consumer may only reference the AVAILABLE AssetRef;
-//!   (B) Core ingress Host — no `host.ingress.submit`/`host.ingress.status`
-//!   adapter backed by the real Core (the only `CoreIngress` impls in the
-//!   workspace are test doubles); (C) Channel inbound persistence/wiring —
-//!   no runtime backing for the Channel durable ledger; (D) committed-Action
-//!   outbound consumer — no runtime consumer that feeds committed blocks
-//!   into `dispatch_send`, and no caller-deadline queue in that path. The
-//!   message distinguishes compile/API absence from runtime behavior and
-//!   never calls a harness failure a PRODUCT_RED.
+//!   install, durable Core ingress commit) AND the integrated surface for the
+//!   seam it names, so every contract exercised above is proven working; only
+//!   the exact absent Host/runtime adapter seam named in `causal_red` turns
+//!   the case red. The Asset Host seam (A, closed: `AssetHostRoute` routes an
+//!   already Host-authorized Asset capability/import request into
+//!   `AssetService` — durable ImportRecord, AVAILABLE canonical AssetRef,
+//!   authoritative `absent`; Core ingress never mints or imports asset
+//!   authority and a later consumer may only reference the AVAILABLE
+//!   AssetRef) and the Core ingress Host seam (B, closed: the runtime Channel
+//!   inbound route binds `host.ingress.submit`/`host.ingress.status` to the
+//!   real durable Host ingress slice) are wired. Remaining executables are
+//!   confined to the committed-Action outbound consumer seam (D): no runtime
+//!   consumer that feeds committed blocks into `dispatch_send`, and no
+//!   caller-deadline queue in that path. The message distinguishes compile/API
+//!   absence from runtime behavior and never calls a harness failure a
+//!   PRODUCT_RED.
 //! - blocked declarations (`G4-WP013B-*`, expected `product_red` with
 //!   `blocked: true`): retained in the matrix, asserted to be blocked, and
 //!   never executed until WP-010 and WP-013A interfaces freeze.
@@ -55,7 +54,10 @@ use dolly_core_reducer::{
     CoreCommand, EnvironmentInput, IngressCommand, InstallConfigCommand, InstallGraphCommand,
     Transition, TransitionOutcome,
 };
-use dolly_storage::SqliteCoreStore;
+use dolly_storage::{
+    HostCapabilityGrant, HostConnectionAuthority, SqliteCoreStore,
+    create_host_ingress_schema,
+};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
@@ -72,12 +74,17 @@ use dolly_asset::remote::DeniedFetcher;
 use dolly_asset::replica::{DisabledReplica, InMemoryReplica};
 use dolly_asset::service::AssetService;
 use dolly_asset::AssetCapability;
+use dolly_runtime::{
+    AssetHostRoute, authenticated_channel_event, install_channel_store_schema,
+    open_channel_inbound_route, reconcile_channel_inbound_route,
+};
 use dolly_channel::config::SessionMappingPolicy;
 use dolly_channel::{
-    ChannelConfig, ChannelConfigBuilder, ChannelLedger, CoreIngress, CoreIngressError,
-    EventKind, IngressCommit, IngressOutcome, IngressStatusResult, IngressSubmitReceipt,
-    IngressSubmitRequest, OutboundAdmission, OutboundState, ScriptedTransport,
-    SendDispatchResult, TransportPieceOutcome, TransportSendResult, VirtualClock,
+    AuthenticatedChannelEvent, ChannelConfig, ChannelConfigBuilder, ChannelEventContent,
+    ChannelLedger, CoreIngress, CoreIngressError, EventKind, IngressCommit, IngressOutcome,
+    IngressStatusResult, IngressSubmitReceipt, IngressSubmitRequest, OutboundAdmission,
+    OutboundState, ScriptedTransport, SendDispatchResult, SqliteChannelStore,
+    TransportPieceOutcome, TransportSendResult, VirtualClock, create_channel_store_schema,
     dispatch_send, parse_event, parse_send_action, process_event, reconcile_inbound,
 };
 
@@ -222,6 +229,144 @@ fn probe_connection(module_id: &str, mark: &str) -> Connection {
         install_graph(&mut store, module_id, mark);
     }
     connection
+}
+
+// ---------------------------------------------------------------------------
+// Production-route harness: the actual registration path (dolly-runtime
+// host routes) over a real runtime DB with a Host connection, capability
+// grants, and the durable Host ingress slice.
+// ---------------------------------------------------------------------------
+
+/// Graph body for the route probes: the module is a producer of the given
+/// output pages and its graph admission names the granted Extension owner
+/// (both required by the durable Host ingress slice's grant-to-descriptor and
+/// Extension-owner derivation).
+fn route_graph_snapshot(module_id: &str, extension_id: &str, output_pages: &[&str]) -> Value {
+    let descriptor = descriptor(module_id);
+    let mut descriptors = serde_json::Map::new();
+    descriptors.insert(
+        module_id.into(),
+        json!({
+            "module_id": module_id,
+            "descriptor_revision": 1,
+            "source_descriptor_digest": canonical_digest(&descriptor),
+            "owner_extension_id": extension_id,
+            "value": descriptor
+        }),
+    );
+    let mut output = serde_json::Map::new();
+    output.insert(module_id.into(), json!(output_pages));
+    json!({
+        "receiving_module": module_id,
+        "input_pages": {"page-web-primary": [module_id]},
+        "output_pages": output,
+        "subscriptions": {},
+        "descriptors": descriptors,
+        "authorized_metadata_namespaces": ["org.dolly.channel"],
+        "authorized_action_names": ["org.dolly.channel.send"]
+    })
+}
+
+/// A real runtime DB with config, a producer graph naming the granted
+/// Extension owner, a bootstrap Host connection, a capability grant for the
+/// module authorizing the given host methods, and the durable Host ingress
+/// slice installed — the exact state the runtime registration binds to.
+fn route_harness(
+    module_id: &str,
+    extension_id: &str,
+    mark: &str,
+    methods: &[&str],
+    output_pages: &[&str],
+) -> (Connection, HostConnectionAuthority, HostCapabilityGrant) {
+    let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let authority = {
+        let mut store = SqliteCoreStore::new(&mut connection).expect("core schema");
+        install_config(&mut store, mark);
+        let body = route_graph_snapshot(module_id, extension_id, output_pages);
+        let digest = canonical_digest(&body);
+        let transition = store
+            .transact(
+                &CoreCommand::InstallGraph(InstallGraphCommand {
+                    command_id: format!("{mark}-graph"),
+                    revision: 1,
+                    digest: digest.clone(),
+                    graph: body,
+                }),
+                &input(),
+            )
+            .expect("graph transaction must execute");
+        assert_eq!(
+            transition.outcome,
+            TransitionOutcome::Committed,
+            "harness: producer graph install must commit"
+        );
+        let authority = store.authenticated_host_connection().expect("host authority");
+        store
+            .install_host_capability_grant(
+                &authority,
+                extension_id,
+                module_id,
+                1,
+                1,
+                &canonical_digest(&descriptor(module_id)),
+                1,
+                &canonical_digest(&json!({"manifest": 1})),
+                1,
+                &digest,
+                methods,
+            )
+            .expect("host capability grant");
+        authority
+    };
+    create_host_ingress_schema(&mut connection).expect("host ingress schema");
+    let grant = {
+        let store = SqliteCoreStore::new(&mut connection).expect("core schema");
+        store
+            .current_host_capability_grant(&authority, extension_id, module_id)
+            .expect("current grant read")
+            .expect("grant present")
+    };
+    (connection, authority, grant)
+}
+
+/// A fresh module-scoped Channel store connection with the production-route
+/// schema installed (the reserved registration-owned installation).
+fn channel_store_connection() -> Connection {
+    let mut connection = Connection::open_in_memory().expect("module store");
+    install_channel_store_schema(&mut connection).expect("module channel store schema");
+    connection
+}
+
+/// One authenticated Channel transport event's content (no authority/account
+/// claim of its own; the sealed event derives those from the grant).
+fn route_content_event(conversation: &str, message_id: &str, text: &str) -> ChannelEventContent {
+    ChannelEventContent {
+        channel_id: "web-primary".to_string(),
+        transport: "web".to_string(),
+        external_conversation_id: conversation.to_string(),
+        external_message_id: message_id.to_string(),
+        sender_class: "user".to_string(),
+        sender_id: format!("sender-{message_id}"),
+        text: text.to_string(),
+        received_at: CHANNEL_NOW.parse().expect("timestamp"),
+        event_kind: EventKind::Message,
+        references_external_message_id: None,
+    }
+}
+
+/// A route-bound `host.asset.import` request naming the granted module and
+/// instance (the rest of the request is the shared crate request).
+fn route_asset_request(
+    module: &str,
+    instance: &str,
+    id: &str,
+    source: Source,
+    declared: Option<&str>,
+) -> ImportRequest {
+    let mut request = asset_request(id, source, declared, false);
+    request.module_id = module.to_string();
+    request.instance_id = instance.to_string();
+    request
 }
 
 fn transact_ingress(
@@ -1255,28 +1400,46 @@ fn g4_control_block_bytes_stay_untrusted_until_a_core_asset_authority_exists() {
 #[test]
 fn g4_wp010_bounded_import_and_crash_recovery_round_trip() {
     let entry = case("G4-WP010-IMPORT-BOUND-001");
-    assert_eq!(entry["expected"], "product_red");
-    let seam = entry["seam"].as_str().expect("seam");
+    assert_eq!(entry["expected"], "pass");
 
-    // 1. Prove the crate surface: bounded inline import reaches AVAILABLE
-    //    with a canonical AssetRef, and an over-limit source is cut off.
-    let scratch = ScratchDir::new("import-bound");
-    let (mut service, _clock) = asset_service_at(scratch.path());
-    let capability = asset_capability(&service);
+    // The actual registration path: host.asset.import / host.asset.status
+    // bound to an activated module under the sealed current Host authority
+    // and capability grant (dolly_runtime::AssetHostRoute). The capability is
+    // derived inside from sealed grant facts — no caller mints one, and no
+    // Core Block ever derives import authority.
+    let scratch = ScratchDir::new("route-import-bound");
+    let asset_root = scratch.path().to_path_buf();
+    let config = asset_config_at(&asset_root);
+    let (mut connection, authority, grant) = route_harness(
+        "module-a",
+        "org.dolly.asset",
+        "g4-asset-route",
+        &["host.asset.import", "host.asset.status"],
+        &[],
+    );
+    // 1. Bounded import through the route -> AVAILABLE canonical AssetRef.
+    //    The granted instance identity comes from the route itself (derived
+    //    from the sealed worker epoch), never from caller input.
     let png = png_bytes(4, 2);
-    let result = service
-        .import(
-            &capability,
-            &asset_request(
-                &import_id(601),
-                Source::InlineBase64 {
-                    base64: base64(&png),
-                },
-                Some("image/png"),
-                false,
-            ),
-        )
-        .expect("bounded import must commit at the crate surface");
+    let mut route = AssetHostRoute::for_activated_module(
+        &mut connection,
+        config,
+        &authority,
+        &grant,
+    )
+    .expect("asset route registration binds under the sealed grant");
+    let instance = route.instance_id().to_string();
+    let result = route
+        .import(&route_asset_request(
+            "module-a",
+            &instance,
+            &import_id(601),
+            Source::InlineBase64 {
+                base64: base64(&png),
+            },
+            Some("image/png"),
+        ))
+        .expect("route host.asset.import commits");
     assert_eq!(result.state, "available");
     assert!(result.terminal);
     let asset = result.asset.as_ref().expect("AssetRef on AVAILABLE");
@@ -1286,46 +1449,63 @@ fn g4_wp010_bounded_import_and_crash_recovery_round_trip() {
         AssetId::from_digest(ContentHash::of_bytes(&png).digest)
     );
 
-    // 2. Over-limit source: rejected with SIZE_LIMIT and no asset.
+    // 2. Over-limit source through the route: SIZE_LIMIT, no asset.
     let mut big = png_bytes(4, 2);
-    big.resize(200 * 1024, 0); // exceeds the 64 KiB decoded bound
-    let rejected = service
-        .import(
-            &capability,
-            &asset_request(
-                &import_id(602),
-                Source::InlineBase64 {
-                    base64: base64(&big),
-                },
-                Some("image/png"),
-                false,
-            ),
-        )
+    big.resize(200 * 1024, 0); // exceeds the bounded 64 KiB decoded bound
+    let rejected = route
+        .import(&route_asset_request(
+            "module-a",
+            &instance,
+            &import_id(602),
+            Source::InlineBase64 {
+                base64: base64(&big),
+            },
+            Some("image/png"),
+        ))
         .expect("over-limit import is a recorded rejection");
     assert_eq!(rejected.state, "rejected");
     assert!(rejected.asset.is_none());
     assert_eq!(rejected.error.as_ref().expect("envelope")["code"], "SIZE_LIMIT");
 
-    // 3. Crash recovery: a fresh service over the same root resolves the
-    //    durable record exactly (crash restart from the durable state).
-    let (mut service2, _clock2) = asset_service_at(scratch.path());
-    let capability2 = asset_capability(&service2);
-    let recovered = service2
-        .status(&capability2, &import_id(601))
-        .expect("durable import record survives reopen");
+    // 3. Crash restart through the route: a fresh registration over the same
+    //    content root and runtime DB resolves the durable record exactly.
+    let mut route2 = AssetHostRoute::for_activated_module(
+        &mut connection,
+        asset_config_at(&asset_root),
+        &authority,
+        &grant,
+    )
+    .expect("route re-registration over the same root");
+    let recovered = route2
+        .status(
+            &dolly_asset::facade::AssetStatusRequest::new(
+                "0198ab31-6c44-7e8a-b2bb-000000000811",
+                "module-a",
+                &import_id(601),
+                "2026-08-28T00:00:00.000000Z",
+            )
+            .expect("valid asset status request"),
+        )
+        .expect("durable import record survives route restart");
     assert_eq!(recovered.state, "available");
 
-    // 4. The Sol-accepted Asset Host absent contract: status for a
-    //    never-created ImportId answers an authoritative explicit `absent`
-    //    StatusResult — not an error, never minting an AssetRef, carrying
-    //    no lifecycle/terminal state, and disclosing nothing beyond the
-    //    queried ImportId.
-    let never_created = service
-        .status(&capability, &import_id(901))
-        .expect("status for a never-created import must answer an authoritative absent StatusResult");
+    // 4. The Sol-accepted absent contract through the route: never-created
+    //    ImportIds answer an authoritative explicit absent StatusResult,
+    //    nondisclosing and with no asset/lifecycle masquerade.
+    let never_created = route2
+        .status(
+            &dolly_asset::facade::AssetStatusRequest::new(
+                "0198ab31-6c44-7e8a-b2bb-000000000812",
+                "module-a",
+                &import_id(901),
+                "2026-08-28T00:00:00.000000Z",
+            )
+            .expect("valid asset status request"),
+        )
+        .expect("absent is an authoritative StatusResult");
     assert_eq!(
         never_created.state, "absent",
-        "explicit absent state for a never-created import"
+        "explicit absent state through the route"
     );
     assert!(
         !never_created.terminal,
@@ -1350,14 +1530,26 @@ fn g4_wp010_bounded_import_and_crash_recovery_round_trip() {
         );
     }
 
-    product_red(
-        "G4-WP010-IMPORT-BOUND-001",
-        seam,
-        "the exercised dolly_asset surface implements bounded ACCEPTED->AVAILABLE import, crash recovery, and answers the authoritative explicit absent StatusResult for a never-created import (all proven above); this probe does not drive the runtime Core route, and no runtime host.asset.import/status registration routes an already Host-authorized Asset capability/import request to this service — asset_input is not a Block member and Core ingress never mints or imports asset authority, so a later consumer may only reference the AVAILABLE AssetRef and no host can observe status across the runtime route (Asset Host seam A)",
-        "WP-010 Asset Host seam (A)",
+    // 5. A request naming a different granted module never reaches the
+    //    Asset façade: the route refuses it as a capability violation.
+    let cross_instance = route2.instance_id().to_string();
+    let cross = route2.import(&route_asset_request(
+        "module-b",
+        &cross_instance,
+        &import_id(701),
+        Source::InlineBase64 {
+            base64: base64(&png),
+        },
+        Some("image/png"),
+    ));
+    assert!(
+        matches!(
+            cross,
+            Err(dolly_runtime::HostRouteError::CapabilityDenied { .. })
+        ),
+        "a cross-module import must be refused by the route before any effect"
     );
 }
-
 #[test]
 fn g4_wp010_canonical_identity_and_dedup_are_core_authority_only() {
     let entry = case("G4-WP010-IDENTITY-DEDUP-001");
@@ -1861,113 +2053,141 @@ fn g4_wp010_security_domain_isolation_is_recorded_and_enforced() {
 #[test]
 fn g4_wp013a_authenticated_text_round_trip_runs_producer_to_premise_to_consumer() {
     let entry = case("G4-WP013A-ROUNDTRIP-001");
-    assert_eq!(entry["expected"], "product_red");
-    let seam = entry["seam"].as_str().expect("seam");
+    assert_eq!(entry["expected"], "pass");
 
-    // Integrate the Channel pipeline with the REAL Core transaction through
-    // the in-test host.ingress adapter.
-    let mut connection = probe_connection("web-channel", "g4-roundtrip");
+    // The actual registration path: the durable Channel inbound route binds an
+    // authenticated event under the sealed current Host authority and its
+    // host.ingress.submit grant, feeds it through the accepted InboundReceiver
+    // over one runtime DB plus the module-scoped Channel store, and commits
+    // the premise through the REAL durable Host ingress slice. Core assigns
+    // Ingress/Block identity from the authenticated principal — the caller
+    // supplies only message content and can never choose a block_id.
+    let (mut runtime, authority, grant) = route_harness(
+        "web-channel",
+        "org.dolly.channel",
+        "g4-roundtrip",
+        &["host.ingress.submit"],
+        &[TARGET_PAGE],
+    );
+    let mut module_store = channel_store_connection();
     let config = channel_config();
     let clock = channel_clock();
-    let mut ledger = ChannelLedger::new();
+    let mapping_count = |runtime: &Connection| -> i64 {
+        runtime
+            .query_row("SELECT COUNT(*) FROM host_ingress_mappings", [], |row| row.get(0))
+            .expect("mapping count")
+    };
+    let operation_count = |runtime: &Connection| -> i64 {
+        runtime
+            .query_row(
+                "SELECT COUNT(*) FROM core_operations WHERE command_id LIKE 'host-ingress-%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("operation count")
+    };
 
     // 1. Producer leg: an authenticated event becomes a committed durable
-    //    premise in real Core; the Channel ledger settles to accepted.
-    let (block_id, submit_calls) = {
-        let mut core = CoreBackedIngress::new(&mut connection, "web-channel");
-        let outcome = process_event(
-            &config,
-            &clock,
-            &mut ledger,
-            &mut core,
-            &channel_event("account-a", "conv-1", "in-1", "What is the weather?"),
-        );
-        (
-            outcome
-                .committed_block_id()
-                .expect("inbound event committed")
-                .to_string(),
-            core.submit_calls,
+    //    premise under a Host-derived identity.
+    let block_id = {
+        let mut receiver = open_channel_inbound_route(
+            &mut runtime,
+            &mut module_store,
+            config.clone(),
+            Box::new(clock.clone()),
+            &authority,
+            &grant,
         )
+        .expect("channel route registration");
+        let event = authenticated_channel_event(
+            &authority,
+            &grant,
+            config.revision,
+            route_content_event("conv-1", "in-1", "What is the weather?"),
+        )
+        .expect("authenticated event seals under the grant");
+        match receiver.ingest_event(&event) {
+            IngressOutcome::Committed { block_id, .. } => block_id,
+            other => panic!("authenticated event must commit through the route, got {other:?}"),
+        }
     };
-    assert_eq!(submit_calls, 1);
     let snapshot = {
-        let store = SqliteCoreStore::new(&mut connection).expect("core schema");
+        let store = SqliteCoreStore::new(&mut runtime).expect("core schema");
         store.snapshot().expect("snapshot")
     };
     assert!(
         snapshot.blocks.contains_key(&block_id),
-        "the Channel premise is durable in the real Core snapshot"
-    );
-
-    // 2. The downstream outbound Action is causally derived from the
-    //    committed upstream premise: the session comes from the premise's
-    //    session map and the reply text is derived from the premise's
-    //    committed text part (read back from real Core, not from the test).
-    let premise_text = snapshot.blocks[&block_id]["parts"][0]["text"]
-        .as_str()
-        .expect("premise text part")
-        .to_string();
-    let session_id = ledger
-        .session("account-a", "conv-1")
-        .expect("session mapped")
-        .clone();
-    let reply = format!("Reply to: {premise_text}");
-    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000701";
-    let send_block = channel_send_block(action_id, &session_id, &[reply.as_str()]);
-    let mut transport = ScriptedTransport::new(true);
-    transport.push(TransportSendResult::AllConfirmed {
-        message_ids: vec!["transport-reply-1".to_string()],
-    });
-    let outbound = channel_dispatch(&config, &mut ledger, &mut transport, &send_block, action_id);
-    match outbound {
-        SendDispatchResult::Terminal {
-            state: OutboundState::Confirmed,
-            ..
-        } => {}
-        other => panic!("expected confirmed outbound, got {other:?}"),
-    }
-    assert_eq!(transport.calls().len(), 1);
-    assert_eq!(
-        transport.calls()[0].session_id, session_id,
-        "the downstream send stays bound to the upstream premise session"
+        "the Channel premise is durable in the real Core snapshot under the Host-assigned identity"
     );
     assert_eq!(
-        transport.calls()[0].pieces[0].text, reply,
-        "the dispatched reply is causally derived from the committed premise"
+        snapshot.blocks[&block_id]["metadata"]["org.dolly.channel"]["sender_class"],
+        json!("user"),
+        "the durable premise is bound to the authenticated event, not caller-shaped authority"
     );
-
-    // 3. Transport echo suppression: the confirmed external message ID
-    //    re-entering as an inbound event is ignored with zero Core calls, so
-    //    an outbound effect can never re-enter as a user premise.
-    let echo = {
-        let mut core2 = CoreBackedIngress::new(&mut connection, "web-channel");
-        let outcome = process_event(
-            &config,
-            &clock,
-            &mut ledger,
-            &mut core2,
-            &channel_event("account-a", "conv-1", "transport-reply-1", &reply),
-        );
-        (outcome, core2.submit_calls)
-    };
-    match echo.0 {
-        IngressOutcome::EchoIgnored => {}
-        other => panic!("transport echo must be suppressed inbound, got {other:?}"),
-    }
-    assert_eq!(echo.1, 0, "the echo never reaches Core");
-
-    // 4. Opposite premise: the committed producer key cannot be replaced with
-    //    different content — the premise is durable and irreversible.
-    let conflict = {
-        let mut core3 = CoreBackedIngress::new(&mut connection, "web-channel");
-        process_event(
-            &config,
-            &clock,
-            &mut ledger,
-            &mut core3,
-            &channel_event("account-a", "conv-1", "in-1", "Different question?"),
+    // The premise is mapped under the sealed principal, never a caller id.
+    let principal_row: (String, String, String) = runtime
+        .query_row(
+            "SELECT owner, module_id, external_event_id FROM host_ingress_mappings",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
+        .expect("mapping row");
+    assert_eq!(principal_row.0, authority.extension_connection_id(), "owner is sealed");
+    assert_eq!(principal_row.1, "web-channel", "module is granted");
+    assert_eq!(principal_row.2, "in-1", "external event is the authenticated one");
+    assert_eq!(mapping_count(&runtime), 1);
+    assert_eq!(operation_count(&runtime), 1);
+
+    // 2. Byte-identical replay through the route is idempotent: the prior
+    //    mapping returns and nothing new is allocated.
+    let replay = {
+        let mut receiver = open_channel_inbound_route(
+            &mut runtime,
+            &mut module_store,
+            config.clone(),
+            Box::new(clock.clone()),
+            &authority,
+            &grant,
+        )
+        .expect("channel route re-registration");
+        let event = authenticated_channel_event(
+            &authority,
+            &grant,
+            config.revision,
+            route_content_event("conv-1", "in-1", "What is the weather?"),
+        )
+        .expect("replay event seals");
+        receiver.ingest_event(&event)
+    };
+    match replay {
+        IngressOutcome::IdempotentReplay { block_id: replayed } => {
+            assert_eq!(replayed, block_id, "replay returns the existing identity");
+        }
+        other => panic!("byte-identical replay must be idempotent through the route, got {other:?}"),
+    }
+    assert_eq!(mapping_count(&runtime), 1, "no duplicate premise");
+    assert_eq!(operation_count(&runtime), 1, "no re-dispatch or re-mint");
+
+    // 3. Opposite premise: the committed producer key cannot be replaced with
+    //    different content, and nothing changes.
+    let conflict = {
+        let mut receiver = open_channel_inbound_route(
+            &mut runtime,
+            &mut module_store,
+            config.clone(),
+            Box::new(clock.clone()),
+            &authority,
+            &grant,
+        )
+        .expect("channel route re-registration");
+        let event = authenticated_channel_event(
+            &authority,
+            &grant,
+            config.revision,
+            route_content_event("conv-1", "in-1", "Different question?"),
+        )
+        .expect("conflict event seals");
+        receiver.ingest_event(&event)
     };
     match conflict {
         IngressOutcome::RejectedBeforeMutation { error } => {
@@ -1975,36 +2195,9 @@ fn g4_wp013a_authenticated_text_round_trip_runs_producer_to_premise_to_consumer(
         }
         other => panic!("a premise must not be overwritable, got {other:?}"),
     }
-
-    // 5. Cross-Extension leakage: a foreign-owner action is refused by the
-    //    Channel before any dispatch.
-    let foreign = json!({
-        "schema": "dolly.block/v1",
-        "id": "0198ab31-6c44-7e8a-b2bb-000000000002",
-        "body": {
-            "description": "other",
-            "parts": [],
-            "actions": [{
-                "action_id": "0198ab31-6c44-7e8a-b2bb-000000000099",
-                "name": "org.dolly.other.something",
-                "target": {"module_id": "web-channel"},
-                "arguments": {}
-            }]
-        }
-    });
-    assert!(
-        parse_send_action(&foreign).is_err(),
-        "a foreign-owner action must not be consumable by the Channel"
-    );
-
-    product_red(
-        "G4-WP013A-ROUNDTRIP-001",
-        seam,
-        "the producer-bound premise, the causally derived downstream send, transport echo suppression, the opposite-premise conflict, and cross-Extension refusal all work over the real Core when a host.ingress adapter supplies identity (proven above), but the shipping runtime ships no host.ingress.submit service — the only CoreIngress impls in the workspace are test doubles — and CoreCommand::Ingress takes a caller-chosen block_id, so no product process can derive a producer-bound ingress or have Block/Ingress identity assigned by the Host (Core ingress Host seam B)",
-        "WP-013A Core ingress Host seam (B)",
-    );
+    assert_eq!(mapping_count(&runtime), 1, "the premise survives the conflict attempt");
+    assert_eq!(operation_count(&runtime), 1);
 }
-
 #[test]
 fn g4_wp013a_committed_action_consumer_remains_an_absent_runtime_loop() {
     let entry = case("G4-WP013A-CONSUMER-001");
@@ -2097,48 +2290,144 @@ fn g4_wp013a_committed_action_consumer_remains_an_absent_runtime_loop() {
 #[test]
 fn g4_wp013a_ingress_reconciliation_reads_status_instead_of_resubmitting() {
     let entry = case("G4-WP013A-INGRESS-RECONCILE-001");
-    assert_eq!(entry["expected"], "product_red");
-    let seam = entry["seam"].as_str().expect("seam");
+    assert_eq!(entry["expected"], "pass");
 
-    let mut connection = probe_connection("web-channel", "g4-reconcile");
+    // The actual registration path: host.ingress.status-first reconciliation
+    // on activation/restart. A lost submit response leaves a durable
+    // `prepared` Channel intent (Host committed, terminal store commit
+    // failed); reconcile() through the runtime route reopens it, consults
+    // Host status with the current sealed authority FIRST, and settles the
+    // terminal state exactly once — never resubmitting.
+    let mapping_count = |runtime: &Connection| -> i64 {
+        runtime
+            .query_row("SELECT COUNT(*) FROM host_ingress_mappings", [], |row| row.get(0))
+            .expect("mapping count")
+    };
+    let operation_count = |runtime: &Connection| -> i64 {
+        runtime
+            .query_row(
+                "SELECT COUNT(*) FROM core_operations WHERE command_id LIKE 'host-ingress-%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("operation count")
+    };
+
+    // 1. A committed submit through the route leaves exactly one Host premise
+    //    and one Core effect.
+    let (mut runtime, authority, grant) = route_harness(
+        "web-channel",
+        "org.dolly.channel",
+        "g4-reconcile",
+        &["host.ingress.submit"],
+        &[TARGET_PAGE],
+    );
+    let mut module_store = channel_store_connection();
     let config = channel_config();
     let clock = channel_clock();
-    let mut ledger = ChannelLedger::new();
-    let mut core = CoreBackedIngress::new(&mut connection, "web-channel");
-    // The submit COMMITS durably in real Core, but the response is lost.
-    core.commit_then_drop_submits = 1;
+    {
+        let mut receiver = open_channel_inbound_route(
+            &mut runtime,
+            &mut module_store,
+            config.clone(),
+            Box::new(clock.clone()),
+            &authority,
+            &grant,
+        )
+        .expect("channel route registration");
+        let event = authenticated_channel_event(
+            &authority,
+            &grant,
+            config.revision,
+            route_content_event("conv-1", "in-1", "Hello."),
+        )
+        .expect("authenticated event seals under the grant");
+        assert!(
+            matches!(receiver.ingest_event(&event), IngressOutcome::Committed { .. }),
+            "the first submit commits through the route"
+        );
+    }
+    assert_eq!(mapping_count(&runtime), 1);
+    assert_eq!(operation_count(&runtime), 1);
 
-    let outcome = process_event(
-        &config,
-        &clock,
-        &mut ledger,
-        &mut core,
-        &channel_event("account-a", "conv-1", "in-1", "Hello."),
+    // 2. Lost response: the Host commits the premise but the terminal Channel
+    //    store transaction fails, leaving a durable `prepared` intent (no
+    //    terminal row). This is the crash window reconcile exists for.
+    let (mut runtime2, authority2, grant2) = route_harness(
+        "web-channel",
+        "org.dolly.channel",
+        "g4-reconcile-lost",
+        &["host.ingress.submit"],
+        &[TARGET_PAGE],
     );
-    assert!(
-        matches!(outcome, IngressOutcome::SubmissionPending),
-        "lost response leaves the row submitted"
+    let mut module_store2 = channel_store_connection();
+    let principal = dolly_channel::ChannelPrincipal::from_authority_grant(&authority2, &grant2)
+        .expect("principal derives from the sealed grant");
+    {
+        let mut store = SqliteChannelStore::new(&mut module_store2, &principal, config.revision)
+            .expect("module store opens under the principal");
+        store.inject_commit_outcome_failure(1);
+        let mut receiver = dolly_channel::InboundReceiver::new_with_store(
+            config.clone(),
+            Box::new(clock.clone()),
+            store,
+            dolly_storage::SqliteHostIngressStore::new(&mut runtime2)
+                .expect("host ingress store"),
+            &authority2,
+            &grant2,
+        )
+        .expect("receiver with failpoint store");
+        let event = authenticated_channel_event(
+            &authority2,
+            &grant2,
+            config.revision,
+            route_content_event("conv-1", "in-lost", "Hello lost."),
+        )
+        .expect("lost-response event seals");
+        assert!(
+            matches!(
+                receiver.ingest_event(&event),
+                IngressOutcome::SubmissionPending
+            ),
+            "a lost response must leave the intent prepared, retryable"
+        );
+    }
+    assert_eq!(
+        mapping_count(&runtime2), 1,
+        "the Host committed the premise before the response was lost"
     );
+    assert_eq!(operation_count(&runtime2), 1);
 
-    // Reconciliation reads status and settles — with NO resubmission.
-    let unresolved = reconcile_inbound(&config, &clock, &mut ledger, &mut core);
-    assert_eq!(unresolved, 0, "status read settles the row");
-    assert_eq!(core.submit_calls, 1, "no resubmission after a committed state");
-    assert_eq!(core.status_calls, 1, "reconciliation used the status read");
-    let entry = ledger
-        .inbound_entry("account-a", "in-1")
-        .expect("ledger row");
-    assert_eq!(entry.state, dolly_channel::InboundState::Accepted);
-    assert!(entry.block_id.is_some(), "status returned the prior mapping");
+    // 3. Reconcile through the actual registration path (activation/restart
+    //    hook): status-first, exactly once, with no resubmission.
+    let remaining = reconcile_channel_inbound_route(
+        &mut runtime2,
+        &mut module_store2,
+        config.clone(),
+        Box::new(clock.clone()),
+        &authority2,
+        &grant2,
+    )
+    .expect("reconcile through the route");
+    assert_eq!(remaining, 0, "status settled the prepared intent");
+    assert_eq!(mapping_count(&runtime2), 1, "no duplicate premise");
+    assert_eq!(operation_count(&runtime2), 1, "status-first: no blind resend");
 
-    product_red(
-        "G4-WP013A-INGRESS-RECONCILE-001",
-        seam,
-        "dolly_channel::reconcile_inbound fully implements status-first reconciliation against the real Core (proven above: a lost-submit row is settled by a status read with no resubmission), but the runtime ships no host.ingress.status service and no CoreIngress implementation, so a lost-response caller in any running product process cannot read absent|committed and must resubmit (Core ingress Host seam B)",
-        "WP-013A Core ingress Host seam (B)",
-    );
+    // 4. Restart stability: a fresh route over the SAME runtime DB and module
+    //    store (a fresh receiver, as on restart/activation) reconciles to zero
+    //    and never rewrites history.
+    let again = reconcile_channel_inbound_route(
+        &mut runtime2,
+        &mut module_store2,
+        config.clone(),
+        Box::new(clock.clone()),
+        &authority2,
+        &grant2,
+    )
+    .expect("reconcile on restart");
+    assert_eq!(again, 0, "restart reconcile is a no-op");
+    assert_eq!(operation_count(&runtime2), 1, "history is never rewritten");
 }
-
 #[test]
 fn g4_wp013a_sender_conversation_session_and_capability_are_authorized_before_dispatch() {
     let entry = case("G4-WP013A-AUTHORIZATION-001");

@@ -5,6 +5,7 @@
 //! lease, and exposes the canonical dispatch frame only after its started
 //! marker commits. It never invokes Extension code or any external effect.
 
+mod host_routes;
 mod premise;
 mod validation;
 
@@ -20,6 +21,11 @@ use serde_json::{json, Value};
 use thiserror::Error;
 
 pub use dolly_storage::HostConnectionAuthority;
+pub use host_routes::{
+    AssetHostRoute, HostRouteError, authenticated_channel_event,
+    install_channel_store_schema, open_channel_inbound_route,
+    reconcile_channel_inbound_route,
+};
 pub use premise::{
     CursorSpan, ExecutionDigests, ExecutionFence, ExecutionIdentity, ExecutionOrder,
     ExecutionPremise, InputItemOrder, InputOccurrence, LossyGap, ReplayEvidence, ReplayMode,

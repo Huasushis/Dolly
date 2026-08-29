@@ -89,10 +89,12 @@
       "id": "G4-WP010-IMPORT-BOUND-001",
       "name": "bounded_import_and_crash_recovery_require_a_core_owned_import_seam",
       "kind": "asset_import_bound",
-      "expected": "product_red",
-      "seam": "Asset Host seam (A): runtime registration/routing of an already Host-authorized Asset capability/import request into dolly_asset::AssetService over host.asset.import / host.asset.status, producing a durable ImportRecord, an AVAILABLE canonical AssetRef, and a StatusResult answering an authoritative absent for a never-created import; asset_input is not a Block member and Core ingress never mints or imports asset authority, so a later consumer may only reference the AVAILABLE AssetRef",
-      "causal_red": "the exercised dolly_asset surface implements bounded ACCEPTED->AVAILABLE import, crash recovery, and answers the authoritative explicit absent StatusResult for a never-created import (all proven by driving it); this probe does not drive the runtime Core route, and no runtime host.asset.import/status registration routes an already Host-authorized Asset capability/import request to this service, so no later consumer has an AVAILABLE AssetRef to reference through the runtime route and no host can observe status across it; asset_input is not a Block member and Core ingress never mints or imports asset authority",
-      "verify": "drive service import, crash recovery, and a status read of a never-created import (authoritative explicit absent, nondisclosing, no AssetRef) \u2014 all proven above; this probe does not drive the runtime Core route, and the absent runtime host.asset.import/status registration for an already Host-authorized Asset request is the RED (Core ingress never mints or imports asset authority); absent -> PRODUCT_RED"
+      "expected": "pass",
+      "pass_basis": "dolly_runtime::AssetHostRoute binds host.asset.import/host.asset.status to an activated module under the sealed current Host authority + capability grant; a real import reaches a durable AVAILABLE canonical AssetRef, crash restart resolves the record, a never-created ImportId answers the authoritative explicit absent StatusResult (nondisclosing, no AssetRef, no lifecycle masquerade), and a cross-module request is refused before any effect",
+      "references": [
+        "crates/dolly-runtime/src/host_routes.rs::AssetHostRoute",
+        "crates/dolly-runtime/tests/g4_content_channel_conformance.rs::g4_wp010_bounded_import_and_crash_recovery_round_trip"
+      ]
     },
     {
       "id": "G4-WP010-IDENTITY-DEDUP-001",
@@ -158,10 +160,12 @@
       "id": "G4-WP013A-ROUNDTRIP-001",
       "name": "authenticated_text_round_trip_runs_producer_to_durable_premise_to_consumer",
       "kind": "channel_text_round_trip",
-      "expected": "product_red",
-      "seam": "Core ingress Host seam (B): host.ingress.submit assigns Ingress/Block identity from the authenticated principal; Core must not accept a caller-chosen block_id",
-      "causal_red": "the producer-bound premise, the causally derived downstream send, transport echo suppression, the opposite-premise conflict, and cross-Extension refusal all work over the real Core when a host.ingress adapter supplies identity (proven), but the shipping runtime ships no host.ingress.submit service (the only CoreIngress impls in the workspace are test doubles) and CoreCommand::Ingress takes a caller-chosen block_id, so no product process can derive a producer-bound ingress or have Block/Ingress identity assigned by the Host",
-      "verify": "drive the producer-bound premise, echo suppression, conflict, and cross-Extension refusal over real Core, then require the shipping runtime to expose host.ingress.submit that assigns identity; absent -> PRODUCT_RED"
+      "expected": "pass",
+      "pass_basis": "the dolly_runtime channel inbound route (authenticated_channel_event + open_channel_inbound_route over the real durable host.ingress.submit slice, one runtime DB plus the module-scoped Channel store) commits an authenticated event to a durable Core premise under a Host-derived identity the caller never chooses; a byte-identical replay is idempotent and an opposite-premise conflict changes nothing",
+      "references": [
+        "crates/dolly-runtime/src/host_routes.rs::open_channel_inbound_route",
+        "crates/dolly-runtime/tests/g4_content_channel_conformance.rs::g4_wp013a_authenticated_text_round_trip_runs_producer_to_premise_to_consumer"
+      ]
     },
     {
       "id": "G4-WP013A-CONSUMER-001",
@@ -176,10 +180,12 @@
       "id": "G4-WP013A-INGRESS-RECONCILE-001",
       "name": "ingress_reconciliation_reads_status_instead_of_resubmitting",
       "kind": "channel_ingress_reconcile",
-      "expected": "product_red",
-      "seam": "Core ingress Host seam (B): host.ingress.status returns absent|committed for the same authenticated principal and key; only authoritative absent permits a byte-identical replay",
-      "causal_red": "dolly_channel::reconcile_inbound fully implements status-first reconciliation against the real Core (proven: a lost-submit row is settled by a status read with no resubmission), but the runtime ships no host.ingress.status service and no CoreIngress implementation, so a lost-response caller in any running process cannot read absent|committed and must resubmit",
-      "verify": "drive reconcile_inbound over a Core-backed adapter, then require the runtime to expose host.ingress.status for the authenticated principal and key; absent -> PRODUCT_RED"
+      "expected": "pass",
+      "pass_basis": "dolly_runtime::reconcile_channel_inbound_route is status-first through the real registration path: a lost response that left a durable prepared intent is settled via host.ingress.status exactly once with zero resubmission, and a restart reconcile is a no-op that never rewrites history",
+      "references": [
+        "crates/dolly-runtime/src/host_routes.rs::reconcile_channel_inbound_route",
+        "crates/dolly-runtime/tests/g4_content_channel_conformance.rs::g4_wp013a_ingress_reconciliation_reads_status_instead_of_resubmitting"
+      ]
     },
     {
       "id": "G4-WP013A-AUTHORIZATION-001",

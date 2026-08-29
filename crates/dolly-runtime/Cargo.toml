@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+dolly-asset = { path = "../dolly-asset" }
+dolly-channel = { path = "../dolly-channel" }
 dolly-canonical-json = { path = "../dolly-canonical-json" }
 dolly-core-domain = { path = "../dolly-core-domain" }
 dolly-core-reducer = { path = "../dolly-core-reducer" }
@@ -16,9 +18,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 [dev-dependencies]
-dolly-asset = { path = "../dolly-asset" }
-dolly-channel = { path = "../dolly-channel" }
+dolly-channel = { path = "../dolly-channel", features = ["test-support"] }
 dolly-extension-host = { path = "../dolly-extension-host" }
 dolly-protocol = { path = "../dolly-protocol" }
 dolly-extension-sdk = { path = "../dolly-extension-sdk" }
-dolly-worker = { path = "../dolly-worker" }
+tempfile = "3"
