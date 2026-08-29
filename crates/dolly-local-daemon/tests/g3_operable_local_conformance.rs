@@ -81,6 +81,7 @@ fn graph_snapshot(module_id: &str) -> Value {
             "module_id": module_id,
             "descriptor_revision": 1,
             "source_descriptor_digest": canonical_digest(&descriptor),
+            "owner_extension_id": EXTENSION_ID,
             "value": descriptor
         }),
     );
