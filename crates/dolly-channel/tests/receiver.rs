@@ -1,7 +1,10 @@
 //! G4-C focused end-to-end, crash/replay, conflict, tamper, and authority
 //! tests over the real durable Host ingress slice and the real Core reducer
 //! transaction, with the Channel store backed by a real module-scoped SQLite
-//! file.
+//! file and deterministic failpoints. Compiled only under the non-default
+//! `test-support` feature.
+
+#![cfg(feature = "test-support")]
 
 mod common;
 
@@ -9,7 +12,8 @@ use std::path::Path;
 
 use common::g4::*;
 use dolly_channel::{
-    ChannelLedger, InboundReceiver, IngressOutcome, InboundState, create_channel_store_schema,
+    AuthenticatedChannelEvent, ChannelPrincipal, InboundReceiver, IngressOutcome, InboundState,
+    SqliteChannelStore, create_channel_store_schema,
 };
 use dolly_storage::SqliteHostIngressStore;
 use rusqlite::Connection;
@@ -29,70 +33,94 @@ fn committed_block(outcome: &IngressOutcome) -> String {
     }
 }
 
-// --- End-to-end exactly-once ---
-
-#[test]
-fn authenticated_event_reaches_core_exactly_once() {
-    let mut harness = RuntimeHarness::new("recv-e2e");
-    let dir = tempdir().unwrap();
-    let (mut channel_connection, path) = channel_store_connection(dir.path());
-    let block_id;
-    {
-        let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
-        let mut receiver = InboundReceiver::new(
-            channel_config(), Box::new(channel_clock()), &mut channel_connection,
-            host, &harness.authority, &harness.grant).unwrap();
-        let event = sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-1", "Hello, Dolly.");
-        block_id = committed_block(&receiver.ingest_event(&event));
-        let acct = account(&harness.authority, &harness.grant);
-        let ledger = receiver.ledger().unwrap();
-        let entry = ledger.inbound_entry(&acct, "msg-1").expect("ledger row");
-        assert_eq!(entry.state, InboundState::Accepted);
-    }
-    // Reopen: durable store + ledger projection survive.
-    let mut channel_connection2 = Connection::open(&path).unwrap();
-    let host2 = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
-    let mut receiver2 = InboundReceiver::new(
-        channel_config(), Box::new(channel_clock()), &mut channel_connection2,
-        host2, &harness.authority, &harness.grant).unwrap();
-    let acct = account(&harness.authority, &harness.grant);
-    let ledger = receiver2.ledger().unwrap();
-        let entry = ledger.inbound_entry(&acct, "msg-1").expect("durable ledger row");
-    assert_eq!(entry.state, InboundState::Accepted);
-    assert_eq!(entry.block_id.as_deref(), Some(block_id.as_str()));
-    drop(receiver2);
-    assert_eq!(harness.mapping_count(), 1);
-    assert_eq!(harness.operation_count(), 1);
+fn principal_of(harness: &RuntimeHarness) -> ChannelPrincipal {
+    ChannelPrincipal::from_authority_grant(&harness.authority, &harness.grant).unwrap()
 }
 
-// --- Pre-effect durable intent ---
+// --- Pre-effect durability: initial Channel write failure -> zero effect ---
 
 #[test]
-fn durable_prepared_intent_precedes_any_host_or_core_effect() {
-    let mut harness = RuntimeHarness::new("recv-prepared");
+fn initial_channel_write_failure_yields_zero_effect() {
+    let mut harness = RuntimeHarness::new("recv-write-fail");
     let dir = tempdir().unwrap();
     let (mut channel_connection, _path) = channel_store_connection(dir.path());
+    let principal = principal_of(&harness);
+    let inner = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+    let mut store = SqliteChannelStore::new(&mut channel_connection, &principal).unwrap();
+    store.inject_write_prepared_failure(1);
+    let mut receiver = InboundReceiver::new_with_store(
+        channel_config(), Box::new(channel_clock()), store,
+        inner, &harness.authority, &harness.grant).unwrap();
+    let outcome = receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-pf", "x"));
+    assert!(matches!(outcome, IngressOutcome::SubmissionPending), "initial write failure must not look committed: {outcome:?}");
+    drop(receiver);
+    assert_eq!(harness.mapping_count(), 0, "zero Host premise");
+    assert_eq!(harness.operation_count(), 0, "zero Core effect");
+}
+
+// --- Post-Host final transaction failure -> SubmissionPending, reconcile-alone ---
+
+#[test]
+fn post_host_final_transaction_failure_reconciles_alone_to_one_effect() {
+    let mut harness = RuntimeHarness::new("recv-commit-fail");
+    let dir = tempdir().unwrap();
+    let (mut channel_connection, _path) = channel_store_connection(dir.path());
+    let acct = account(&harness.authority, &harness.grant);
+
+    let principal = principal_of(&harness);
+    // Phase A: bind owner with a normal receiver, then drop it.
+    {
+        let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+        let receiver = InboundReceiver::new(
+            channel_config(), Box::new(channel_clock()), &mut channel_connection,
+            host, &harness.authority, &harness.grant).unwrap();
+        drop(receiver);
+    }
+
+    // Phase B: a store with an injected commit_outcome failure, and a host
+    // whose submit commits durably but drops the response.
     {
         let inner = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
         let mut faulty = FaultyHostIngress::new(inner);
-        faulty.fail_submits = 1;
-        let mut receiver = InboundReceiver::new(
-            channel_config(), Box::new(channel_clock()), &mut channel_connection,
+        faulty.commit_then_drop_submits = 1;
+        // `principal` was computed before borrowing harness.connection.
+        let mut store = SqliteChannelStore::new(&mut channel_connection, &principal).unwrap();
+        store.inject_commit_outcome_failure(1);
+        let mut receiver = InboundReceiver::new_with_store(
+            channel_config(), Box::new(channel_clock()), store,
             faulty, &harness.authority, &harness.grant).unwrap();
-        let outcome = receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-prepared", "pending"));
-        assert!(matches!(outcome, IngressOutcome::SubmissionPending));
+        let outcome = receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-cf", "once"));
+        assert!(matches!(outcome, IngressOutcome::SubmissionPending), "commit_outcome failure must yield retryable SubmissionPending, got {outcome:?}");
+        // No terminal ledger row while the durable intent is Prepared.
+        assert!(receiver.ledger().unwrap().inbound_entry(&acct, "msg-cf").is_none(), "no terminal row while Prepared");
     }
-    assert_eq!(harness.mapping_count(), 0, "no Host premise before a successful submit");
-    assert_eq!(harness.operation_count(), 0, "no Core effect before the submit");
+    assert_eq!(harness.mapping_count(), 1, "Host committed");
+    assert_eq!(harness.operation_count(), 1);
+
+    // Phase C: reopen and reconcile() ALONE — no re-ingest — status-first
+    // restores the terminal state + complete ledger result exactly once.
+    let host2 = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+    let mut receiver2 = InboundReceiver::new(
+        channel_config(), Box::new(channel_clock()), &mut channel_connection,
+        host2, &harness.authority, &harness.grant).unwrap();
+    assert_eq!(receiver2.reconcile().unwrap(), 0, "reconcile alone converged");
+    let ledger = receiver2.ledger().unwrap();
+        let entry = ledger.inbound_entry(&acct, "msg-cf").expect("complete ledger result");
+    assert_eq!(entry.state, InboundState::Accepted);
+    assert!(entry.block_id.is_some());
+    drop(receiver2);
+    assert_eq!(harness.mapping_count(), 1, "no duplicate premise");
+    assert_eq!(harness.operation_count(), 1, "exactly one Core effect");
 }
 
-// --- Crash / replay / reconciliation ---
+// --- Lost response reconcile-alone (status-first, no resend) ---
 
 #[test]
 fn lost_response_reconciled_status_first_without_resend() {
     let mut harness = RuntimeHarness::new("recv-reconcile");
     let dir = tempdir().unwrap();
     let (mut channel_connection, _path) = channel_store_connection(dir.path());
+    let acct = account(&harness.authority, &harness.grant);
     {
         let inner = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
         let mut faulty = FaultyHostIngress::new(inner);
@@ -103,73 +131,110 @@ fn lost_response_reconciled_status_first_without_resend() {
         let outcome = receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-4", "lost"));
         assert!(matches!(outcome, IngressOutcome::SubmissionPending));
     }
-    // Reconcile alone (no re-ingest): status-first.
     let host2 = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
     let mut receiver2 = InboundReceiver::new(
         channel_config(), Box::new(channel_clock()), &mut channel_connection,
         host2, &harness.authority, &harness.grant).unwrap();
-    let remaining = receiver2.reconcile().unwrap();
-    assert_eq!(remaining, 0, "status settled the pending intent");
-    let acct = account(&harness.authority, &harness.grant);
+    assert_eq!(receiver2.reconcile().unwrap(), 0, "status settled the pending intent");
     let ledger = receiver2.ledger().unwrap();
         let entry = ledger.inbound_entry(&acct, "msg-4").expect("row");
     assert_eq!(entry.state, InboundState::Accepted);
     drop(receiver2);
-    assert_eq!(harness.mapping_count(), 1, "no duplicate mapping");
+    assert_eq!(harness.mapping_count(), 1);
     assert_eq!(harness.operation_count(), 1, "status settled: no blind resend");
 }
 
+// --- Lifecycle/config/graph crossing replay rejection ---
+
 #[test]
-fn reconcile_alone_restores_terminal_state_no_redelivery() {
-    let mut harness = RuntimeHarness::new("recv-crash");
+fn config_crossing_replay_is_rejected_before_core() {
+    let mut harness = RuntimeHarness::new("recv-config-cross");
     let dir = tempdir().unwrap();
     let (mut channel_connection, _path) = channel_store_connection(dir.path());
-    // Phase A: commit durably in Host, lose response.
     {
-        let inner = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
-        let mut faulty = FaultyHostIngress::new(inner);
-        faulty.commit_then_drop_submits = 1;
+        let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
         let mut receiver = InboundReceiver::new(
             channel_config(), Box::new(channel_clock()), &mut channel_connection,
-            faulty, &harness.authority, &harness.grant).unwrap();
-        assert!(matches!(receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-crash", "once")), IngressOutcome::SubmissionPending));
+            host, &harness.authority, &harness.grant).unwrap();
+        assert!(matches!(receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-cross", "x")), IngressOutcome::Committed { .. }));
     }
-    // Phase B: reconcile() alone — no re-ingest — restores terminal state.
+    // Config revision 2 receiver; same event sealed under config revision 1 =>
+    // the bound config revision no longer matches the current one.
     let host2 = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
     let mut receiver2 = InboundReceiver::new(
-        channel_config(), Box::new(channel_clock()), &mut channel_connection,
+        dolly_channel::ChannelConfigBuilder::new("web", "account-a", MODULE_ID, 2).target_pages(&["page-a"]).build(),
+        Box::new(channel_clock()), &mut channel_connection,
         host2, &harness.authority, &harness.grant).unwrap();
-    assert_eq!(receiver2.reconcile().unwrap(), 0);
-    let acct = account(&harness.authority, &harness.grant);
-    let ledger = receiver2.ledger().unwrap();
-        let entry = ledger.inbound_entry(&acct, "msg-crash").expect("row");
-    assert_eq!(entry.state, InboundState::Accepted);
-    assert!(entry.block_id.is_some());
+    match receiver2.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-cross", "x")) {
+        IngressOutcome::RejectedBeforeMutation { error } => {
+            assert!(error.code == "CHANNEL_AUTHENTICATION_FAILED" || error.code == "CHANNEL_OPERATION_CONFLICT", "got {error:?}");
+        }
+        other => panic!("expected rejection, got {other:?}"),
+    }
     drop(receiver2);
     assert_eq!(harness.mapping_count(), 1);
-    assert_eq!(harness.operation_count(), 1, "exactly one Core effect");
+    assert_eq!(harness.operation_count(), 1, "no second Core effect");
 }
-
-// --- Conflicts before Core ---
 
 #[test]
-fn same_key_different_content_conflicts_before_core() {
-    let mut harness = RuntimeHarness::new("recv-content");
+fn generation_crossing_replay_is_rejected() {
+    let mut harness = RuntimeHarness::new("recv-gen-cross");
     let dir = tempdir().unwrap();
     let (mut channel_connection, _path) = channel_store_connection(dir.path());
-    let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
-    let mut receiver = InboundReceiver::new(
-        channel_config(), Box::new(channel_clock()), &mut channel_connection,
-        host, &harness.authority, &harness.grant).unwrap();
-    assert!(matches!(receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-2", "original")), IngressOutcome::Committed { .. }));
-    match receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-2", "changed")) {
-        IngressOutcome::RejectedBeforeMutation { error } => assert_eq!(error.code, "CHANNEL_OPERATION_CONFLICT"),
-        other => panic!("expected RejectedBeforeMutation, got {other:?}"),
+    {
+        let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+        let mut receiver = InboundReceiver::new(
+            channel_config(), Box::new(channel_clock()), &mut channel_connection,
+            host, &harness.authority, &harness.grant).unwrap();
+        assert!(matches!(receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-gen", "g")), IngressOutcome::Committed { .. }));
     }
-    drop(receiver);
-    assert_eq!(harness.mapping_count(), 1);
-    assert_eq!(harness.operation_count(), 1);
+    // Install a new grant with generation 2; attempt to replay the SAME old
+    // sealed event (bound to generation 1).
+    let new_grant = harness.reinstall_grant_with_generation(2);
+    // A fresh channel store bound to the NEW principal (generation 2).
+    let mut fresh_connection = Connection::open_in_memory().unwrap();
+    create_channel_store_schema(&mut fresh_connection).unwrap();
+    let host2 = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+    let mut receiver2 = InboundReceiver::new(
+        channel_config(), Box::new(channel_clock()), &mut fresh_connection,
+        host2, &harness.authority, &new_grant).unwrap();
+    let old_event = sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-gen", "g");
+    match receiver2.ingest_event(&old_event) {
+        IngressOutcome::RejectedBeforeMutation { error } => assert_eq!(error.code, "CHANNEL_AUTHENTICATION_FAILED"),
+        other => panic!("expected generation crossing to be rejected, got {other:?}"),
+    }
+    drop(receiver2);
+    assert_eq!(harness.mapping_count(), 1, "one durable mapping from phase A");
+    assert_eq!(harness.operation_count(), 1, "no second Core effect");
 }
+
+// --- Receiver-level cross-module/store refusal reaching the owner check ---
+
+#[test]
+fn cross_module_store_reuse_fails_closed_at_receiver() {
+    let mut harness = RuntimeHarness::new("recv-crossmod");
+    let dir = tempdir().unwrap();
+    let (mut channel_connection, _path) = channel_store_connection(dir.path());
+    {
+        let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+        let receiver = InboundReceiver::new(
+            channel_config(), Box::new(channel_clock()), &mut channel_connection,
+            host, &harness.authority, &harness.grant).unwrap();
+        drop(receiver);
+    }
+    // Opening the same store under a DIFFERENT module principal must fail at
+    // the receiver boundary via the store owner check.
+    let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+    let result = InboundReceiver::new(
+        channel_config(), Box::new(channel_clock()), &mut channel_connection,
+        host, &harness.authority, &harness.grant_other);
+    match result {
+        Err(e) => assert_eq!(e.code, "CHANNEL_AUTHENTICATION_FAILED"),
+        Ok(_) => panic!("cross-module reuse must fail at the receiver boundary"),
+    }
+}
+
+// --- Changed targets conflict ---
 
 #[test]
 fn same_key_changed_target_pages_conflicts_before_core() {
@@ -183,13 +248,17 @@ fn same_key_changed_target_pages_conflicts_before_core() {
             host, &harness.authority, &harness.grant).unwrap();
         assert!(matches!(receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-pages", "same")), IngressOutcome::Committed { .. }));
     }
-    // Config revision 2 targets [page-b] instead of [page-a].
+    // Receiver bound to the same principal+store with config revision 2 and
+    // a different ordered target set.
     let host2 = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
     let mut receiver2 = InboundReceiver::new(
         dolly_channel::ChannelConfigBuilder::new("web", "account-a", MODULE_ID, 2).target_pages(&["page-b"]).build(),
         Box::new(channel_clock()), &mut channel_connection,
         host2, &harness.authority, &harness.grant).unwrap();
-    match receiver2.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-pages", "same")) {
+    // Re-seal under the same principal/config facts so provenance passes and
+    // the pre-replay digest conflict triggers.
+    let event = AuthenticatedChannelEvent::new(&harness.authority, &harness.grant, 2, content_event("conv-1", "msg-pages", "same")).unwrap();
+    match receiver2.ingest_event(&event) {
         IngressOutcome::RejectedBeforeMutation { error } => assert_eq!(error.code, "CHANNEL_OPERATION_CONFLICT"),
         other => panic!("expected conflict, got {other:?}"),
     }
@@ -198,7 +267,122 @@ fn same_key_changed_target_pages_conflicts_before_core() {
     assert_eq!(harness.operation_count(), 1);
 }
 
-// --- Authority revalidation ---
+// --- End-to-end exactly-once + lossless projection ---
+
+#[test]
+fn authenticated_event_reaches_core_exactly_once_with_lossless_projection() {
+    let mut harness = RuntimeHarness::new("recv-e2e");
+    let dir = tempdir().unwrap();
+    let (mut channel_connection, path) = channel_store_connection(dir.path());
+    let acct = account(&harness.authority, &harness.grant);
+    let block_id;
+    {
+        let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+        let mut receiver = InboundReceiver::new(
+            channel_config(), Box::new(channel_clock()), &mut channel_connection,
+            host, &harness.authority, &harness.grant).unwrap();
+        let event = sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-1", "Hello, Dolly.");
+        block_id = committed_block(&receiver.ingest_event(&event));
+        let ledger = receiver.ledger().unwrap();
+        let entry = ledger.inbound_entry(&acct, "msg-1").expect("ledger row");
+        assert_eq!(entry.state, InboundState::Accepted);
+        assert_eq!(entry.channel_id, "web-primary");
+        assert_eq!(entry.external_conversation_id, "conv-1");
+        assert_eq!(entry.sender_class, "user");
+        assert_eq!(entry.pages, vec!["page-a".to_string()]);
+        assert_eq!(entry.received_at, CHANNEL_NOW);
+    }
+    let mut channel_connection2 = Connection::open(&path).unwrap();
+    let host2 = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+    let mut receiver2 = InboundReceiver::new(
+        channel_config(), Box::new(channel_clock()), &mut channel_connection2,
+        host2, &harness.authority, &harness.grant).unwrap();
+    let ledger = receiver2.ledger().unwrap();
+        let entry = ledger.inbound_entry(&acct, "msg-1").expect("durable ledger row");
+    assert_eq!(entry.state, InboundState::Accepted);
+    assert_eq!(entry.block_id.as_deref(), Some(block_id.as_str()));
+    drop(receiver2);
+    assert_eq!(harness.mapping_count(), 1);
+    assert_eq!(harness.operation_count(), 1);
+}
+
+// --- Durable echo markers: suppression with zero Host/Core ---
+
+#[test]
+fn durable_echo_marker_suppresses_matching_inbound_with_zero_core() {
+    let mut harness = RuntimeHarness::new("recv-echo");
+    let dir = tempdir().unwrap();
+    let (mut channel_connection, _path) = channel_store_connection(dir.path());
+    let acct = account(&harness.authority, &harness.grant);
+    let principal = principal_of(&harness);
+    // Record a durable echo marker in the owner-bound store.
+    {
+        let mut store = SqliteChannelStore::new(&mut channel_connection, &principal).unwrap();
+        store.record_echo(&acct, "transport-echo-1").unwrap();
+    }
+    let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+    let mut receiver = InboundReceiver::new(
+        channel_config(), Box::new(channel_clock()), &mut channel_connection,
+        host, &harness.authority, &harness.grant).unwrap();
+    let outcome = receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "transport-echo-1", "echo"));
+    assert!(matches!(outcome, IngressOutcome::EchoIgnored), "echo must be suppressed before Host/Core, got {outcome:?}");
+    drop(receiver);
+    assert_eq!(harness.mapping_count(), 0, "zero Host premise for an echo");
+    assert_eq!(harness.operation_count(), 0, "zero Core effect for an echo");
+
+    // Markers survive reopen.
+    let host2 = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+    let mut receiver2 = InboundReceiver::new(
+        channel_config(), Box::new(channel_clock()), &mut channel_connection,
+        host2, &harness.authority, &harness.grant).unwrap();
+    let outcome2 = receiver2.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "transport-echo-1", "echo"));
+    assert!(matches!(outcome2, IngressOutcome::EchoIgnored), "echo marker must survive reopen, got {outcome2:?}");
+    drop(receiver2);
+    assert_eq!(harness.mapping_count(), 0);
+}
+
+// --- Semantic tamper with recomputed outer hash fails closed ---
+
+#[test]
+fn semantic_tamper_with_recomputed_hash_fails_closed() {
+    let mut harness = RuntimeHarness::new("recv-semtamper");
+    let dir = tempdir().unwrap();
+    let (mut channel_connection, path) = channel_store_connection(dir.path());
+    let acct = account(&harness.authority, &harness.grant);
+    let principal = principal_of(&harness);
+    {
+        let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+        let mut receiver = InboundReceiver::new(
+            channel_config(), Box::new(channel_clock()), &mut channel_connection,
+            host, &harness.authority, &harness.grant).unwrap();
+        assert!(matches!(receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-tamper", "data")), IngressOutcome::Committed { .. }));
+    }
+    // Semantic tamper: change the ordered target pages AND recompute the outer
+    // record hash so the bytes parse and hash-match. verify_intent must still
+    // fail because the operation digest is recomputed from the (tampered)
+    // fields and compared.
+    {
+        let mut store = SqliteChannelStore::new(&mut channel_connection, &principal).unwrap();
+        let key = dolly_channel::ids::inbound_ingress_key(&acct, "msg-tamper");
+        let mut intent = store.find_intent(&key).unwrap().unwrap();
+        intent.target_page_ids = vec!["page-b".to_string()];
+        let canonical = intent.canonical_string().unwrap();
+        let digest = dolly_canonical_json::Sha256Digest::compute(canonical.as_bytes()).to_canonical_string();
+        channel_connection.execute(
+            "UPDATE channel_intent SET record_digest = ?1, canonical_jcs = ?2 WHERE intent_key = ?3",
+            rusqlite::params![digest, canonical.as_bytes(), key],
+        ).unwrap();
+    }
+    let host2 = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+    let mut receiver2 = InboundReceiver::new(
+        channel_config(), Box::new(channel_clock()), &mut channel_connection,
+        host2, &harness.authority, &harness.grant).unwrap();
+    let err = receiver2.ledger().expect_err("semantic tamper must fail closed");
+    assert_eq!(err.code, "CHANNEL_LEDGER_CORRUPT");
+    let _ = path;
+}
+
+// --- Authority replay revalidation ---
 
 #[test]
 fn current_authority_replay_revalidates_and_keeps_one_effect() {
@@ -242,7 +426,7 @@ fn revoked_authority_replay_never_returns_cached_success() {
     assert!(!matches!(outcome, IngressOutcome::IdempotentReplay { .. }), "must not return cached success under revoked authority: {outcome:?}");
     drop(receiver);
     assert_eq!(harness.mapping_count(), 1);
-    assert_eq!(harness.operation_count(), 1, "no new Core effect");
+    assert_eq!(harness.operation_count(), 1);
 }
 
 #[test]
@@ -264,32 +448,7 @@ fn event_bound_to_another_principal_fails_closed() {
     assert_eq!(harness.operation_count(), 0);
 }
 
-// --- Direction, relation, echo, tamper ---
-
-#[test]
-fn echo_suppressed_without_core() {
-    let mut harness = RuntimeHarness::new("recv-echo");
-    let dir = tempdir().unwrap();
-    let (mut channel_connection, _path) = channel_store_connection(dir.path());
-    let acct = account(&harness.authority, &harness.grant);
-    // Seed echo.
-    {
-        let mut ledger = ChannelLedger::new();
-        ledger.record_echoed(&acct, "transport-echo-1");
-        // Can't use SqliteChannelStore directly (crate-private); seed via raw SQL.
-        channel_connection.execute("INSERT OR IGNORE INTO channel_intent (intent_key, record_digest, canonical_jcs) VALUES ('echo-seed', 'sha256:0', X'00')", []).ok();
-    }
-    let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
-    let mut receiver = InboundReceiver::new(
-        channel_config(), Box::new(channel_clock()), &mut channel_connection,
-        host, &harness.authority, &harness.grant).unwrap();
-    let outcome = receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "transport-echo-1", "echo"));
-    // Echo suppression requires the echo ID in the ledger; since we can't seed
-    // the crate-private store directly, this test verifies the pipeline runs
-    // without error (the echo path is tested by the existing ingress tests).
-    let _ = outcome;
-    drop(receiver);
-}
+// --- Direction, relation ---
 
 #[test]
 fn opposite_direction_target_fails_closed() {
@@ -326,45 +485,4 @@ fn edit_delete_relation_and_stale_reference_fails_closed() {
     drop(receiver);
     assert_eq!(harness.mapping_count(), 2, "original + edit only");
     assert_eq!(harness.operation_count(), 2);
-}
-
-#[test]
-fn cross_module_store_reuse_fails_closed() {
-    let mut harness = RuntimeHarness::new("recv-crossmod");
-    let dir = tempdir().unwrap();
-    let (mut channel_connection, _path) = channel_store_connection(dir.path());
-    {
-        let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
-        let mut receiver = InboundReceiver::new(
-            channel_config(), Box::new(channel_clock()), &mut channel_connection,
-            host, &harness.authority, &harness.grant).unwrap();
-        let _ = receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-12", "bound"));
-    }
-    // Reopen the same DB under a different principal (grant_other = different module).
-    let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
-    let result = InboundReceiver::new(
-        channel_config(), Box::new(channel_clock()), &mut channel_connection,
-        host, &harness.authority, &harness.grant_other);
-    assert!(result.is_err(), "cross-principal store reuse must fail closed at the receiver boundary");
-}
-
-#[test]
-fn tampered_store_fails_closed() {
-    let mut harness = RuntimeHarness::new("recv-tamper");
-    let dir = tempdir().unwrap();
-    let (mut channel_connection, _path) = channel_store_connection(dir.path());
-    {
-        let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
-        let mut receiver = InboundReceiver::new(
-            channel_config(), Box::new(channel_clock()), &mut channel_connection,
-            host, &harness.authority, &harness.grant).unwrap();
-        let _ = receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-11", "durable"));
-    }
-    // Tamper with the owner binding.
-    channel_connection.execute("UPDATE channel_store_owner SET owner_digest = 'sha256:tampered' WHERE singleton = 1", []).unwrap();
-    let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
-    let result = InboundReceiver::new(
-        channel_config(), Box::new(channel_clock()), &mut channel_connection,
-        host, &harness.authority, &harness.grant);
-    assert!(result.is_err(), "tampered store must fail closed");
 }

@@ -36,6 +36,7 @@ pub struct ChannelPrincipal {
     generation: u64,
     revision: i64,
     graph_revision: i64,
+    graph_digest: String,
     account: String,
 }
 
@@ -78,6 +79,11 @@ impl ChannelPrincipal {
         let generation = grant.extension_generation();
         let revision = authority.incarnation_revision();
         let graph_revision = grant.graph_revision();
+        let graph_digest = grant.graph_digest().to_owned();
+        if graph_digest.is_empty() || graph_digest.chars().any(|character| character.is_control())
+        {
+            return Err(invalid("authenticated principal graph digest is malformed"));
+        }
         for (value, name) in [
             (&owner, "owner"),
             (&extension_id, "extension"),
@@ -108,6 +114,7 @@ impl ChannelPrincipal {
             generation: generation as u64,
             revision,
             graph_revision,
+            graph_digest,
             account,
         })
     }
@@ -147,6 +154,11 @@ impl ChannelPrincipal {
         self.graph_revision
     }
 
+    /// The granted graph digest fence.
+    pub fn graph_digest(&self) -> &str {
+        &self.graph_digest
+    }
+
     /// The deterministic Channel account of this principal: the root of the
     /// Channel deduplication namespace, a pure function of the sealed
     /// authority and grant.
@@ -157,6 +169,7 @@ impl ChannelPrincipal {
     /// Test-only constructor from explicit principal parts.
     #[cfg(test)]
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_parts(
         owner: &str,
         extension_id: &str,
@@ -165,6 +178,7 @@ impl ChannelPrincipal {
         generation: u64,
         revision: i64,
         graph_revision: i64,
+        graph_digest: &str,
     ) -> Self {
         let account = crate::ids::channel_account(owner, extension_id, module_id, instance_id);
         Self {
@@ -175,6 +189,7 @@ impl ChannelPrincipal {
             generation,
             revision,
             graph_revision,
+            graph_digest: graph_digest.to_string(),
             account,
         }
     }

@@ -30,7 +30,7 @@ pub(crate) const CHANNEL_INTENT_RECORD_SCHEMA: &str = "dolly.channel-intent/v1";
 /// The lifecycle of one Channel intent (the sole per-event state machine).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum IntentState {
+pub enum IntentState {
     /// Durably recorded before any Host submit; the Host outcome is unknown.
     Prepared,
     /// The Host mapping committed and the final ledger row landed atomically.
@@ -40,6 +40,7 @@ pub(crate) enum IntentState {
 }
 
 impl IntentState {
+    #[allow(dead_code)]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             IntentState::Prepared => "prepared",
@@ -58,7 +59,7 @@ impl IntentState {
 /// authority/grant) plus caller-supplied event content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ChannelIntent {
+pub struct ChannelIntent {
     pub schema: String,
     /// The principal-bound account-scoped ingress key (dedup namespace).
     pub intent_key: String,
@@ -73,9 +74,17 @@ pub(crate) struct ChannelIntent {
     pub generation: i64,
     pub revision: i64,
     pub graph_revision: i64,
+    pub graph_digest: String,
     pub config_revision: i64,
     pub account: String,
     pub external_event_id: String,
+    /// Transport-sourced content facts preserved for the lossless ChannelLedger
+    /// projection (real conversation/session/channel/sender/time).
+    pub channel_id: String,
+    pub transport: String,
+    pub external_conversation_id: String,
+    pub sender_class: String,
+    pub received_at: String,
     pub kind: EventKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub references_external_event_id: Option<String>,
@@ -94,7 +103,7 @@ pub(crate) struct ChannelIntent {
 impl ChannelIntent {
     /// The canonical JSON text of the full record (including its current
     /// lifecycle state), used as the tamper-guarded storage encoding.
-    pub(crate) fn canonical_string(&self) -> Result<String, ChannelError> {
+    pub fn canonical_string(&self) -> Result<String, ChannelError> {
         canonicalize(self)
             .map(|(bytes, _)| {
                 String::from_utf8(bytes.as_bytes().to_vec()).expect("canonical encoding is UTF-8")
@@ -111,7 +120,7 @@ impl ChannelIntent {
 
     /// Rebuild an intent from its canonical encoding; any structural
     /// violation fails closed.
-    pub(crate) fn from_canonical_string(text: &str) -> Result<Self, ChannelError> {
+    pub fn from_canonical_string(text: &str) -> Result<Self, ChannelError> {
         let record: ChannelIntent = serde_json::from_str(text).map_err(|error| {
             ChannelError::new(
                 codes::LEDGER_CORRUPT,

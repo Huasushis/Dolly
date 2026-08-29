@@ -1,7 +1,7 @@
-//! Shared G4-C receiver test harness: a real Runtime connection (Core engine,
-//! Host connection, capability grants, durable Host ingress slice) plus a
-//! durable module-scoped Channel store, and fault-injecting wrappers for the
-//! accepted seams.
+//! Shared G4-C receiver test harness: real Runtime connection (Core engine,
+//! Host connection, capability grants, durable Host ingress slice) and real
+//! module-scoped Channel store, plus fault injection over the accepted seams.
+//! Compiled only under the non-default `test-support` feature.
 
 #![allow(dead_code)]
 
@@ -151,6 +151,15 @@ impl RuntimeHarness {
         Self { connection, authority, grant, grant_other, graph_digest }
     }
 
+    pub fn reinstall_grant_with_generation(&mut self, generation: i64) -> HostCapabilityGrant {
+        let mut store = SqliteCoreStore::new(&mut self.connection).unwrap();
+        store.install_host_capability_grant(&self.authority, EXTENSION_ID, MODULE_ID, generation,
+            1, &descriptor_digest(MODULE_ID), 1, &digest(&json!({"manifest": 1})),
+            1, &self.graph_digest, &["host.ingress.submit"]).unwrap();
+        SqliteCoreStore::new(&mut self.connection).unwrap()
+            .current_host_capability_grant(&self.authority, EXTENSION_ID, MODULE_ID).unwrap().unwrap()
+    }
+
     pub fn revoke_grant(&mut self, authority: &HostConnectionAuthority, module_id: &str) {
         SqliteCoreStore::new(&mut self.connection).unwrap()
             .revoke_host_capability_grant(authority, EXTENSION_ID, module_id).unwrap();
@@ -180,7 +189,7 @@ pub fn channel_clock() -> VirtualClock {
 
 pub fn sealed_event(authority: &HostConnectionAuthority, grant: &HostCapabilityGrant,
     conversation: &str, message_id: &str, text: &str) -> AuthenticatedChannelEvent {
-    AuthenticatedChannelEvent::new(authority, grant, content_event(conversation, message_id, text)).unwrap()
+    AuthenticatedChannelEvent::new(authority, grant, 1, content_event(conversation, message_id, text)).unwrap()
 }
 
 pub fn sealed_edit_event(authority: &HostConnectionAuthority, grant: &HostCapabilityGrant,
@@ -188,10 +197,10 @@ pub fn sealed_edit_event(authority: &HostConnectionAuthority, grant: &HostCapabi
     let mut content = content_event("conv-1", message_id, text);
     content.event_kind = EventKind::Edit;
     content.references_external_message_id = Some(references.to_string());
-    AuthenticatedChannelEvent::new(authority, grant, content).unwrap()
+    AuthenticatedChannelEvent::new(authority, grant, 1, content).unwrap()
 }
 
-fn content_event(conversation: &str, message_id: &str, text: &str) -> ChannelEventContent {
+pub fn content_event(conversation: &str, message_id: &str, text: &str) -> ChannelEventContent {
     ChannelEventContent {
         channel_id: "web-primary".to_string(), transport: "web".to_string(),
         external_conversation_id: conversation.to_string(), external_message_id: message_id.to_string(),
@@ -206,6 +215,7 @@ pub fn account(authority: &HostConnectionAuthority, grant: &HostCapabilityGrant)
         grant.module_id(), authority.worker_epoch().as_str())
 }
 
+/// Fault-injecting `HostIngress` wrapper over a real store.
 pub struct FaultyHostIngress<H: HostIngress> {
     inner: H,
     pub fail_submits: u64,

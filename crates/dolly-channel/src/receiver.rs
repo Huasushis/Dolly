@@ -4,8 +4,10 @@
 //!
 //! ```text
 //! authenticated transport event (sealed under the Host authority/grant)
-//!   -> recompute/compare principal against current sealed
-//!      HostConnectionAuthority + HostCapabilityGrant (before any replay/ack)
+//!   -> recompute/compare the full bound principal (owner/Extension/module/
+//!      instance/generation/incarnation/graph revision+digest/config revision/
+//!      account) against the current sealed HostConnectionAuthority +
+//!      HostCapabilityGrant (before any replay/ack)
 //!   -> durable prepared Channel intent (module-scoped SQLite, BEFORE any
 //!      Host submit or Core effect)
 //!   -> sealed B Host ingress premise
@@ -13,8 +15,8 @@
 //!   -> atomic terminal intent (same Channel DB transaction)
 //! ```
 //!
-//! A crash or lost response after a Host commit leaves the durable row
-//! `prepared`; `reconcile()` (no event redelivery) reopens that row, calls
+//! A crash or failed final transaction after a Host commit leaves the durable
+//! row `prepared`; `reconcile()` (no event redelivery) reopens that row, calls
 //! Host `status` first with the current sealed authority, and restores the
 //! terminal state exactly once.
 
@@ -24,7 +26,7 @@ use dolly_storage::{HostCapabilityGrant, HostConnectionAuthority, HostIngress};
 use crate::clock::Clock;
 use crate::config::ChannelConfig;
 use crate::error::{ChannelError, ChannelOutcome, codes};
-use crate::host_adapter::HostIngressCoreAdapter;
+use crate::host_adapter::{HostIngressCoreAdapter, channel_intent_digest, payload_digest_of};
 use crate::ids;
 use crate::ingress::{
     CoreIngress, CoreIngressError, IngressOutcome, IngressStatusResult, IngressSubmitReceipt,
@@ -54,46 +56,70 @@ pub struct ChannelEventContent {
 
 /// An opaque, already-authenticated Channel transport event.
 ///
-/// Binds the COMPLETE current authority/grant facts (owner, Extension,
-/// module, instance, generation, incarnation revision, graph revision, and
-/// the derived account) needed to prevent reuse across
-/// generation/incarnation/lifecycle/config/graph. Constructed only under the
-/// sealed authority/grant; no public deserializer. The receiver recomputes
-/// the principal from the CURRENT sealed authority/grant and compares before
-/// any replay or acknowledgement.
+/// Binds the COMPLETE current authority/grant facts — owner, Extension,
+/// module, instance (security domain / worker epoch), Extension generation,
+/// Host incarnation revision, graph revision + digest, and the derived
+/// account — needed to prevent reuse across generation/incarnation/lifecycle/
+/// config/graph. The account hash is NOT a substitute for these fences: every
+/// fact is bound explicitly and compared explicitly. Constructed only through
+/// [`AuthenticatedChannelEvent::new`], which requires the current sealed Host
+/// authority and capability grant plus authenticated transport data; no public
+/// deserializer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedChannelEvent {
-    account: String,
-    generation: u64,
-    revision: i64,
-    graph_revision: i64,
+    bound_owner: String,
+    bound_extension_id: String,
+    bound_module_id: String,
+    bound_instance_id: String,
+    bound_generation: u64,
+    bound_revision: i64,
+    bound_graph_revision: i64,
+    bound_graph_digest: String,
+    bound_config_revision: i64,
+    bound_account: String,
     content: ChannelEventContent,
 }
 
 impl AuthenticatedChannelEvent {
     /// Seal one authenticated transport event under the opaque current Host
-    /// authority and capability grant. Every authoritative fact is derived
-    /// from the sealed principal; the caller supplies message content only.
+    /// authority and capability grant plus the current config revision. Every
+    /// authoritative fact is derived from the sealed principal; the caller
+    /// supplies message content only.
     pub fn new(
         authority: &HostConnectionAuthority,
         grant: &HostCapabilityGrant,
+        config_revision: i64,
         content: ChannelEventContent,
     ) -> Result<Self, ChannelError> {
         let principal = ChannelPrincipal::from_authority_grant(authority, grant)?;
         Ok(Self {
-            account: principal.account().to_string(),
-            generation: principal.generation(),
-            revision: principal.revision(),
-            graph_revision: principal.graph_revision(),
+            bound_owner: principal.owner().to_string(),
+            bound_extension_id: principal.extension_id().to_string(),
+            bound_module_id: principal.module_id().to_string(),
+            bound_instance_id: principal.instance_id().to_string(),
+            bound_generation: principal.generation(),
+            bound_revision: principal.revision(),
+            bound_graph_revision: principal.graph_revision(),
+            bound_graph_digest: principal.graph_digest().to_string(),
+            bound_config_revision: config_revision,
+            bound_account: principal.account().to_string(),
             content,
         })
     }
 
-    fn matches_current(&self, principal: &ChannelPrincipal) -> bool {
-        self.account == principal.account()
-            && self.generation == principal.generation()
-            && self.revision == principal.revision()
-            && self.graph_revision == principal.graph_revision()
+    /// Whether every bound fact matches the current principal and config
+    /// revision. Each fence is compared explicitly.
+    fn matches_current(&self, principal: &ChannelPrincipal, config_revision: i64) -> bool {
+        self.bound_owner == principal.owner()
+            && self.bound_extension_id == principal.extension_id()
+            && self.bound_module_id == principal.module_id()
+            && self.bound_instance_id == principal.instance_id()
+            && self.bound_generation == principal.generation()
+            && self.bound_revision == principal.revision()
+            && self.bound_graph_revision == principal.graph_revision()
+            && self.bound_graph_digest == principal.graph_digest()
+            && self.bound_config_revision == config_revision
+            && self.bound_account == principal.account()
     }
 
     fn into_inbound_event(self, account: String) -> InboundEvent {
@@ -113,13 +139,12 @@ impl AuthenticatedChannelEvent {
     }
 }
 
-/// The durable Channel inbound facade over one module-scoped SQLite
-/// connection and one `HostIngress` implementation. The only public
-/// submission path.
+/// The durable Channel inbound facade over one module-scoped store and one
+/// `HostIngress` implementation. The only public submission path.
 pub struct InboundReceiver<'conn, 'principal, H: HostIngress> {
     config: ChannelConfig,
     clock: Box<dyn Clock>,
-    connection: &'conn mut rusqlite::Connection,
+    store: SqliteChannelStore<'conn>,
     host: H,
     authority: &'principal HostConnectionAuthority,
     grant: &'principal HostCapabilityGrant,
@@ -150,29 +175,52 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
         }
         let mut config = config;
         config.transport_account = principal.account().to_string();
-        // Open + verify the store under the current principal.
         let store = SqliteChannelStore::new(connection, &principal)?;
-        drop(store);
-        Ok(Self { config, clock, connection, host, authority, grant, principal })
+        Ok(Self { config, clock, store, host, authority, grant, principal })
     }
 
     /// The current in-memory Channel ledger projection (rebuilt from the
-    /// durable intents, the single source of truth).
+    /// durable intents + echo markers, the single source of truth).
     pub fn ledger(&mut self) -> Result<crate::ledger::ChannelLedger, ChannelError> {
-        let mut store = SqliteChannelStore::new(&mut *self.connection, &self.principal)?;
-        store.project_ledger()
+        self.store.project_ledger()
+    }
+
+    /// Test-support only: build the receiver over a pre-opened store so tests
+    /// can inject store failpoints while still enforcing store/principal
+    /// equality. Not available in the default production build.
+    #[cfg(feature = "test-support")]
+    pub fn new_with_store(
+        config: ChannelConfig,
+        clock: Box<dyn Clock>,
+        store: SqliteChannelStore<'conn>,
+        host: H,
+        authority: &'principal HostConnectionAuthority,
+        grant: &'principal HostCapabilityGrant,
+    ) -> Result<Self, ChannelError> {
+        let principal = ChannelPrincipal::from_authority_grant(authority, grant)?;
+        if config.extension_id != principal.extension_id() {
+            return Err(ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "channel config Extension does not match the granted Channel Extension"));
+        }
+        if config.module_id != principal.module_id() {
+            return Err(ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "channel config Module does not match the granted Module"));
+        }
+        let mut config = config;
+        config.transport_account = principal.account().to_string();
+        store.verify_owner_against(&principal)?;
+        Ok(Self { config, clock, store, host, authority, grant, principal })
     }
 
     /// Process one sealed, already-authenticated event.
     pub fn ingest_event(&mut self, event: &AuthenticatedChannelEvent) -> IngressOutcome {
-        // 1. Recompute/compare against the CURRENT sealed authority/grant.
+        // 1. Recompute/compare the full bound principal against the CURRENT
+        //    sealed authority/grant + config revision before any replay/ack.
         let principal = match ChannelPrincipal::from_authority_grant(self.authority, self.grant) {
             Ok(p) => p,
             Err(e) => return IngressOutcome::RejectedBeforeMutation { error: e },
         };
-        if !event.matches_current(&principal) {
+        if !event.matches_current(&principal, self.config.revision) {
             return IngressOutcome::RejectedBeforeMutation {
-                error: ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "the event is bound to a different authenticated principal, generation, incarnation, or graph"),
+                error: ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "the event is bound to a different authenticated principal, generation, incarnation, graph, or config"),
             };
         }
         // Enforce store/principal equality on every use.
@@ -189,46 +237,42 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
         //    durable intent: the Channel-local digest includes the ordered
         //    target Pages, so a same-key replay whose targets/order changed
         //    conflicts BEFORE any Core path is reached.
-        {
-            let mut store = SqliteChannelStore::new(&mut *self.connection, &principal).unwrap();
-            if let Ok(Some(intent)) = store.find_intent(&intent_key) {
-                if intent.state == IntentState::Rejected {
-                    let code = intent.rejected_code.unwrap_or_else(|| codes::INTERNAL.to_string());
+        if let Ok(Some(intent)) = self.store.find_intent(&intent_key) {
+            if intent.state == IntentState::Rejected {
+                let code = intent.rejected_code.clone().unwrap_or_else(|| codes::INTERNAL.to_string());
+                return IngressOutcome::RejectedBeforeMutation {
+                    error: ChannelError::new(code, false, ChannelOutcome::NotApplied, "the event key was already durably rejected"),
+                };
+            }
+            if intent.state == IntentState::Accepted {
+                let current_payload_digest = payload_digest_of(&intent.request_jcs);
+                let current_digest = channel_intent_digest(
+                    principal.account(), principal.extension_id(), principal.module_id(), principal.instance_id(),
+                    principal.generation(), principal.revision(), principal.graph_revision(), principal.graph_digest(),
+                    self.config.revision, &intent.external_event_id, intent.kind,
+                    intent.references_external_event_id.as_deref(), &self.config.target_page_ids,
+                    &current_payload_digest);
+                if current_digest != intent.digest {
                     return IngressOutcome::RejectedBeforeMutation {
-                        error: ChannelError::new(code, false, ChannelOutcome::NotApplied, "the event key was already durably rejected"),
+                        error: ChannelError::new(codes::OPERATION_CONFLICT, false, ChannelOutcome::NotApplied, "the same event key now carries different pages/content/relation"),
                     };
-                }
-                // If the intent is terminal or prepared, verify the current
-                // config's target pages still match the stored digest. A
-                // changed ordered target set changes the digest and conflicts.
-                if intent.state == IntentState::Accepted {
-                    let current_payload_digest = crate::host_adapter::payload_digest_of(&intent.request_jcs);
-                    let current_digest = crate::host_adapter::channel_intent_digest(
-                        &principal, self.config.revision, &inbound.external_message_id,
-                        inbound.event_kind, inbound.references_external_message_id.as_deref(),
-                        &self.config.target_page_ids, &current_payload_digest);
-                    if current_digest != intent.digest {
-                        return IngressOutcome::RejectedBeforeMutation {
-                            error: ChannelError::new(codes::OPERATION_CONFLICT, false, ChannelOutcome::NotApplied, "the same event key now carries different pages/content/relation"),
-                        };
-                    }
                 }
             }
         }
 
-        // 3. The accepted pipeline runs with a fresh adapter + store.
+        // 3. The accepted pipeline runs with a fresh adapter over the owned
+        //    store. Suppress a durable sent-transport echo before Host/Core
+        //    via the projection seeded with echo markers.
         let mut ledger = ChannelLedger::new();
         let outcome = {
-            let mut store = SqliteChannelStore::new(&mut *self.connection, &principal).unwrap();
-            // Project the ledger for process_event dedup.
-            if let Ok(projected) = store.project_ledger() {
+            if let Ok(projected) = self.store.project_ledger() {
                 ledger = projected;
             }
             let mut adapter = HostIngressCoreAdapter::new(
                 &mut self.host,
                 self.authority,
                 self.grant,
-                &mut store,
+                &mut self.store,
                 self.config.revision,
             );
             process_event(&self.config, &*self.clock, &mut ledger, &mut adapter, &inbound)
@@ -236,14 +280,13 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
 
         // 4. A replay must still revalidate the CURRENT authority/grant and
         //    status before acknowledging.
-        let outcome = match outcome {
+        match outcome {
             IngressOutcome::IdempotentReplay { block_id } => {
-                let mut store = SqliteChannelStore::new(&mut *self.connection, &principal).unwrap();
                 let mut adapter = HostIngressCoreAdapter::new(
                     &mut self.host,
                     self.authority,
                     self.grant,
-                    &mut store,
+                    &mut self.store,
                     self.config.revision,
                 );
                 match adapter.status_for_event(&inbound.external_message_id) {
@@ -265,50 +308,46 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
                 }
             }
             other => other,
-        };
-        outcome
+        }
     }
 
     /// Reconcile every durable `prepared` intent through `status` first, with
     /// NO event redelivery. Restores the terminal ledger/state exactly once.
     /// Returns the number of intents left unresolved.
     pub fn reconcile(&mut self) -> Result<usize, ChannelError> {
-        let principal = ChannelPrincipal::from_authority_grant(self.authority, self.grant)?;
-        let mut store = SqliteChannelStore::new(&mut *self.connection, &principal)?;
-        // Process pending intents one at a time: reopen the store for each,
-        // so the adapter+store borrow is fully released between iterations.
-        let pending_keys: Vec<String> = {
-            let mut store = SqliteChannelStore::new(&mut *self.connection, &principal)?;
-            store.list_pending()?.into_iter().map(|i| i.intent_key).collect()
-        };
+        let pending_keys: Vec<String> = self.store.list_pending()?.into_iter().map(|i| i.intent_key).collect();
         let mut remaining = 0;
         for intent_key in pending_keys {
-            let intent = {
-                let mut store = SqliteChannelStore::new(&mut *self.connection, &principal)?;
-                store.find_intent(&intent_key)?.unwrap_or_else(|| panic!("pending intent vanished"))
+            let intent = match self.store.find_intent(&intent_key)? {
+                Some(intent) => intent,
+                None => continue,
             };
-            let result = {
-                let mut store = SqliteChannelStore::new(&mut *self.connection, &principal)?;
+            let terminal = {
                 let mut adapter = HostIngressCoreAdapter::new(
                     &mut self.host,
                     self.authority,
                     self.grant,
-                    &mut store,
+                    &mut self.store,
                     self.config.revision,
                 );
                 match adapter.status_for_event(&intent.external_event_id) {
                     Ok(IngressStatusResult::Committed { commit }) => {
-                        adapter.commit_outcome(&intent_key, Some(&commit.block_id), None).map_err(|e| ChannelError::new(codes::INTERNAL, false, ChannelOutcome::NotApplied, format!("commit_outcome failed: {e:?}")))?;
-                        true
+                        match adapter.commit_outcome(&intent_key, Some(&commit.block_id), None) {
+                            Ok(()) => true,
+                            Err(_) => false,
+                        }
                     }
                     Ok(IngressStatusResult::Absent) => {
                         let request = rebuild_request(&intent, &self.config, &*self.clock)?;
-                        matches!(adapter.submit(&request), Ok(IngressSubmitReceipt::Committed { .. }))
+                        matches!(
+                            adapter.submit(&request),
+                            Ok(IngressSubmitReceipt::Committed { .. })
+                        )
                     }
                     Err(_) => false,
                 }
             };
-            if !result {
+            if !terminal {
                 remaining += 1;
             }
         }
