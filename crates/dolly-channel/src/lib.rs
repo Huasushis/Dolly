@@ -70,7 +70,7 @@ pub use outbound::{
 
 /// The single sealed production outbound consumer and its queue seam.
 pub use outbound_consumer::{ConsumerOutcome, OutboundConsumer};
-pub use outbound_queue::{BoundedPendingQueue, PendingQueueSlot};
+pub use outbound_queue::{OutboundQueueGate, PendingQueueSlot};
 
 pub use transport::{
     ChannelTransport, ScriptedTransport, TransportPiece, TransportPieceOutcome,
