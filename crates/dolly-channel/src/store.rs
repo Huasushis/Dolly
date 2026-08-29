@@ -25,7 +25,7 @@
 //! self-consistent semantic tamper (fields edited and the outer hash
 //! recomputed) fails closed.
 
-use dolly_canonical_json::Sha256Digest;
+use dolly_canonical_json::{CanonicalJsonValue, Sha256Digest};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::error::{ChannelError, ChannelOutcome, codes};
@@ -45,6 +45,10 @@ fn derive_draft_facts(intent: &ChannelIntent) -> Result<crate::host_adapter::Cha
     channel_facts_from_draft(&draft).map_err(|_| corrupted("channel intent draft metadata is malformed"))
 }
 
+/// The exact top-level fields the accepted draft builder emits.
+const DRAFT_ROOT_KEYS: &[&str] = &["schema", "parts", "actions", "metadata"];
+/// The exact metadata namespaces the accepted draft builder emits.
+const DRAFT_NAMESPACE_KEYS: &[&str] = &["org.dolly.channel"];
 /// The exact channel-metadata fields the accepted draft builder emits.
 const CHANNEL_METADATA_KEYS: &[&str] = &[
     "channel_id", "transport", "session_id", "external_conversation_id",
@@ -70,8 +74,29 @@ fn verify_draft_canonical(intent: &ChannelIntent) -> Result<(), ChannelError> {
     if recanon != intent.request_jcs.as_bytes() {
         return Err(corrupted("channel intent draft is not canonically encoded"));
     }
-    let channel = crate::host_adapter::parse_draft_metadata(&parsed)
-        .map_err(|_| corrupted("channel intent draft metadata is malformed"))?;
+    // Top-level key set is exactly the accepted draft fields.
+    let CanonicalJsonValue::Object(root) = &parsed else {
+        return Err(corrupted("channel intent draft is not an object"));
+    };
+    for key in root.iter().map(|(k, _)| k) {
+        if !DRAFT_ROOT_KEYS.contains(&key) {
+            return Err(corrupted("channel intent draft carries an unknown top-level field"));
+        }
+    }
+    // Metadata namespaces are exactly `org.dolly.channel`.
+    let Some(CanonicalJsonValue::Object(metadata)) = root.get("metadata") else {
+        return Err(corrupted("channel intent draft lacks a metadata object"));
+    };
+    for key in metadata.iter().map(|(k, _)| k) {
+        if !DRAFT_NAMESPACE_KEYS.contains(&key) {
+            return Err(corrupted("channel intent draft carries an unknown metadata namespace"));
+        }
+    }
+    // Channel metadata fields are exactly the accepted set (references is
+    // optional, the rest are required by the draft builder).
+    let Some(CanonicalJsonValue::Object(channel)) = metadata.get("org.dolly.channel") else {
+        return Err(corrupted("channel intent draft lacks the channel metadata namespace"));
+    };
     for key in channel.iter().map(|(k, _)| k) {
         if !CHANNEL_METADATA_KEYS.contains(&key) {
             return Err(corrupted("channel intent draft carries an unknown metadata field"));
@@ -187,6 +212,7 @@ pub(crate) struct StoreOwner {
     revision: i64,
     graph_revision: i64,
     graph_digest: String,
+    config_revision: i64,
     account: String,
 }
 
@@ -202,13 +228,22 @@ impl StoreOwner {
             "revision": self.revision,
             "graph_revision": self.graph_revision,
             "graph_digest": self.graph_digest,
+            "config_revision": self.config_revision,
             "account": self.account,
         })
     }
 }
 
-impl From<&ChannelPrincipal> for StoreOwner {
-    fn from(principal: &ChannelPrincipal) -> Self {
+struct StoreOwnerBinding {
+    principal: ChannelPrincipal,
+    config_revision: i64,
+}
+
+/// Derive the store owner from the sealed principal and the current config
+/// revision; the config fence is part of the store principal binding.
+impl From<StoreOwnerBinding> for StoreOwner {
+    fn from(binding: StoreOwnerBinding) -> Self {
+        let principal = &binding.principal;
         Self {
             owner: principal.owner().to_string(),
             extension_id: principal.extension_id().to_string(),
@@ -218,6 +253,7 @@ impl From<&ChannelPrincipal> for StoreOwner {
             revision: principal.revision(),
             graph_revision: principal.graph_revision(),
             graph_digest: principal.graph_digest().to_string(),
+            config_revision: binding.config_revision,
             account: principal.account().to_string(),
         }
     }
@@ -311,9 +347,13 @@ impl<'connection> SqliteChannelStore<'connection> {
     pub fn new(
         connection: &'connection mut Connection,
         principal: &ChannelPrincipal,
+        config_revision: i64,
     ) -> Result<Self, ChannelError> {
         gate_channel_store_schema(connection)?;
-        let owner = StoreOwner::from(principal);
+        if config_revision < 1 {
+            return Err(ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "store config revision must be positive"));
+        }
+        let owner = StoreOwner::from(StoreOwnerBinding { principal: principal.clone(), config_revision });
         let (owner_text, owner_digest) = owner_canonical(&owner)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(map_sqlite)?;
         let existing: Option<String> = transaction
@@ -354,9 +394,9 @@ impl<'connection> SqliteChannelStore<'connection> {
     /// facts). Used by the receiver test-support constructor to enforce
     /// store/principal equality.
     #[cfg(feature = "test-support")]
-    pub(crate) fn verify_owner_against(&self, principal: &ChannelPrincipal) -> Result<(), ChannelError> {
+    pub(crate) fn verify_owner_against(&self, principal: &ChannelPrincipal, config_revision: i64) -> Result<(), ChannelError> {
         self.verify_owner_meta()?;
-        let expected = StoreOwner::from(principal);
+        let expected = StoreOwner::from(StoreOwnerBinding { principal: principal.clone(), config_revision });
         if self.owner != expected {
             return Err(ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "channel store is bound to a different principal"));
         }
@@ -634,6 +674,9 @@ impl<'connection> SqliteChannelStore<'connection> {
         transport_event_id: &str,
     ) -> Result<(), ChannelError> {
         self.verify_owner_meta()?;
+        if config_revision != self.owner.config_revision {
+            return Err(ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "echo record config revision does not match the bound store principal"));
+        }
         let account = principal.account();
         let echo_key = format!("{account}\u{0}{transport_event_id}");
         let record = EchoRecord {
@@ -709,6 +752,9 @@ impl<'connection> SqliteChannelStore<'connection> {
             return Err(corrupted("channel echo marker derived key mismatch"));
         }
         // Complete sealed principal equality against the bound store owner.
+        if record.config_revision != self.owner.config_revision {
+            return Err(corrupted("channel echo marker config revision does not match the bound store principal"));
+        }
         if record.owner != self.owner.owner
             || record.extension_id != self.owner.extension_id
             || record.module_id != self.owner.module_id
@@ -718,7 +764,6 @@ impl<'connection> SqliteChannelStore<'connection> {
             || record.graph_revision != self.owner.graph_revision
             || record.graph_digest != self.owner.graph_digest
             || record.account != self.owner.account
-            || record.config_revision < 1
         {
             return Err(corrupted("channel echo marker owner/meta does not match the bound principal"));
         }
@@ -893,11 +938,11 @@ mod tests {
     fn store_binds_principal_and_rejects_cross_principal_reuse() {
         let mut connection = connection();
         {
-            let store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
+            let store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
             drop(store);
         }
         let other = ChannelPrincipal::from_parts("owner-2", "org.dolly.channel", "receiver", "worker-1", 1, 1, 1, "digest-g");
-        let error = SqliteChannelStore::new(&mut connection, &other).expect_err("cross-principal reuse");
+        let error = SqliteChannelStore::new(&mut connection, &other, 1).expect_err("cross-principal reuse");
         assert_eq!(error.code, codes::AUTHENTICATION_FAILED);
     }
 
@@ -907,7 +952,7 @@ mod tests {
         let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
         let key = crate::ids::inbound_ingress_key(&account, "msg-1");
         {
-            let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
             store.write_prepared(&valid_intent(&key, &account, "msg-1")).unwrap();
             // Sanity: the valid record reads back.
             assert!(store.find_intent(&key).unwrap().is_some());
@@ -915,7 +960,7 @@ mod tests {
         // Semantic tamper: change the ordered target pages AND recompute the
         // outer hash; verify_intent must still fail (operation digest match).
         {
-            let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
             let mut intent = store.find_intent(&key).unwrap().unwrap();
             intent.target_page_ids = vec!["page-b".to_string()];
             let canonical = intent.canonical_string().unwrap();
@@ -927,7 +972,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
+        let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
         let error = store.find_intent(&key).expect_err("semantic tamper must fail closed");
         assert_eq!(error.code, codes::LEDGER_CORRUPT);
     }
@@ -941,12 +986,12 @@ mod tests {
         let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
         let key = crate::ids::inbound_ingress_key(&account, "msg-1");
         {
-            let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
             store.write_prepared(&valid_intent(&key, &account, "msg-1")).unwrap();
         }
         // Rewrite the draft metadata to a different external message id.
         let intent = {
-            let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
             let mut i = store.find_intent(&key).unwrap().unwrap();
             i.request_jcs = draft("msg-9");
             i
@@ -958,7 +1003,7 @@ mod tests {
             rusqlite::params![digest, canonical.as_bytes(), key],
         ).unwrap();
         let error = {
-            let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
             store.find_intent(&key).expect_err("metadata tamper must fail closed")
         };
         assert_eq!(error.code, codes::LEDGER_CORRUPT);
@@ -969,7 +1014,7 @@ mod tests {
         let mut connection = connection();
         let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
         let key = crate::ids::inbound_ingress_key(&account, "msg-1");
-        let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
+        let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
         let intent = valid_intent(&key, &account, "msg-1");
         store.write_prepared(&intent).unwrap();
         store.commit_outcome(&key, Some("block-1"), None).unwrap();
@@ -990,14 +1035,14 @@ mod tests {
         let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
         let key = crate::ids::inbound_ingress_key(&account, "msg-1");
         {
-            let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
             store.write_prepared(&valid_intent(&key, &account, "msg-1")).unwrap();
         }
         // Rewrite the stored draft with the SAME canonical value but serialized
         // in a noncanonical key order (object keys unsorted), and recompute the
         // outer record hash: strict draft verification must fail closed.
         let mut intent = {
-            let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
             let mut i = store.find_intent(&key).unwrap().unwrap();
             let parsed: serde_json::Value = serde_json::from_str(&i.request_jcs).unwrap();
         let obj = parsed.as_object().unwrap();
@@ -1017,7 +1062,7 @@ mod tests {
             rusqlite::params![digest, canonical.as_bytes(), key],
         ).unwrap();
         let error = {
-            let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
             store.find_intent(&key).expect_err("noncanonical draft must fail closed")
         };
         assert_eq!(error.code, codes::LEDGER_CORRUPT);
@@ -1029,13 +1074,13 @@ mod tests {
         let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
         let key = crate::ids::inbound_ingress_key(&account, "msg-1");
         {
-            let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
             store.write_prepared(&valid_intent(&key, &account, "msg-1")).unwrap();
         }
         // Inject an unknown field into the channel metadata and recompute the
         // outer hash: strict metadata key-set verification must fail closed.
         let intent = {
-            let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
             let mut i = store.find_intent(&key).unwrap().unwrap();
             let mut draft: serde_json::Value = serde_json::from_str(&i.request_jcs).unwrap();
             draft["metadata"]["org.dolly.channel"]["forged"] = serde_json::json!(1);
@@ -1050,8 +1095,68 @@ mod tests {
             rusqlite::params![digest, canonical.as_bytes(), key],
         ).unwrap();
         let error = {
-            let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
             store.find_intent(&key).expect_err("unknown draft field must fail closed")
+        };
+        assert_eq!(error.code, codes::LEDGER_CORRUPT);
+    }
+
+    #[test]
+    fn unknown_top_level_draft_field_fails_closed() {
+        let mut connection = connection();
+        let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
+        let key = crate::ids::inbound_ingress_key(&account, "msg-1");
+        {
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+            store.write_prepared(&valid_intent(&key, &account, "msg-1")).unwrap();
+        }
+        let intent = {
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+            let mut i = store.find_intent(&key).unwrap().unwrap();
+            let mut draft: serde_json::Value = serde_json::from_str(&i.request_jcs).unwrap();
+            draft["evil_top"] = serde_json::json!(1);
+            i.request_jcs = draft.to_string();
+            i
+        };
+        let canonical = intent.canonical_string().unwrap();
+        let digest = Sha256Digest::compute(canonical.as_bytes()).to_canonical_string();
+        connection.execute(
+            "UPDATE channel_intent SET record_digest = ?1, canonical_jcs = ?2 WHERE intent_key = ?3",
+            rusqlite::params![digest, canonical.as_bytes(), key],
+        ).unwrap();
+        let error = {
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+            store.find_intent(&key).expect_err("unknown top-level draft field must fail closed")
+        };
+        assert_eq!(error.code, codes::LEDGER_CORRUPT);
+    }
+
+    #[test]
+    fn unknown_metadata_namespace_fails_closed() {
+        let mut connection = connection();
+        let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
+        let key = crate::ids::inbound_ingress_key(&account, "msg-1");
+        {
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+            store.write_prepared(&valid_intent(&key, &account, "msg-1")).unwrap();
+        }
+        let intent = {
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+            let mut i = store.find_intent(&key).unwrap().unwrap();
+            let mut draft: serde_json::Value = serde_json::from_str(&i.request_jcs).unwrap();
+            draft["metadata"]["org.evil.namespace"] = serde_json::json!({"x":1});
+            i.request_jcs = draft.to_string();
+            i
+        };
+        let canonical = intent.canonical_string().unwrap();
+        let digest = Sha256Digest::compute(canonical.as_bytes()).to_canonical_string();
+        connection.execute(
+            "UPDATE channel_intent SET record_digest = ?1, canonical_jcs = ?2 WHERE intent_key = ?3",
+            rusqlite::params![digest, canonical.as_bytes(), key],
+        ).unwrap();
+        let error = {
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+            store.find_intent(&key).expect_err("unknown metadata namespace must fail closed")
         };
         assert_eq!(error.code, codes::LEDGER_CORRUPT);
     }
@@ -1061,12 +1166,12 @@ mod tests {
         let mut connection = connection();
         let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
         {
-            let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
             store.record_echo(&principal(), 1, "transport-msg-1").unwrap();
             assert!(store.is_echo(&account, "transport-msg-1").unwrap());
         }
         {
-            let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
             assert!(store.is_echo(&account, "transport-msg-1").unwrap());
             assert!(!store.is_echo(&account, "other").unwrap());
             let ledger = store.project_ledger().unwrap();
@@ -1089,7 +1194,7 @@ mod tests {
                 "UPDATE channel_echo SET record_digest = ?1, canonical_jcs = ?2 WHERE echo_key = ?3",
                 rusqlite::params![digest, forged.as_bytes(), echo_key],
             ).unwrap();
-            let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
             let err = store.project_ledger().expect_err("forged echo must fail closed");
             assert_eq!(err.code, codes::LEDGER_CORRUPT);
         }
