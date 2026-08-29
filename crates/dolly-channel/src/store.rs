@@ -244,6 +244,28 @@ pub enum OutboundPreparedOutcome {
     },
 }
 
+/// The result of the atomic Prepared/Queued -> Dispatched CAS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchClaim {
+    /// This caller won the CAS: the row is now `Dispatched` and this caller
+    /// is the ONLY one authorized to call the transport. The returned record
+    /// is the verified durable Dispatched row.
+    Won(DurableOutboundRecord),
+    /// Another concurrent claimant already won the CAS (or the row changed
+    /// between load and CAS). This caller MUST NOT call the transport.
+    LostRace,
+    /// The row was already `Dispatched` by a prior pass (crash re-entry after
+    /// the marker but before the transport). This caller MUST NOT transport
+    /// and MUST status-first reconcile.
+    AlreadyDispatched,
+    /// The row is already terminal (a prior pass settled it). The frozen
+    /// result MUST be returned with zero re-dispatch.
+    AlreadyTerminal {
+        state: OutboundState,
+        result_jcs: Option<String>,
+    },
+}
+
 /// The strict canonical durable outbound record: the complete sealed
 /// principal fence facts, the canonical committed Action bytes, the
 /// authority-bound operation digest, and the accepted [`OutboundEntry`]
@@ -975,34 +997,67 @@ impl<'connection> SqliteChannelStore<'connection> {
         Ok(Some(record))
     }
 
-    fn write_outbound_row(
-        transaction: &rusqlite::Transaction<'_>,
+    /// Serialize one outbound record to canonical bytes + its record digest.
+    fn outbound_record_bytes(
         record: &DurableOutboundRecord,
-    ) -> Result<(), ChannelError> {
+    ) -> Result<(Vec<u8>, String), ChannelError> {
         let bytes = dolly_canonical_json::canonicalize(record)
             .map_err(|e| corrupted(&format!("channel outbound record failed canonicalization: {e}")))?
             .0
             .as_bytes()
             .to_vec();
         let digest = Sha256Digest::compute(&bytes).to_canonical_string();
-        transaction
+        Ok((bytes, digest))
+    }
+
+    /// Atomically INSERT one outbound row. Returns whether the row was newly
+    /// inserted (`true`) or a row already existed under the key (`false`).
+    /// Never upserts: an existing key is never overwritten by this call.
+    fn insert_outbound_row(
+        transaction: &rusqlite::Transaction<'_>,
+        record: &DurableOutboundRecord,
+    ) -> Result<bool, ChannelError> {
+        let (bytes, digest) = Self::outbound_record_bytes(record)?;
+        let inserted = transaction
             .execute(
                 "INSERT INTO channel_outbound (outbound_key, record_digest, canonical_jcs) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(outbound_key) DO UPDATE SET record_digest = ?2, canonical_jcs = ?3",
+                 ON CONFLICT(outbound_key) DO NOTHING",
                 params![record.outbound_key, digest, bytes.as_slice()],
             )
             .map_err(map_sqlite)?;
+        Ok(inserted == 1)
+    }
+
+    /// Atomically UPDATE one outbound row's canonical bytes. Used only by the
+    /// dispatch CAS winner and the terminal+echo commit; both load+verify the
+    /// existing row before calling this.
+    fn update_outbound_row(
+        transaction: &rusqlite::Transaction<'_>,
+        record: &DurableOutboundRecord,
+    ) -> Result<(), ChannelError> {
+        let (bytes, digest) = Self::outbound_record_bytes(record)?;
+        let changed = transaction
+            .execute(
+                "UPDATE channel_outbound SET record_digest = ?2, canonical_jcs = ?3 WHERE outbound_key = ?1",
+                params![record.outbound_key, digest, bytes.as_slice()],
+            )
+            .map_err(map_sqlite)?;
+        if changed == 0 {
+            return Err(corrupted("channel outbound row vanished during update"));
+        }
         Ok(())
     }
 
-    /// Durably persist the `Prepared` outbound record for one committed
-    /// targeted Action BEFORE any queue admission or transport call. The
-    /// same key + operation digest replays idempotently (a terminal row
-    /// returns its stored result with zero re-dispatch, a non-terminal row
-    /// is never overwritten or downgraded); the same key with a different
-    /// digest (different target/content/config) conflicts before enqueue and
-    /// changes nothing.
-    pub fn write_prepared_outbound(
+    /// Atomically insert the exact action key + operation digest as a
+    /// `Prepared` row BEFORE any queue admission or transport call. One
+    /// SQLite transaction: `INSERT ... ON CONFLICT DO NOTHING` — a fresh key
+    /// inserts as Prepared; an existing key does NOT insert and is then
+    /// loaded+verified for replay/conflict. The same key + same digest
+    /// replays idempotently (a terminal row returns its frozen result with
+    /// zero re-dispatch, a non-terminal row is returned unchanged and never
+    /// downgraded); the same key with a different digest (different
+    /// target/content/config) conflicts before enqueue and changes nothing.
+    pub fn insert_prepared_or_replay(
         &mut self,
         record: &DurableOutboundRecord,
     ) -> Result<OutboundPreparedOutcome, ChannelError> {
@@ -1015,32 +1070,53 @@ impl<'connection> SqliteChannelStore<'connection> {
             return Err(corrupted("channel outbound record discriminator mismatch"));
         }
         if record.entry.state != OutboundState::Prepared {
-            return Err(corrupted("write_prepared_outbound requires a prepared outbound record"));
+            return Err(corrupted("insert_prepared_or_replay requires a prepared outbound record"));
         }
-        if let Some(existing) = self.load_outbound(&record.outbound_key)? {
-            if existing.digest != record.digest {
-                return Err(ChannelError::new(
-                    codes::OPERATION_CONFLICT,
-                    false,
-                    ChannelOutcome::NotApplied,
-                    "durable outbound key already carries a different operation digest (different target/content/config)",
-                ));
-            }
-            if existing.entry.state.is_terminal() {
-                let result_jcs = existing.entry.result_jcs.clone().ok_or_else(|| {
-                    corrupted("terminal outbound record has no frozen result")
-                })?;
-                return Ok(OutboundPreparedOutcome::ReplayTerminal {
-                    state: existing.entry.state,
-                    result_jcs,
-                });
-            }
-            return Ok(OutboundPreparedOutcome::PreparedExisting);
+        let mut transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(map_sqlite)?;
+        let inserted = Self::insert_outbound_row(&transaction, record)?;
+        if inserted {
+            transaction.commit().map_err(map_sqlite)?;
+            return Ok(OutboundPreparedOutcome::Prepared);
         }
-        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(map_sqlite)?;
-        Self::write_outbound_row(&transaction, record)?;
+        // A row already exists under this key: read it from the same
+        // transaction (the row cannot change between the failed insert and
+        // this read under the Immediate lock), then commit.
+        let row: Option<(String, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT record_digest, canonical_jcs FROM channel_outbound WHERE outbound_key = ?1",
+                [&record.outbound_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(map_sqlite)?;
         transaction.commit().map_err(map_sqlite)?;
-        Ok(OutboundPreparedOutcome::Prepared)
+        let (digest, jcs) = row.ok_or_else(|| corrupted("outbound row existed at insert but vanished on load"))?;
+        let computed = Sha256Digest::compute(&jcs).to_canonical_string();
+        if computed != digest {
+            return Err(corrupted("channel outbound stored digest mismatch (tampered)"));
+        }
+        let text = std::str::from_utf8(&jcs).map_err(|_| corrupted("channel outbound record is not UTF-8"))?;
+        let existing: DurableOutboundRecord = serde_json::from_str(text)
+            .map_err(|_| corrupted("channel outbound record is not a strict canonical record"))?;
+        Self::verify_outbound_record(self.connection, &record.outbound_key, &existing, &self.owner)?;
+        if existing.digest != record.digest {
+            return Err(ChannelError::new(
+                codes::OPERATION_CONFLICT,
+                false,
+                ChannelOutcome::NotApplied,
+                "durable outbound key already carries a different operation digest (different target/content/config)",
+            ));
+        }
+        if existing.entry.state.is_terminal() {
+            let result_jcs = existing.entry.result_jcs.clone().ok_or_else(|| {
+                corrupted("terminal outbound record has no frozen result")
+            })?;
+            return Ok(OutboundPreparedOutcome::ReplayTerminal {
+                state: existing.entry.state,
+                result_jcs,
+            });
+        }
+        Ok(OutboundPreparedOutcome::PreparedExisting)
     }
 
     /// The verified durable outbound record for one action key.
@@ -1071,20 +1147,19 @@ impl<'connection> SqliteChannelStore<'connection> {
         Ok(pending)
     }
 
-    /// Atomically claim the dispatch of one Prepared outbound row.
-    /// `pre_send_cas = true` transitions `Prepared` -> `Dispatched` ONLY when
-    /// the row is still `Prepared` (so a concurrent claimant cannot double-
-    /// authorize the same send); this marker MUST be durable before transport
-    /// initiation for transports without idempotency-key support. Returns
-    /// whether this call performed the transition. `pre_send_cas = false`
-    /// (idempotent transports) records the durable marker after the send;
-    /// the row then must never be re-dispatched.
-    pub(crate) fn mark_outbound_dispatched(
+    /// Atomically claim the dispatch of one outbound row with a single
+    /// SQLite compare-and-swap: the UPDATE only fires when the durable row's
+    /// current record_digest still equals the loaded+verified digest (which
+    /// encodes the Prepared/Queued state). Exactly one concurrent claimant
+    /// wins (rows-changed == 1); all others see 0 and MUST NOT call the
+    /// transport. The CAS winner transitions to `Dispatched` BEFORE transport
+    /// initiation; a CAS failure (already dispatched, terminal, or missing)
+    /// means zero transport.
+    pub(crate) fn claim_dispatch(
         &mut self,
         outbound_key: &str,
         now: &str,
-        pre_send_cas: bool,
-    ) -> Result<bool, ChannelError> {
+    ) -> Result<DispatchClaim, ChannelError> {
         if self.fail_mark_dispatched > 0 {
             self.fail_mark_dispatched -= 1;
             return Err(ChannelError::new(codes::INTERNAL, false, ChannelOutcome::NotApplied, "injected dispatched-marker write failure"));
@@ -1092,28 +1167,55 @@ impl<'connection> SqliteChannelStore<'connection> {
         self.verify_owner_meta()?;
         let mut record = self
             .load_outbound(outbound_key)?
-            .ok_or_else(|| corrupted("outbound row missing for dispatched marker"))?;
+            .ok_or_else(|| corrupted("outbound row missing for dispatch CAS"))?;
         if record.entry.state.is_terminal() {
-            return Ok(false);
-        }
-        if pre_send_cas && record.entry.state != OutboundState::Prepared {
-            // Another claimant already dispatched; this caller must not.
-            return Ok(false);
-        }
-        if record.entry.state != OutboundState::Dispatched {
-            record.entry.state = OutboundState::Dispatched;
-            record.entry.dispatched_at = Some(now.to_string());
-            record.entry.attempts.push(AttemptRecord {
-                at: now.to_string(),
-                kind: "dispatch".to_string(),
-                detail_digest: Sha256Digest::compute(if pre_send_cas { b"pre-dispatch" } else { b"post-idempotent-send" })
-                    .to_canonical_string(),
+            return Ok(DispatchClaim::AlreadyTerminal {
+                state: record.entry.state,
+                result_jcs: record.entry.result_jcs.clone(),
             });
-            let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(map_sqlite)?;
-            Self::write_outbound_row(&transaction, &record)?;
-            transaction.commit().map_err(map_sqlite)?;
         }
-        Ok(true)
+        if record.entry.state == OutboundState::Dispatched {
+            return Ok(DispatchClaim::AlreadyDispatched);
+        }
+        // Build the Dispatched record (recomputed canonical bytes + digest
+        // from the loaded+verified durable truth).
+        record.entry.state = OutboundState::Dispatched;
+        record.entry.dispatched_at = Some(now.to_string());
+        record.entry.attempts.push(AttemptRecord {
+            at: now.to_string(),
+            kind: "dispatch".to_string(),
+            detail_digest: Sha256Digest::compute(b"dispatch-cas").to_canonical_string(),
+        });
+        let (bytes, digest) = Self::outbound_record_bytes(&record)?;
+        // Single CAS in one Immediate transaction: the UPDATE only fires
+        // when the durable row's current record_digest still equals the
+        // digest we loaded+verified above (which encodes the Prepared/Queued
+        // state). SQLite serializes the transaction, so exactly one
+        // concurrent claimant sees rows-changed == 1; all others see 0 and
+        // MUST NOT transport. A CAS failure means zero transport.
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite)?;
+        let prior_digest: String = transaction
+            .query_row(
+                "SELECT record_digest FROM channel_outbound WHERE outbound_key = ?1",
+                [outbound_key],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite)?;
+        let changed = transaction
+            .execute(
+                "UPDATE channel_outbound SET record_digest = ?2, canonical_jcs = ?3
+                 WHERE outbound_key = ?1 AND record_digest = ?4",
+                params![outbound_key, digest, bytes.as_slice(), prior_digest],
+            )
+            .map_err(map_sqlite)?;
+        transaction.commit().map_err(map_sqlite)?;
+        if changed == 0 {
+            return Ok(DispatchClaim::LostRace);
+        }
+        Ok(DispatchClaim::Won(record))
     }
 
     /// Atomically commit the terminal outbound record AND every sent-transport
@@ -1138,7 +1240,7 @@ impl<'connection> SqliteChannelStore<'connection> {
             return Err(corrupted("commit_outbound_terminal requires a terminal outbound record"));
         }
         let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(map_sqlite)?;
-        Self::write_outbound_row(&transaction, record)?;
+        Self::update_outbound_row(&transaction, record)?;
         for piece in record.entry.pieces.iter().filter_map(|p| match &p.outcome {
             Some(PieceOutcome::Confirmed { transport_message_id }) => Some(transport_message_id),
             _ => None,
@@ -2038,20 +2140,20 @@ mod tests {
         let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
         let first = valid_outbound_record(action_id, "session-main", "receiver", "Hello.");
         assert_eq!(
-            store.write_prepared_outbound(&first).unwrap(),
+            store.insert_prepared_or_replay(&first).unwrap(),
             OutboundPreparedOutcome::Prepared,
             "a fresh key+digest persists as Prepared"
         );
         // Same key + digest replays with nothing changed and no downgrade.
         let replay = valid_outbound_record(action_id, "session-main", "receiver", "Hello.");
         assert_eq!(
-            store.write_prepared_outbound(&replay).unwrap(),
+            store.insert_prepared_or_replay(&replay).unwrap(),
             OutboundPreparedOutcome::PreparedExisting,
             "same key+digest is idempotent"
         );
         // Same key + different content (different text) conflicts before enqueue.
         let changed = valid_outbound_record(action_id, "session-main", "receiver", "Different.");
-        let error = store.write_prepared_outbound(&changed).expect_err("different content must conflict");
+        let error = store.insert_prepared_or_replay(&changed).expect_err("different content must conflict");
         assert_eq!(error.code, codes::OPERATION_CONFLICT);
         // The durable row is unchanged by the conflict attempt.
         let loaded = store.find_outbound(action_id).unwrap().expect("durable row");
@@ -2073,7 +2175,7 @@ mod tests {
         let record = valid_outbound_record(action_id, "session-main", "receiver", "Hello.");
         {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-            store.write_prepared_outbound(&record).unwrap();
+            store.insert_prepared_or_replay(&record).unwrap();
         }
         // Re-hash a tampered canonical record: change the targeted module and
         // recompute the outer hash. Full verification must fail closed.
@@ -2101,7 +2203,7 @@ mod tests {
         let record = valid_outbound_record(action_id, "session-main", "receiver", "Hello.");
         let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
         store.inject_write_prepared_outbound_failure(1);
-        let err = store.write_prepared_outbound(&record).expect_err("injected write failure");
+        let err = store.insert_prepared_or_replay(&record).expect_err("injected write failure");
         assert_eq!(err.code, codes::INTERNAL);
         assert!(store.find_outbound(action_id).unwrap().is_none(), "no durable row after a failed pre-admission write");
     }

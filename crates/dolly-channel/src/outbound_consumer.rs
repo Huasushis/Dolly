@@ -32,7 +32,7 @@ use crate::outbound::{
 use crate::outbound_committed::{CommittedSendAction, committed_send_from_block};
 use crate::outbound_queue::{BoundedPendingQueue, PendingQueueSlot};
 use crate::principal::ChannelPrincipal;
-use crate::store::{DurableOutboundRecord, OutboundPreparedOutcome, SqliteChannelStore};
+use crate::store::{DispatchClaim, DurableOutboundRecord, OutboundPreparedOutcome, SqliteChannelStore};
 
 /// The typed shared registration seam for the sole integrator: the ONLY
 /// source of committed Blocks for the outbound consumer. No transport,
@@ -360,13 +360,16 @@ impl<'connection, 'principal, S: CommittedActionSource>
                     })
                 }
             };
-        // 1. Durable Prepared/idempotency state before any admission or
-        //    transport: same key+digest replays the stored result with zero
-        //    re-dispatch; same key + different target/content/config
-        //    conflicts before enqueue.
+        // 1. Atomic insert/replay/conflict: the exact action key + operation
+        //    digest is durably persisted as `Prepared` in one SQLite
+        //    transaction (INSERT ... ON CONFLICT DO NOTHING). A fresh key
+        //    inserts; an existing key with the same digest replays (terminal
+        //    returns the frozen result with zero re-dispatch, non-terminal is
+        //    returned unchanged); a different digest conflicts before enqueue
+        //    and changes nothing.
         let idempotency_supported = self.transport.idempotency_supported();
         let prepared = self.build_prepared_record(&committed, idempotency_supported);
-        match self.store.write_prepared_outbound(&prepared) {
+        match self.store.insert_prepared_or_replay(&prepared) {
             Ok(OutboundPreparedOutcome::ReplayTerminal { state, result_jcs }) => {
                 return Ok(ConsumerOutcome::Terminal {
                     action_id: committed.action.action_id.clone(),
@@ -384,22 +387,7 @@ impl<'connection, 'principal, S: CommittedActionSource>
             Err(error) => return Err(error),
         }
 
-        // 2. Dispatch decision from the surviving durable row: ONLY a row
-        //    that never recorded a dispatch attempt may reach the transport
-        //    (a Prepared row that was never dispatched was never sent).
-        let durable = self
-            .store
-            .find_outbound(&committed.action.action_id)?
-            .expect("durable outbound row");
-        let never_dispatched = durable.entry.state == OutboundState::Prepared
-            && !durable.entry.attempts.iter().any(|a| a.kind == "dispatch");
-        if !never_dispatched {
-            return Ok(ConsumerOutcome::Pending {
-                action_id: committed.action.action_id.clone(),
-            });
-        }
-
-        // 3. Bounded queue admission (fair, caller deadline, no leak).
+        // 2. Bounded queue admission (fair, caller deadline, no leak).
         let session_key = format!("{}\u{0}{}", self.principal.account(), committed.session_id);
         let slot = match self.queue.admit(&*self.clock, &session_key, caller_deadline) {
             Ok(slot) => slot,
@@ -411,104 +399,109 @@ impl<'connection, 'principal, S: CommittedActionSource>
             }
         };
 
-        // 4. Ensure the in-memory ledger row exists as Prepared.
-        if ledger.outbound_entry(&committed.action.action_id).is_none() {
-            let entry = build_prepared_entry(
-                &self.config,
-                &*self.clock,
-                &committed.action,
-                &committed.session_id,
-                committed.pieces.clone(),
-                idempotency_supported,
-            );
-            if ledger
-                .insert_outbound(entry, self.config.ledger_bounds.outbound_max_entries)
-                .is_err()
-            {
-                drop(slot);
-                return Err(ChannelError::new(
-                    codes::LEDGER_FULL,
-                    false,
-                    ChannelOutcome::NotApplied,
-                    "outbound ledger is at capacity",
-                ));
-            }
-        }
-
+        // 3. Atomic dispatch CAS: exactly one claimant wins the
+        //    Prepared/Queued -> Dispatched transition. The CAS winner is the
+        //    ONLY one authorized to call the transport; all others
+        //    (AlreadyDispatched, LostRace) MUST NOT transport and return
+        //    Pending for status-first reconciliation. A CAS failure means
+        //    zero transport.
         let now = self.clock.now().as_str().to_string();
-        // 5. Durable dispatched marker BEFORE transport initiation for
-        //    transports without idempotency-key support (atomic claim).
-        if !idempotency_supported
-            && !self
-                .store
-                .mark_outbound_dispatched(&committed.action.action_id, &now, true)?
-        {
-            drop(slot);
-            return Ok(ConsumerOutcome::Pending {
-                action_id: committed.action.action_id.clone(),
-            });
-        }
-
-        // 6. Transport + settle.
-        let result = transport_and_settle(
-            &self.config,
-            ledger,
-            &mut *self.transport,
-            &committed.action.action_id,
-            &now,
-            idempotency_supported,
-        );
-        match result {
-            SendDispatchResult::Terminal { state, result } => {
-                // 7. Durable terminal result + echo markers ATOMICALLY. For
-                //    idempotent transports a durable dispatched marker after
-                //    send is redundant here: the terminal commit supersedes
-                //    the Prepared row, and a crash between the send and this
-                //    commit leaves `Prepared` so restart re-dispatches under
-                //    the same idempotency key (provider de-duplicates).
-                let entry = ledger
-                    .outbound_entry(&committed.action.action_id)
-                    .cloned()
-                    .expect("settled outbound row");
-                let record = self.build_terminal_record(&committed, &entry);
-                if let Err(error) = self.store.commit_outbound_terminal(&record) {
-                    drop(slot);
-                    return Err(error);
+        let dispatch_claim = self.store.claim_dispatch(&committed.action.action_id, &now);
+        match dispatch_claim {
+            Ok(DispatchClaim::Won(_won_record)) => {
+                // This caller won the CAS: drive the transport + settle.
+                // Ensure the in-memory ledger row exists for settle.
+                if ledger.outbound_entry(&committed.action.action_id).is_none() {
+                    let entry = build_prepared_entry(
+                        &self.config,
+                        &*self.clock,
+                        &committed.action,
+                        &committed.session_id,
+                        committed.pieces.clone(),
+                        idempotency_supported,
+                    );
+                    let _ = ledger.insert_outbound(
+                        entry,
+                        self.config.ledger_bounds.outbound_max_entries,
+                    );
                 }
-                drop(slot);
-                let result_jcs = dolly_canonical_json::canonicalize(&result)
-                    .map(|(bytes, _)| String::from_utf8(bytes.as_bytes().to_vec()))
-                    .unwrap_or(Ok("canonicalize-failed".to_string()))
-                    .unwrap_or_else(|_| "canonicalize-failed".to_string());
-                Ok(ConsumerOutcome::Terminal {
-                    action_id: committed.action.action_id.clone(),
-                    state,
-                    result_jcs,
-                })
+                let result = transport_and_settle(
+                    &self.config,
+                    ledger,
+                    &mut *self.transport,
+                    &committed.action.action_id,
+                    &now,
+                    idempotency_supported,
+                );
+                match result {
+                    SendDispatchResult::Terminal { state, result } => {
+                        // 4. Atomic terminal+echo commit: the frozen result
+                        //    and confirmed transport IDs become durable
+                        //    echo-suppression facts in ONE transaction. A
+                        //    failure leaves the row Dispatched (uncertain),
+                        //    never a terminal-without-marker inconsistency.
+                        let entry = ledger
+                            .outbound_entry(&committed.action.action_id)
+                            .cloned()
+                            .expect("settled outbound row");
+                        let record = self.build_terminal_record(&committed, &entry);
+                        if let Err(error) = self.store.commit_outbound_terminal(&record) {
+                            drop(slot);
+                            return Err(error);
+                        }
+                        drop(slot);
+                        let result_jcs = dolly_canonical_json::canonicalize(&result)
+                            .map(|(bytes, _)| String::from_utf8(bytes.as_bytes().to_vec()))
+                            .unwrap_or(Ok("canonicalize-failed".to_string()))
+                            .unwrap_or_else(|_| "canonicalize-failed".to_string());
+                        Ok(ConsumerOutcome::Terminal {
+                            action_id: committed.action.action_id.clone(),
+                            state,
+                            result_jcs,
+                        })
+                    }
+                    SendDispatchResult::DispatchedPending => {
+                        // The transport response was lost; the durable
+                        // Dispatched marker is already recorded by the CAS.
+                        // Hold the slot so the pending bound is honored until
+                        // status-first recovery.
+                        self.pending_slots
+                            .insert(committed.action.action_id.clone(), slot);
+                        Ok(ConsumerOutcome::Pending {
+                            action_id: committed.action.action_id.clone(),
+                        })
+                    }
+                    SendDispatchResult::Rejected(error) => {
+                        drop(slot);
+                        Err(ChannelError::new(
+                            error.code,
+                            error.retryable,
+                            error.outcome,
+                            format!("outbound dispatch failed internally: {}", error.message),
+                        ))
+                    }
+                }
             }
-            SendDispatchResult::DispatchedPending => {
-                // 7'. The transport response was lost; the durable dispatched
-                //     marker is recorded (idempotent transports) and the slot
-                //     is held so the pending bound is honored until recovery.
-                if idempotency_supported {
-                    let _ = self
-                        .store
-                        .mark_outbound_dispatched(&committed.action.action_id, &now, false);
-                }
-                self.pending_slots
-                    .insert(committed.action.action_id.clone(), slot);
+            Ok(DispatchClaim::AlreadyDispatched) | Ok(DispatchClaim::LostRace) => {
+                // Another claimant won the CAS or the row was already
+                // dispatched: zero transport, return Pending for
+                // status-first reconciliation.
+                drop(slot);
                 Ok(ConsumerOutcome::Pending {
                     action_id: committed.action.action_id.clone(),
                 })
             }
-            SendDispatchResult::Rejected(error) => {
+            Ok(DispatchClaim::AlreadyTerminal { state, result_jcs }) => {
                 drop(slot);
-                Err(ChannelError::new(
-                    error.code,
-                    error.retryable,
-                    error.outcome,
-                    format!("outbound dispatch failed internally: {}", error.message),
-                ))
+                Ok(ConsumerOutcome::Terminal {
+                    action_id: committed.action.action_id.clone(),
+                    state,
+                    result_jcs: result_jcs.unwrap_or_default(),
+                })
+            }
+            Err(error) => {
+                drop(slot);
+                Err(error)
             }
         }
     }

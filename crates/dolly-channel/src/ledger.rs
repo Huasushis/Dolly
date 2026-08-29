@@ -124,11 +124,13 @@ pub struct InboundEntry {
 // ---------------------------------------------------------------------------
 
 /// Outbound ledger states. `confirmed`, `partial`, `failed`, and `unknown`
-/// are terminal; `prepared` and `dispatched` are recoverable crash states.
+/// are terminal; `prepared`, `queued`, and `dispatched` are recoverable crash
+/// states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutboundState {
     Prepared,
+    Queued,
     Dispatched,
     Confirmed,
     Partial,
@@ -140,6 +142,7 @@ impl OutboundState {
     pub fn as_str(self) -> &'static str {
         match self {
             OutboundState::Prepared => "prepared",
+            OutboundState::Queued => "queued",
             OutboundState::Dispatched => "dispatched",
             OutboundState::Confirmed => "confirmed",
             OutboundState::Partial => "partial",
@@ -156,6 +159,13 @@ impl OutboundState {
                 | OutboundState::Failed
                 | OutboundState::Unknown
         )
+    }
+
+    /// The two non-terminal states that may be CAS-claimed for dispatch:
+    /// `prepared` (not yet queued) and `queued` (admitted to the shared
+    /// queue, awaiting the dispatch CAS winner).
+    pub fn is_dispatchable(self) -> bool {
+        matches!(self, OutboundState::Prepared | OutboundState::Queued)
     }
 }
 
