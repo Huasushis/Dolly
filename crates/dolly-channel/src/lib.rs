@@ -28,6 +28,8 @@ pub(crate) mod intent;
 pub mod ledger;
 pub mod outbound;
 pub mod outbound_committed;
+pub mod outbound_consumer;
+pub mod outbound_queue;
 pub(crate) mod principal;
 pub mod projection;
 pub mod rate_limit;
@@ -58,6 +60,10 @@ pub use outbound::{
     parse_send_action, recover_outbound,
 };
 pub use outbound_committed::{CommittedSendAction, committed_send_from_block};
+pub use outbound_consumer::{
+    CommittedActionSource, ConsumerOutcome, OutboundConsumer, SnapshotCommittedActionSource,
+};
+pub use outbound_queue::{BoundedPendingQueue, PendingQueueSlot};
 pub use principal::ChannelPrincipal;
 pub use projection::{
     AttemptProjection, InboundProjection, LedgerSnapshotProjection, OutboundProjection,
@@ -83,5 +89,7 @@ pub use transport::{
 #[cfg(feature = "test-support")]
 pub use crate::intent::{ChannelIntent, IntentState};
 #[cfg(feature = "test-support")]
-pub use crate::store::{SqliteChannelStore, create_channel_store_schema};
+pub use crate::store::{
+    DurableOutboundRecord, OutboundPreparedOutcome, SqliteChannelStore, create_channel_store_schema,
+};
 
