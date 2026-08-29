@@ -175,22 +175,29 @@ fn validate_arguments(arguments: &CanonicalJsonValue) -> Result<(), ChannelError
         })
 }
 
-/// Dispatch one committed targeted channel send action.
-///
-/// Returns `Terminal` only when the ledger reached a closed outcome and the
-/// frozen `ActionResult` is produced. `DispatchedPending` means the transport
-/// response was lost and the durable outcome is unknown.
-pub fn dispatch_send(
+/// The validated parts of one authorized channel send: the account-owned
+/// session and the v1 text pieces. Produced ONLY by [`authorize_send`] from a
+/// committed targeted Action; no caller-shaped authority or payload reaches
+/// this type.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AuthorizedSend {
+    pub session_id: String,
+    pub pieces: Vec<OutboundPiece>,
+}
+
+/// Shared authority verification for `org.dolly.channel.send`: owner name,
+/// targeted module, frozen result contract, frozen arguments schema, an
+/// account-owned session, and the v1 text-only pieces. Used by
+/// [`dispatch_send`] and the committed targeted-Action verification boundary;
+/// no durable effect and no transport call happens before this succeeds.
+pub(crate) fn authorize_send(
     config: &ChannelConfig,
-    clock: &dyn Clock,
-    ledger: &mut ChannelLedger,
-    transport: &mut dyn ChannelTransport,
-    admission: &mut OutboundAdmission,
+    ledger: &ChannelLedger,
     action: &SendAction,
-) -> SendDispatchResult {
+) -> Result<AuthorizedSend, ChannelError> {
     // 1. Owner and target authority.
     if action.name != crate::config::SEND_ACTION_NAME {
-        return SendDispatchResult::Rejected(ChannelError::new(
+        return Err(ChannelError::new(
             codes::AUTHORIZATION_FAILED,
             false,
             ChannelOutcome::NotApplied,
@@ -198,7 +205,7 @@ pub fn dispatch_send(
         ));
     }
     if action.target_module_id != config.module_id {
-        return SendDispatchResult::Rejected(ChannelError::new(
+        return Err(ChannelError::new(
             codes::AUTHORIZATION_FAILED,
             false,
             ChannelOutcome::NotApplied,
@@ -210,7 +217,7 @@ pub fn dispatch_send(
     }
     if !result_contract_matches(action.result_validator_id.as_deref(), action.result_validator_revision)
     {
-        return SendDispatchResult::Rejected(ChannelError::new(
+        return Err(ChannelError::new(
             codes::RESULT_CONTRACT_MISMATCH,
             false,
             ChannelOutcome::NotApplied,
@@ -220,14 +227,14 @@ pub fn dispatch_send(
         ));
     }
     if let Err(error) = validate_arguments(&action.arguments) {
-        return SendDispatchResult::Rejected(error);
+        return Err(error);
     }
 
     // 2. Session authorization and text-only v1 parts.
     let arguments_obj = match &action.arguments {
         CanonicalJsonValue::Object(obj) => obj,
         _ => {
-            return SendDispatchResult::Rejected(ChannelError::new(
+            return Err(ChannelError::new(
                 codes::MALFORMED_EVENT,
                 false,
                 ChannelOutcome::NotApplied,
@@ -238,7 +245,7 @@ pub fn dispatch_send(
     let session_id = match arguments_obj.get("session_id") {
         Some(CanonicalJsonValue::String(session)) => session.clone(),
         _ => {
-            return SendDispatchResult::Rejected(ChannelError::new(
+            return Err(ChannelError::new(
                 codes::MALFORMED_EVENT,
                 false,
                 ChannelOutcome::NotApplied,
@@ -247,7 +254,7 @@ pub fn dispatch_send(
         }
     };
     if !ledger.sessions.values().any(|s| *s == session_id) {
-        return SendDispatchResult::Rejected(ChannelError::new(
+        return Err(ChannelError::new(
             codes::SESSION_MISSING,
             false,
             ChannelOutcome::NotApplied,
@@ -257,7 +264,7 @@ pub fn dispatch_send(
     let parts = match arguments_obj.get("parts") {
         Some(CanonicalJsonValue::Array(items)) => items.clone(),
         _ => {
-            return SendDispatchResult::Rejected(ChannelError::new(
+            return Err(ChannelError::new(
                 codes::MALFORMED_EVENT,
                 false,
                 ChannelOutcome::NotApplied,
@@ -270,7 +277,7 @@ pub fn dispatch_send(
         let part_obj = match part {
             CanonicalJsonValue::Object(obj) => obj,
             _ => {
-                return SendDispatchResult::Rejected(ChannelError::new(
+                return Err(ChannelError::new(
                     codes::MALFORMED_EVENT,
                     false,
                     ChannelOutcome::NotApplied,
@@ -287,7 +294,7 @@ pub fn dispatch_send(
                 let text = match part_obj.get("text") {
                     Some(CanonicalJsonValue::String(text)) => text.clone(),
                     _ => {
-                        return SendDispatchResult::Rejected(ChannelError::new(
+                        return Err(ChannelError::new(
                             codes::MALFORMED_EVENT,
                             false,
                             ChannelOutcome::NotApplied,
@@ -296,7 +303,7 @@ pub fn dispatch_send(
                     }
                 };
                 if text.len() > config.max_text_bytes {
-                    return SendDispatchResult::Rejected(ChannelError::new(
+                    return Err(ChannelError::new(
                         codes::MALFORMED_EVENT,
                         false,
                         ChannelOutcome::NotApplied,
@@ -317,7 +324,7 @@ pub fn dispatch_send(
                 // WP-013B seam: Asset parts are not deliverable in v1. They are
                 // rejected with a distinct code before any transport call; text
                 // parts alone remain supported.
-                return SendDispatchResult::Rejected(ChannelError::new(
+                return Err(ChannelError::new(
                     codes::UNSUPPORTED_MODALITY,
                     false,
                     ChannelOutcome::NotApplied,
@@ -325,7 +332,7 @@ pub fn dispatch_send(
                 ));
             }
             other => {
-                return SendDispatchResult::Rejected(ChannelError::new(
+                return Err(ChannelError::new(
                     codes::MALFORMED_EVENT,
                     false,
                     ChannelOutcome::NotApplied,
@@ -335,13 +342,38 @@ pub fn dispatch_send(
         }
     }
     if pieces.is_empty() {
-        return SendDispatchResult::Rejected(ChannelError::new(
+        return Err(ChannelError::new(
             codes::MALFORMED_EVENT,
             false,
             ChannelOutcome::NotApplied,
             "send must contain at least one text part",
         ));
     }
+    Ok(AuthorizedSend { session_id, pieces })
+}
+
+/// Dispatch one committed targeted channel send action.
+///
+/// Returns `Terminal` only when the ledger reached a closed outcome and the
+/// frozen `ActionResult` is produced. `DispatchedPending` means the transport
+/// response was lost and the durable outcome is unknown.
+pub fn dispatch_send(
+    config: &ChannelConfig,
+    clock: &dyn Clock,
+    ledger: &mut ChannelLedger,
+    transport: &mut dyn ChannelTransport,
+    admission: &mut OutboundAdmission,
+    action: &SendAction,
+) -> SendDispatchResult {
+    // 1-2. Committed targeted-Action authority and text-only v1 pieces,
+    // shared with the verification boundary. Nothing durable and no
+    // transport call happens before this succeeds.
+    let authorized = match authorize_send(config, ledger, action) {
+        Ok(authorized) => authorized,
+        Err(error) => return SendDispatchResult::Rejected(error),
+    };
+    let session_id = authorized.session_id;
+    let pieces = authorized.pieces;
 
     // 3. Ledger idempotency: a terminal row is never re-dispatched.
     if let Some(existing) = ledger.outbound_entry(&action.action_id) {
