@@ -63,20 +63,12 @@ impl Drop for PendingQueueSlot {
     }
 }
 
+#[derive(Default)]
 struct SessionQueue {
     /// Granted (in-flight) sends for this session.
     inflight: usize,
     /// FIFO waiter ids in arrival order (fair, starvation-free).
     waiters: VecDeque<u64>,
-}
-
-impl Default for SessionQueue {
-    fn default() -> Self {
-        Self {
-            inflight: 0,
-            waiters: VecDeque::new(),
-        }
-    }
 }
 
 #[derive(Default)]
@@ -181,7 +173,7 @@ impl BoundedPendingQueue {
                     "caller deadline expired while waiting for a queue slot",
                 ));
             }
-            if guard.waiters.get(&id).is_none() {
+            if !guard.waiters.contains_key(&id) {
                 // Granted: the grant path removed this waiter and counted it
                 // in-flight.
                 return Ok(self.slot(session_key));

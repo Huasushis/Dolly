@@ -240,6 +240,7 @@ pub(crate) fn prepare_intent(
 /// Action. Reused in the durable Prepared outbound record so the same
 /// `action_id` under a different target/content/config conflicts before
 /// enqueue, and a same key+digest replay returns the stored result.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn outbound_operation_digest(
     extension_id: &str,
     module_id: &str,
