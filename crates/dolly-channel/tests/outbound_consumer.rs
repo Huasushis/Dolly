@@ -28,8 +28,8 @@ use dolly_channel::{
     OutboundState, SqliteChannelStore, create_channel_store_schema, timestamp_plus_seconds,
 };
 use dolly_core_reducer::{
-    BuildManifestCommand, CoreCommand, DispatchLeaseCommand, DispatchState, EnvironmentInput,
-    IngressCommand, IssueLeaseCommand, TransitionOutcome,
+    ActivationState, BeginFenceCommand, BuildManifestCommand, CoreCommand, DispatchLeaseCommand,
+    DispatchState, EnvironmentInput, IngressCommand, IssueLeaseCommand, TransitionOutcome,
 };
 use dolly_storage::{SqliteCoreStore, SqliteHostIngressStore, create_host_ingress_schema};
 use rusqlite::Connection;
@@ -214,6 +214,37 @@ fn commit_block_with_config(
         .to_canonical_string();
     let (block_for_manifest, pages_for_manifest) = (block.clone(), pages.clone());
     let mut store = SqliteCoreStore::new(&mut harness.connection).expect("core schema");
+    let prior_activations: Vec<String> = store
+        .snapshot()
+        .unwrap()
+        .activations
+        .into_iter()
+        .filter_map(|(activation_id, activation)| {
+            (activation.state == ActivationState::Dispatched
+                && activation
+                    .manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.get("module_id"))
+                    .and_then(Value::as_str)
+                    == Some(MODULE_ID))
+            .then_some(activation_id)
+        })
+        .collect();
+    for activation_id in prior_activations {
+        let transition = store
+            .transact(
+                &CoreCommand::BeginFence(BeginFenceCommand {
+                    command_id: format!("{mark}-fence-{activation_id}"),
+                    activation_id,
+                }),
+                &EnvironmentInput {
+                    now: CHANNEL_NOW.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(transition.outcome, TransitionOutcome::Committed);
+    }
     let transition = store
         .transact(
             &CoreCommand::Ingress(IngressCommand {
@@ -234,7 +265,7 @@ fn commit_block_with_config(
     assert_eq!(transition.outcome, TransitionOutcome::Committed);
     drop(store);
     frozen_config.transport_account = account(&harness.authority, &harness.grant);
-    let (activation_id, manifest_digest) = persist_manifest_selection(
+    let (activation_id, _manifest_digest) = persist_manifest_selection(
         &mut harness.connection,
         mark,
         key,
@@ -242,72 +273,13 @@ fn commit_block_with_config(
         &pages_for_manifest,
         &frozen_config,
     );
-    let lease_id = format!("lease-{mark}-{key}");
-    let token_digest = digest(&json!({"activation_id": activation_id, "lease_id": lease_id}));
-    let mut store = SqliteCoreStore::new(&mut harness.connection).unwrap();
-    let issued = store
-        .transact(
-            &CoreCommand::IssueLease(IssueLeaseCommand {
-                command_id: format!("{mark}-lease-{key}"),
-                activation_id: activation_id.clone(),
-                lease_id: lease_id.clone(),
-                reservation_id: None,
-                token_digest,
-                extension_connection_id: harness.authority.extension_connection_id().to_string(),
-                worker_epoch: harness.authority.worker_epoch_fence(),
-                request_id: None,
-                worker_epoch_id: None,
-                incarnation_revision: None,
-                extension_generation: Some(1),
-            }),
-            &EnvironmentInput {
-                now: CHANNEL_NOW.into(),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    assert_eq!(issued.outcome, TransitionOutcome::Committed);
-    let dispatched = store
-        .transact(
-            &CoreCommand::DispatchLease(DispatchLeaseCommand {
-                command_id: format!("{mark}-dispatch-{key}"),
-                activation_id,
-                lease_id,
-                dispatch_state: DispatchState::Started,
-                reservation_id: None,
-                request_id: None,
-                extension_connection_id: None,
-                incarnation_revision: None,
-                frame_digest: None,
-            }),
-            &EnvironmentInput {
-                now: CHANNEL_NOW.into(),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    assert_eq!(dispatched.outcome, TransitionOutcome::Committed);
-    store
-        .install_host_capability_grant(
-            &harness.authority,
-            EXTENSION_ID,
-            MODULE_ID,
-            1,
-            1,
-            &descriptor_digest(MODULE_ID),
-            1,
-            &manifest_digest,
-            1,
-            &harness.graph_digest,
-            &["host.ingress.submit"],
-        )
-        .unwrap();
-    drop(store);
-    harness.grant = SqliteCoreStore::new(&mut harness.connection)
-        .unwrap()
-        .current_host_capability_grant(&harness.authority, EXTENSION_ID, MODULE_ID)
-        .unwrap()
-        .unwrap();
+    activate_manifest(
+        &mut harness.connection,
+        &harness.authority,
+        mark,
+        key,
+        &activation_id,
+    );
 }
 
 /// Persist one normative manifest and return its activation ID and digest.
@@ -382,12 +354,10 @@ fn persist_manifest_selection(
 fn activate_manifest(
     connection: &mut Connection,
     authority: &dolly_storage::HostConnectionAuthority,
-    graph_digest: &str,
     mark: &str,
     key: &str,
     activation_id: &str,
-    manifest_digest: &str,
-) -> dolly_storage::HostCapabilityGrant {
+) {
     let lease_id = format!("lease-{mark}-{key}");
     let token_digest = digest(&json!({
         "activation_id": activation_id,
@@ -442,27 +412,6 @@ fn activate_manifest(
             .outcome,
         TransitionOutcome::Committed
     );
-    store
-        .install_host_capability_grant(
-            authority,
-            EXTENSION_ID,
-            MODULE_ID,
-            1,
-            1,
-            &descriptor_digest(MODULE_ID),
-            1,
-            manifest_digest,
-            1,
-            graph_digest,
-            &["host.ingress.submit"],
-        )
-        .unwrap();
-    drop(store);
-    SqliteCoreStore::new(connection)
-        .unwrap()
-        .current_host_capability_grant(authority, EXTENSION_ID, MODULE_ID)
-        .unwrap()
-        .unwrap()
 }
 
 struct Fixture {
@@ -541,29 +490,49 @@ struct FileSendFixture {
     grant: dolly_storage::HostCapabilityGrant,
     config: dolly_channel::ChannelConfig,
     principal: ChannelPrincipal,
+    activation_id: String,
 }
 
 fn setup_file_send(mark: &str, action_id: &str) -> FileSendFixture {
+    setup_file_send_with_revisions(mark, action_id, 1, 1)
+}
+
+fn setup_file_send_with_revisions(
+    mark: &str,
+    action_id: &str,
+    activation_config_revision: i64,
+    extension_manifest_revision: i64,
+) -> FileSendFixture {
     let dir = TempDir::new().unwrap();
     let runtime_path = dir.path().join("runtime.sqlite3");
     let graph_body = graph(&[MODULE_ID, MODULE_OTHER], &["page-c"]);
     let graph_digest = digest(&graph_body);
+    let mut config = channel_config();
+    config.revision = activation_config_revision;
     let (mut runtime, authority, initial_grant) = {
         let mut connection = Connection::open(&runtime_path).unwrap();
         let authority = {
             let mut store = SqliteCoreStore::new(&mut connection).unwrap();
-            configured(&mut store, mark, 1);
+            configured(&mut store, mark, activation_config_revision);
             install_graph(&mut store, mark, 1, &graph_body);
             let authority = store.bootstrap_host_connection().unwrap();
-            install_grant(
-                &mut store,
-                &authority,
-                MODULE_ID,
-                1,
-                1,
-                &graph_digest,
-                &["host.ingress.submit"],
-            );
+            store
+                .install_host_capability_grant(
+                    &authority,
+                    EXTENSION_ID,
+                    MODULE_ID,
+                    1,
+                    1,
+                    &descriptor_digest(MODULE_ID),
+                    extension_manifest_revision,
+                    &digest(&json!({
+                        "extension_manifest_revision": extension_manifest_revision
+                    })),
+                    1,
+                    &graph_digest,
+                    &["host.ingress.submit"],
+                )
+                .unwrap();
             authority
         };
         create_host_ingress_schema(&mut connection).unwrap();
@@ -580,7 +549,7 @@ fn setup_file_send(mark: &str, action_id: &str) -> FileSendFixture {
         create_channel_store_schema(&mut module_connection).unwrap();
         let host = SqliteHostIngressStore::new(&mut runtime).unwrap();
         let mut receiver = InboundReceiver::new(
-            channel_config(),
+            config.clone(),
             Box::new(channel_clock()),
             &mut module_connection,
             host,
@@ -589,19 +558,20 @@ fn setup_file_send(mark: &str, action_id: &str) -> FileSendFixture {
         )
         .unwrap();
         assert!(matches!(
-            receiver.ingest_event(&sealed_event(
-                &authority,
-                &initial_grant,
-                "conv-1",
-                &format!("{mark}-inbound"),
-                "hi",
-            )),
+            receiver.ingest_event(
+                &dolly_channel::AuthenticatedChannelEvent::new(
+                    &authority,
+                    &initial_grant,
+                    activation_config_revision,
+                    content_event("conv-1", &format!("{mark}-inbound"), "hi"),
+                )
+                .unwrap(),
+            ),
             IngressOutcome::Committed { .. }
         ));
     }
     let account = account(&authority, &initial_grant);
     let session = dolly_channel::ids::dolly_session_id(&account, "conv-1");
-    let mut config = channel_config();
     config.transport_account = account;
     let block = send_block_for(MODULE_ID, action_id, &session, &["held"]);
     assert_eq!(
@@ -626,7 +596,7 @@ fn setup_file_send(mark: &str, action_id: &str) -> FileSendFixture {
             .outcome,
         TransitionOutcome::Committed
     );
-    let (activation_id, manifest_digest) = persist_manifest_selection(
+    let (activation_id, _manifest_digest) = persist_manifest_selection(
         &mut runtime,
         mark,
         "ingress",
@@ -634,15 +604,8 @@ fn setup_file_send(mark: &str, action_id: &str) -> FileSendFixture {
         &["page-c".to_string()],
         &config,
     );
-    let grant = activate_manifest(
-        &mut runtime,
-        &authority,
-        &graph_digest,
-        mark,
-        "ingress",
-        &activation_id,
-        &manifest_digest,
-    );
+    activate_manifest(&mut runtime, &authority, mark, "ingress", &activation_id);
+    let grant = initial_grant;
     let principal = ChannelPrincipal::from_authority_grant(&authority, &grant).unwrap();
     FileSendFixture {
         _dir: dir,
@@ -653,6 +616,7 @@ fn setup_file_send(mark: &str, action_id: &str) -> FileSendFixture {
         grant,
         config,
         principal,
+        activation_id,
     }
 }
 
@@ -759,9 +723,10 @@ fn committed_send_consumes_durably_with_exact_result_and_echo() {
         record.entry.result_jcs.as_deref(),
         Some(result_jcs.as_str())
     );
-    assert_eq!(
+    assert_ne!(
         record.manifest_digest,
-        fixture.harness.grant.manifest_digest()
+        fixture.harness.grant.manifest_digest(),
+        "Activation Manifest digest is not the Extension manifest digest",
     );
     assert_eq!(record.occurrence_index, 0);
     assert_eq!(record.page_id, "page-c");
@@ -787,6 +752,173 @@ fn committed_send_consumes_durably_with_exact_result_and_echo() {
         other => panic!("expected terminal replay, got {other:?}"),
     }
     assert_eq!(transport2.calls().len(), 0, "zero re-dispatch on replay");
+}
+
+#[test]
+fn unchanged_extension_grant_authorizes_distinct_activation_manifest_and_config_revision() {
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000828";
+    let mut fixture = setup_file_send_with_revisions(
+        "separate-extension-activation-authority",
+        action_id,
+        2,
+        7,
+    );
+    assert_eq!(fixture.grant.manifest_revision(), 7);
+    assert_eq!(fixture.config.revision, 2);
+    let transport = SharedTransport::new(true);
+    transport.push(TransportSendResult::AllConfirmed {
+        message_ids: vec!["separate-authority-id".to_string()],
+    });
+    let mut module_connection = Connection::open(&fixture.module_path).unwrap();
+    let gate = OutboundQueueGate::register(
+        &fixture.config,
+        &mut module_connection,
+        &fixture.authority,
+        &fixture.grant,
+    )
+    .unwrap();
+    let mut consumer = OutboundConsumer::new(
+        fixture.config.clone(),
+        Box::new(channel_clock()),
+        &mut module_connection,
+        &mut fixture.runtime,
+        gate,
+        Box::new(transport.clone()),
+        &fixture.authority,
+        &fixture.grant,
+    )
+    .unwrap();
+    assert!(matches!(
+        &consumer.consume(&far_deadline()).unwrap()[0],
+        dolly_channel::ConsumerOutcome::Terminal { .. }
+    ));
+    drop(consumer);
+    let mut store =
+        SqliteChannelStore::new(&mut module_connection, &fixture.principal, 2).unwrap();
+    let record = store.find_outbound(action_id).unwrap().unwrap();
+    assert_eq!(record.config_revision, 2);
+    assert_ne!(record.config_revision, fixture.grant.manifest_revision());
+    assert_ne!(record.manifest_digest, fixture.grant.manifest_digest());
+    assert_eq!(transport.calls().len(), 1);
+}
+
+#[test]
+fn wrong_resolved_activation_config_is_rejected_with_unchanged_extension_grant() {
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000829";
+    let mut fixture = setup_file_send("wrong-activation-config", action_id);
+    let mut wrong_config = fixture.config.clone();
+    wrong_config
+        .target_page_ids
+        .push("page-not-in-activation-config".to_string());
+    let transport = SharedTransport::new(true);
+    let mut module_connection = Connection::open(&fixture.module_path).unwrap();
+    let gate = OutboundQueueGate::register(
+        &wrong_config,
+        &mut module_connection,
+        &fixture.authority,
+        &fixture.grant,
+    )
+    .unwrap();
+    let mut consumer = OutboundConsumer::new(
+        wrong_config,
+        Box::new(channel_clock()),
+        &mut module_connection,
+        &mut fixture.runtime,
+        gate,
+        Box::new(transport.clone()),
+        &fixture.authority,
+        &fixture.grant,
+    )
+    .unwrap();
+    let error = consumer.consume(&far_deadline()).unwrap_err();
+    assert_eq!(error.code, codes::AUTHENTICATION_FAILED);
+    assert!(transport.calls().is_empty());
+    drop(consumer);
+    let current_grant = SqliteCoreStore::new(&mut fixture.runtime)
+        .unwrap()
+        .current_host_capability_grant(&fixture.authority, EXTENSION_ID, MODULE_ID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(current_grant, fixture.grant);
+}
+
+#[test]
+fn stale_active_activation_is_rejected_with_unchanged_extension_grant() {
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000830";
+    let mut fixture = setup_file_send("stale-active-activation", action_id);
+    let gate = {
+        let mut registration = Connection::open(&fixture.module_path).unwrap();
+        OutboundQueueGate::register(
+            &fixture.config,
+            &mut registration,
+            &fixture.authority,
+            &fixture.grant,
+        )
+        .unwrap()
+    };
+    let (at_boundary_tx, at_boundary_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
+    let hook_release = std::sync::Arc::clone(&release_rx);
+    let barrier = std::sync::Arc::new(move |observed: &str| {
+        if observed == "after_dispatch_cas" {
+            at_boundary_tx.send(()).unwrap();
+            hook_release.lock().unwrap().recv().unwrap();
+        }
+    });
+    let mutator = {
+        let runtime_path = fixture.runtime_path.clone();
+        let activation_id = fixture.activation_id.clone();
+        std::thread::spawn(move || {
+            at_boundary_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap();
+            let mut connection = Connection::open(runtime_path).unwrap();
+            let transition = SqliteCoreStore::new(&mut connection)
+                .unwrap()
+                .transact(
+                    &CoreCommand::BeginFence(BeginFenceCommand {
+                        command_id: "stale-active-activation-fence".to_string(),
+                        activation_id,
+                    }),
+                    &EnvironmentInput {
+                        now: CHANNEL_NOW.into(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(transition.outcome, TransitionOutcome::Committed);
+            release_tx.send(()).unwrap();
+        })
+    };
+    let transport = SharedTransport::new(true);
+    transport.push(TransportSendResult::AllConfirmed {
+        message_ids: vec!["must-not-send".to_string()],
+    });
+    let mut module_connection = Connection::open(&fixture.module_path).unwrap();
+    let mut consumer = OutboundConsumer::new(
+        fixture.config.clone(),
+        Box::new(channel_clock()),
+        &mut module_connection,
+        &mut fixture.runtime,
+        gate,
+        Box::new(transport.clone()),
+        &fixture.authority,
+        &fixture.grant,
+    )
+    .unwrap();
+    consumer.set_effect_barrier(barrier);
+    let error = consumer.consume(&far_deadline()).unwrap_err();
+    assert_eq!(error.code, codes::AUTHENTICATION_FAILED);
+    assert!(transport.calls().is_empty());
+    drop(consumer);
+    mutator.join().unwrap();
+    let current_grant = SqliteCoreStore::new(&mut fixture.runtime)
+        .unwrap()
+        .current_host_capability_grant(&fixture.authority, EXTENSION_ID, MODULE_ID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(current_grant, fixture.grant);
 }
 
 #[test]
@@ -1577,13 +1709,13 @@ fn revocation_fences_queue_dispatch_and_terminal_boundaries() {
     }
 }
 
-/// A current-grant config revision switch at the post-dispatch-CAS barrier is
-/// observed before transport, not treated as authority from the frozen older
-/// config.
+/// A changed installed Extension manifest identity at the post-dispatch-CAS
+/// barrier is rejected before transport without changing the valid active
+/// Activation Manifest.
 #[test]
-fn config_switch_after_dispatch_cas_refuses_transport() {
+fn extension_grant_switch_after_dispatch_cas_refuses_transport() {
     let action_id = "0198ab31-6c44-7e8a-b2bb-000000000825";
-    let mut fixture = setup_file_send("config-switch-dispatch", action_id);
+    let mut fixture = setup_file_send("extension-grant-switch-dispatch", action_id);
     let gate = {
         let mut registration = Connection::open(&fixture.module_path).unwrap();
         OutboundQueueGate::register(
@@ -1623,7 +1755,7 @@ fn config_switch_after_dispatch_cas_refuses_transport() {
                     1,
                     &descriptor_digest(MODULE_ID),
                     2,
-                    &digest(&json!({"config_revision": 2})),
+                    &digest(&json!({"extension_manifest_revision": 2})),
                     1,
                     &graph_digest,
                     &["host.ingress.submit"],

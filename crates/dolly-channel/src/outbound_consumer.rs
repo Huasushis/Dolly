@@ -284,19 +284,33 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
             .collect())
     }
 
-    /// One consume pass: re-verify the current sealed authority, read the
-    /// authoritative committed Blocks, and for every targeted channel send
-    /// Action persist the durable `Prepared` record, admit to the bounded
-    /// queue under the caller deadline, dispatch, and atomically commit the
-    /// durable result + echo markers. Returns one outcome per processed
-    /// Action.
     /// Revalidate the current sealed authority against BOTH the in-memory
     /// principal fences and the authoritative current capability grant in the
     /// Core store (unrevoked, same grant). A revoked grant, a replaced grant
     /// (generation/incarnation/config/graph change), or a fence mismatch
     /// fails closed with `CHANNEL_AUTHENTICATION_FAILED` before any durable
     /// or transport effect.
+    /// Revalidate the installed Extension capability record. Its
+    /// `manifest_revision` and `manifest_digest` identify the installed
+    /// Extension manifest; they are deliberately opaque here and are never
+    /// compared with an Activation Manifest or resolved Activation config.
+    fn validate_extension_grant_identity(&self) -> Result<(), ChannelError> {
+        if self.grant.extension_id() != self.config.extension_id
+            || self.grant.module_id() != self.config.module_id
+            || self.grant.manifest_revision() < 1
+            || self.grant.manifest_digest().is_empty()
+        {
+            return Err(ChannelError::new(
+                codes::AUTHENTICATION_FAILED,
+                false,
+                ChannelOutcome::NotApplied,
+                "the installed Extension capability identity is invalid for this Channel module",
+            ));
+        }
+        Ok(())
+    }
     fn revalidate_current_grant(&mut self) -> Result<(), ChannelError> {
+        self.validate_extension_grant_identity()?;
         let current_principal = ChannelPrincipal::from_authority_grant(self.authority, self.grant)?;
         if current_principal != self.principal {
             return Err(ChannelError::new(
@@ -327,7 +341,7 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 codes::AUTHENTICATION_FAILED,
                 false,
                 ChannelOutcome::NotApplied,
-                "the current capability grant changed (generation/lifecycle/config/graph)",
+                "the installed Extension capability changed (manifest/descriptor/generation/lifecycle/graph)",
             )),
             None => Err(ChannelError::new(
                 codes::AUTHENTICATION_FAILED,
@@ -337,10 +351,10 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
             )),
         }
     }
-    /// Load the one activation that is currently authorized to execute this
-    /// module. Persisted historical activations are ignored: the selected
-    /// manifest must match the current grant, live dispatched activation,
-    /// live lease, current graph descriptor, and the frozen Channel config.
+    /// Load the one currently dispatched Activation for this module.
+    /// Persisted historical Activations are ignored. The Activation Manifest
+    /// is validated against its Core Activation/lease, current graph and
+    /// resolved Channel config; Extension-manifest identity remains separate.
     fn authoritative_manifest(&mut self) -> Result<Option<AuthoritativeManifest>, ChannelError> {
         self.revalidate_current_grant()?;
         let snapshot = self.core.snapshot().map_err(|error| {
@@ -408,8 +422,7 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
             };
             if manifest.get("module_id").and_then(Value::as_str)
                 != Some(self.config.module_id.as_str())
-                || manifest.get("manifest_digest").and_then(Value::as_str)
-                    != Some(self.grant.manifest_digest())
+                || activation.state != ActivationState::Dispatched
             {
                 continue;
             }
@@ -418,23 +431,20 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
             if manifest.get("activation_id").and_then(Value::as_str) != Some(activation_id.as_str())
                 || manifest.get("reason").and_then(Value::as_str) != Some("input")
                 || manifest.get("graph_revision").and_then(Value::as_i64)
-                    != Some(self.grant.graph_revision())
+                    != snapshot.graph.get("revision").and_then(Value::as_i64)
                 || manifest.get("config_revision").and_then(Value::as_i64)
                     != Some(self.config.revision)
-                || manifest.get("config_revision").and_then(Value::as_i64)
-                    != Some(self.grant.manifest_revision())
                 || manifest.get("descriptor_revision").and_then(Value::as_i64)
-                    != Some(self.grant.descriptor_revision())
+                    != descriptor.get("descriptor_revision").and_then(Value::as_i64)
                 || manifest.get("effective_config") != Some(&frozen_config)
                 || manifest
                     .get("effective_config_digest")
                     .and_then(Value::as_str)
                     != Some(frozen_config_digest.as_str())
-                || activation.state != ActivationState::Dispatched
                 || activation.extension_generation != Some(self.grant.extension_generation())
             {
                 return Err(rejected(
-                    "the grant-selected manifest is not the current dispatched activation/config",
+                    "the active Manifest does not match its current Activation, graph, or resolved config",
                 ));
             }
             let live_lease_count = snapshot
@@ -460,14 +470,14 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 .count();
             if live_lease_count != 1 {
                 return Err(rejected(
-                    "the grant-selected manifest does not have exactly one current live lease",
+                    "the active Manifest does not have exactly one current live lease",
                 ));
             }
             selected.push((activation_id.clone(), digest, manifest.clone()));
         }
         if selected.len() > 1 {
             return Err(rejected(
-                "the current grant selects more than one authoritative Channel activation",
+                "Core has more than one current dispatched Channel Activation",
             ));
         }
         let Some((activation_id, digest, manifest)) = selected.pop() else {
@@ -662,6 +672,12 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
         })
     }
 
+    /// One consume pass: re-verify the current sealed authority, read the
+    /// authoritative committed Blocks, and for every targeted channel send
+    /// Action persist the durable `Prepared` record, admit to the bounded
+    /// queue under the caller deadline, dispatch, and atomically commit the
+    /// durable result + echo markers. Returns one outcome per processed
+    /// Action.
     pub fn consume(&mut self, caller_deadline: &str) -> Result<Vec<ConsumerOutcome>, ChannelError> {
         // Fresh authority: re-derive the sealed principal and consult the
         // CURRENT grant in the authoritative Core store BEFORE any durable or
