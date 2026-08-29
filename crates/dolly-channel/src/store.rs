@@ -1303,11 +1303,41 @@ mod tests {
         assert_eq!(error.code, codes::LEDGER_CORRUPT);
     }
 
-    /// Focused optional-reference invariant: a present-but-empty reference on
-    /// message/edit/delete (canonical, fully rehashed) must fail closed; a
-    /// valid absent-message and valid nonempty edit/delete pass.
+    /// Focused optional-reference/event-kind invariants. Every mutated
+    /// canonical request_jcs case ALSO recomputes the authoritative payload
+    /// digest and Channel operation digest from the mutated draft / full
+    /// intent (and resyncs the stored kind/reference fields), then recomputes
+    /// the outer record hash, so it passes all earlier digest checks and fails
+    /// SPECIFICALLY at the optional-reference/event-kind invariant. Valid
+    /// absent-message and valid nonempty edit/delete still pass.
     #[test]
     fn references_shape_invariants_fail_closed_and_valid_relations_pass() {
+        /// Resync an intent's authoritative digests (and kind/reference
+        /// fields) from its (mutated) canonical draft, so a later read passes
+        /// every digest check and fails only on the semantic draft invariant.
+        fn resync_from_draft(mut intent: ChannelIntent) -> ChannelIntent {
+            let draft: serde_json::Value = serde_json::from_str(&intent.request_jcs).unwrap();
+            let channel = &draft["metadata"]["org.dolly.channel"];
+            let kind = match channel.get("event_kind").and_then(serde_json::Value::as_str) {
+                Some("edit") => EventKind::Edit,
+                Some("delete") => EventKind::Delete,
+                _ => EventKind::Message,
+            };
+            let references = match channel.get("references_external_message_id") {
+                Some(serde_json::Value::String(value)) => Some(value.clone()),
+                _ => None,
+            };
+            intent.kind = kind;
+            intent.references_external_event_id = references.clone();
+            intent.payload_digest = crate::host_adapter::payload_digest_of(&intent.request_jcs);
+            intent.digest = channel_intent_digest(
+                &intent.account, "org.dolly.channel", "receiver", "worker-1",
+                1, 1, 1, "digest-g", intent.config_revision, &intent.external_event_id,
+                kind, references.as_deref(), &intent.target_page_ids, &intent.payload_digest,
+            );
+            intent
+        }
+
         #[allow(clippy::too_many_arguments)]
         fn reference_case(connection: &mut Connection, key: &str, account: &str,
             external_message_id: &str, kind: EventKind, references: Option<&str>, label: &str,
@@ -1323,8 +1353,12 @@ mod tests {
                 let mut draft: serde_json::Value = serde_json::from_str(&intent.request_jcs).unwrap();
                 mutate(&mut draft);
                 let mut i2 = intent;
-                i2.request_jcs = draft.to_string();
-                i2
+                // Re-canonicalize so the stored draft passes canonical byte
+                // equality and reaches the reference/event-kind invariant.
+                i2.request_jcs = String::from_utf8(
+                    dolly_canonical_json::canonicalize(&draft).unwrap().0.as_bytes().to_vec(),
+                ).expect("canonical draft is UTF-8");
+                resync_from_draft(i2)
             };
             let canonical = intent.canonical_string().unwrap();
             let digest = Sha256Digest::compute(canonical.as_bytes()).to_canonical_string();
@@ -1337,27 +1371,44 @@ mod tests {
                 store.find_intent(key).expect_err(&format!("{label} must fail closed"))
             };
             assert_eq!(error.code, codes::LEDGER_CORRUPT);
+            // The failure must be the optional-reference/event-kind invariant
+            // itself (all inner+outer digests were recomputed), never an
+            // earlier digest mismatch.
+            assert!(
+                error.message.contains("reference") || error.message.contains("event_kind"),
+                "{label}: expected the reference/event-kind invariant to fail, got: {error:?}"
+            );
         }
 
         let mut connection = connection();
         let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
         // Message carrying a present BUT empty reference must fail closed (an
-        // empty string is never normalized to None).
-        let key_msg = crate::ids::inbound_ingress_key(&account, "mref");
-        reference_case(&mut connection, &key_msg, &account, "mref", EventKind::Message, None, "empty reference on message",
+        // empty string is never normalized to None) — with inner+outer digests
+        // recomputed, so the failure is the reference invariant itself.
+        reference_case(&mut connection, &crate::ids::inbound_ingress_key(&account, "mref"), &account, "mref", EventKind::Message, None, "empty reference on message",
             |d| { d["metadata"]["org.dolly.channel"]["references_external_message_id"] = serde_json::json!(""); });
         // Edit carrying a present BUT empty reference must fail closed.
-        let key_edit = crate::ids::inbound_ingress_key(&account, "eref");
-        reference_case(&mut connection, &key_edit, &account, "eref", EventKind::Edit, Some("msg-original"), "empty reference on edit",
+        reference_case(&mut connection, &crate::ids::inbound_ingress_key(&account, "eref"), &account, "eref", EventKind::Edit, Some("msg-original"), "empty reference on edit",
             |d| { d["metadata"]["org.dolly.channel"]["references_external_message_id"] = serde_json::json!(""); });
         // Delete carrying a present BUT empty reference must fail closed.
-        let key_del = crate::ids::inbound_ingress_key(&account, "dref");
-        reference_case(&mut connection, &key_del, &account, "dref", EventKind::Delete, Some("msg-original"), "empty reference on delete",
+        reference_case(&mut connection, &crate::ids::inbound_ingress_key(&account, "dref"), &account, "dref", EventKind::Delete, Some("msg-original"), "empty reference on delete",
             |d| { d["metadata"]["org.dolly.channel"]["references_external_message_id"] = serde_json::json!(""); });
-        // A message whose draft illegally GAINS a reference must fail closed.
-        let key_gain = crate::ids::inbound_ingress_key(&account, "gref");
-        reference_case(&mut connection, &key_gain, &account, "gref", EventKind::Message, None, "message gaining a reference",
+        // A message whose draft illegally GAINS a reference must fail closed
+        // (relation shape), with all digests recomputed.
+        reference_case(&mut connection, &crate::ids::inbound_ingress_key(&account, "gref"), &account, "gref", EventKind::Message, None, "message gaining a reference",
             |d| { d["metadata"]["org.dolly.channel"]["references_external_message_id"] = serde_json::json!("msg-original"); });
+        // Present NON-STRING reference (a number) must fail closed.
+        reference_case(&mut connection, &crate::ids::inbound_ingress_key(&account, "nref"), &account, "nref", EventKind::Message, None, "non-string reference",
+            |d| { d["metadata"]["org.dolly.channel"]["references_external_message_id"] = serde_json::json!(5); });
+        // Present NULL reference (distinct from absent) must fail closed.
+        reference_case(&mut connection, &crate::ids::inbound_ingress_key(&account, "nulref"), &account, "nulref", EventKind::Message, None, "null reference",
+            |d| { d["metadata"]["org.dolly.channel"]["references_external_message_id"] = serde_json::Value::Null; });
+        // Invalid event_kind string must fail closed (event-kind invariant).
+        reference_case(&mut connection, &crate::ids::inbound_ingress_key(&account, "kref"), &account, "kref", EventKind::Message, None, "invalid event_kind string",
+            |d| { d["metadata"]["org.dolly.channel"]["event_kind"] = serde_json::json!("bogus"); });
+        // Invalid event_kind type must fail closed (event-kind invariant).
+        reference_case(&mut connection, &crate::ids::inbound_ingress_key(&account, "tref"), &account, "tref", EventKind::Message, None, "invalid event_kind type",
+            |d| { d["metadata"]["org.dolly.channel"]["event_kind"] = serde_json::json!(7); });
 
         // Valid absent-message passes.
         connection.execute("DELETE FROM channel_intent WHERE intent_key = ?1", [&crate::ids::inbound_ingress_key(&account, "vm")]).unwrap();
