@@ -82,12 +82,17 @@ impl std::fmt::Display for NeighborError {
 impl std::error::Error for NeighborError {}
 
 /// A frozen source Descriptor selected from the graph snapshot: the complete
-/// canonical `value` and the `source_descriptor_digest` that binds its bytes.
+/// canonical `value`, the `source_descriptor_digest` that binds its bytes, and
+/// the `owner_extension_id` the Host derived for this Module during validated
+/// graph admission (the activating Extension whose package+descriptor the
+/// Module was admitted from). Storage ingress verification binds a grant's
+/// Extension to this owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrozenDescriptor {
     pub module_id: String,
     pub descriptor_revision: i64,
     pub source_descriptor_digest: String,
+    pub owner_extension_id: String,
     pub value: Value,
 }
 

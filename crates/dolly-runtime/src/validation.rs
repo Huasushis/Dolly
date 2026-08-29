@@ -58,6 +58,14 @@ struct GraphDescriptor {
     module_id: String,
     descriptor_revision: i64,
     source_descriptor_digest: String,
+    /// The authoritative Extension that owns this Module in this graph. The
+    /// field is Host-derived during validated graph construction/admission
+    /// (the activating Extension whose package+descriptor this Module is
+    /// admitted from), never trusted from arbitrary graph input. It rides the
+    /// canonical validated representation InstallGraph persists so storage
+    /// ingress verification can bind a grant's Extension to the exact module
+    /// owner.
+    owner_extension_id: String,
     value: Value,
 }
 
@@ -478,6 +486,15 @@ fn validate_graph_and_descriptor(
                 "Descriptor {module_id} revision must be positive"
             )));
         }
+        if descriptor
+            .owner_extension_id
+            .parse::<dolly_core_domain::ExtensionId>()
+            .is_err()
+        {
+            return Err(invalid_descriptor(format!(
+                "Descriptor {module_id} owner_extension_id is not a valid ExtensionId"
+            )));
+        }
         verify_digest(
             &descriptor.value,
             &descriptor.source_descriptor_digest,
@@ -507,9 +524,10 @@ fn validate_graph_and_descriptor(
         frozen.insert(
             module_id.clone(),
             FrozenDescriptor {
-                module_id,
+                module_id: module_id.clone(),
                 descriptor_revision: descriptor.descriptor_revision,
-                source_descriptor_digest: descriptor.source_descriptor_digest,
+                source_descriptor_digest: descriptor.source_descriptor_digest.clone(),
+                owner_extension_id: descriptor.owner_extension_id.clone(),
                 value: descriptor.value,
             },
         );

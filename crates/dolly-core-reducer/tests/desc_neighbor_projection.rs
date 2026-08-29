@@ -108,6 +108,7 @@ fn graph_from_vector(vector: &Value) -> NeighborGraph {
                     .as_str()
                     .unwrap()
                     .to_string(),
+                owner_extension_id: "org.dolly.test".into(),
                 value: descriptor.clone(),
             },
         )]),
@@ -453,6 +454,7 @@ fn self_loop_relationship_is_preserved() {
                 .as_str()
                 .unwrap()
                 .to_string(),
+            owner_extension_id: "org.dolly.test".into(),
             value:
                 fixture("neighbor-is-both-input-producer-and-output-consumer")["source_descriptor"]
                     .clone(),
@@ -532,6 +534,7 @@ fn single_direction_projection_and_dual_order() {
                     .as_i64()
                     .unwrap(),
                 source_descriptor_digest: digest.to_string(),
+                owner_extension_id: "org.dolly.test".into(),
                 value,
             },
         );
@@ -646,6 +649,7 @@ fn reversed_or_unrelated_neighbors_are_not_projected() {
                     .as_i64()
                     .unwrap(),
                 source_descriptor_digest: digest.to_string(),
+                owner_extension_id: "org.dolly.test".into(),
                 value,
             },
         );
