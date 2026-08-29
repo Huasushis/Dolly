@@ -1,18 +1,22 @@
-//! Durable per-event Channel intent records (the pre-effect ledger).
+//! Durable per-event Channel intent — the sole per-event state machine.
 //!
 //! One already-authenticated event becomes a `prepared` intent row in
 //! module-scoped SQLite BEFORE any `HostIngress::submit` or Core effect. The
-//! row is the crash/recovery anchor: it binds the principal-derived account,
-//! the granted Extension/Module and worker epoch, the lifecycle kind and
-//! edit/delete relation, the ordered target Pages, the content digest, and
-//! the complete authority fences (generation, incarnation revision, graph
-//! revision, config revision) to one canonical, digest-guarded record. A
-//! crash or lost response after a Host commit reopens this row, asks `status`
-//! first, and converges without a duplicate effect or a false success.
+//! row is the single crash/recovery anchor and the single deduplication
+//! source of truth: it binds the principal-derived account, the granted
+//! Extension/Module and worker epoch, the lifecycle kind and edit/delete
+//! relation, the ordered target Pages, the content digest, and the complete
+//! authority fences (generation, incarnation revision, graph revision, config
+//! revision) to one canonical, digest-guarded record.
 //!
-//! The record shape mirrors the accepted ledger types but is deliberately
-//! per-event and principal-bound: never an authority model, only durable
-//! intent plus its terminal outcome.
+//! Lifecycle (one source of truth):
+//! - `Prepared`: durably recorded before any Host submit; the Host outcome is
+//!   unknown. A crash, lost response, or failed final transaction here must
+//!   stay `Prepared` so `reconcile()` (no event redelivery) can status-first
+//!   restore the terminal state exactly once.
+//! - `Accepted`: the Host mapping committed; the final Channel ledger row and
+//!   the terminal intent are written in ONE Channel DB transaction.
+//! - `Rejected`: durably rejected before or by the Host; nothing resubmits.
 
 use dolly_canonical_json::canonicalize;
 use serde::{Deserialize, Serialize};
@@ -21,24 +25,22 @@ use crate::error::{ChannelError, ChannelOutcome, codes};
 use crate::ledger::EventKind;
 
 /// The closed record discriminator of one Channel intent.
-pub const CHANNEL_INTENT_RECORD_SCHEMA: &str = "dolly.channel-intent/v1";
+pub(crate) const CHANNEL_INTENT_RECORD_SCHEMA: &str = "dolly.channel-intent/v1";
 
-/// The lifecycle of a prepared Channel intent.
+/// The lifecycle of one Channel intent (the sole per-event state machine).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum IntentState {
-    /// The intent is durably recorded; the Host effect outcome is unknown
-    /// (not yet submitted, or the response was lost). Always reconciled
-    /// through `status` first.
+pub(crate) enum IntentState {
+    /// Durably recorded before any Host submit; the Host outcome is unknown.
     Prepared,
-    /// The Host mapping is committed and the block identity is known.
+    /// The Host mapping committed and the final ledger row landed atomically.
     Accepted,
-    /// The intent was durably rejected; nothing will be submitted again.
+    /// Durably rejected; nothing resubmits.
     Rejected,
 }
 
 impl IntentState {
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             IntentState::Prepared => "prepared",
             IntentState::Accepted => "accepted",
@@ -46,20 +48,22 @@ impl IntentState {
         }
     }
 
-    pub fn is_terminal(self) -> bool {
+    pub(crate) fn is_terminal(self) -> bool {
         matches!(self, IntentState::Accepted | IntentState::Rejected)
     }
 }
 
-/// One canonical, principal-bound intent record.
+/// One canonical, principal-bound intent record — the sole durable per-event
+/// state. Fields are authority-bound (derived from the sealed current Host
+/// authority/grant) plus caller-supplied event content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ChannelIntent {
+pub(crate) struct ChannelIntent {
     pub schema: String,
     /// The principal-bound account-scoped ingress key (dedup namespace).
     pub intent_key: String,
     /// The Channel-local operation digest binding every field below
-    /// (including the ordered target Pages).
+    /// (including the ordered target Pages and the complete authority fences).
     pub digest: String,
     pub state: IntentState,
     pub owner: String,
@@ -90,7 +94,7 @@ pub struct ChannelIntent {
 impl ChannelIntent {
     /// The canonical JSON text of the full record (including its current
     /// lifecycle state), used as the tamper-guarded storage encoding.
-    pub fn canonical_string(&self) -> Result<String, ChannelError> {
+    pub(crate) fn canonical_string(&self) -> Result<String, ChannelError> {
         canonicalize(self)
             .map(|(bytes, _)| {
                 String::from_utf8(bytes.as_bytes().to_vec()).expect("canonical encoding is UTF-8")
@@ -107,7 +111,7 @@ impl ChannelIntent {
 
     /// Rebuild an intent from its canonical encoding; any structural
     /// violation fails closed.
-    pub fn from_canonical_string(text: &str) -> Result<Self, ChannelError> {
+    pub(crate) fn from_canonical_string(text: &str) -> Result<Self, ChannelError> {
         let record: ChannelIntent = serde_json::from_str(text).map_err(|error| {
             ChannelError::new(
                 codes::LEDGER_CORRUPT,

@@ -153,4 +153,29 @@ impl ChannelPrincipal {
     pub fn account(&self) -> &str {
         &self.account
     }
+
+    /// Test-only constructor from explicit principal parts.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn from_parts(
+        owner: &str,
+        extension_id: &str,
+        module_id: &str,
+        instance_id: &str,
+        generation: u64,
+        revision: i64,
+        graph_revision: i64,
+    ) -> Self {
+        let account = crate::ids::channel_account(owner, extension_id, module_id, instance_id);
+        Self {
+            owner: owner.to_string(),
+            extension_id: extension_id.to_string(),
+            module_id: module_id.to_string(),
+            instance_id: instance_id.to_string(),
+            generation,
+            revision,
+            graph_revision,
+            account,
+        }
+    }
 }

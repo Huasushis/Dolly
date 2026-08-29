@@ -9,9 +9,8 @@
 //! injected [`CoreIngress`], [`ChannelTransport`], and storage-agnostic
 //! [`ChannelLedger`] boundaries, so every decision is deterministic and
 //! testable offline. The G4-C durable backing ([`InboundReceiver`],
-//! [`SqliteChannelLedgerStore`], [`HostIngressCoreAdapter`]) is the
-//! shipping-runtime layer that binds that pipeline to the accepted
-//! `HostIngress` / storage seams.
+//! [`SqliteChannelStore`]) is the shipping-runtime layer that binds that
+//! pipeline to the accepted `HostIngress` / storage seams.
 //!
 //! The Channel never appends directly to a Page, never mints a Block or Asset
 //! ID, never exposes management privileges to conversation users, and never
@@ -22,10 +21,10 @@ pub mod clock;
 
 pub mod config;
 pub mod error;
-pub mod host_adapter;
+pub(crate) mod host_adapter;
 pub mod ids;
 pub mod ingress;
-pub mod intent;
+pub(crate) mod intent;
 pub mod ledger;
 pub mod outbound;
 pub mod principal;
@@ -42,13 +41,11 @@ pub use clock::{
 };
 pub use config::{ChannelConfig, ChannelConfigBuilder, EXTENSION_ID, SEND_ACTION_NAME};
 pub use error::{ChannelDeliveryOutcome, ChannelError, ChannelOutcome};
-pub use host_adapter::HostIngressCoreAdapter;
 pub use ingress::{
     CoreIngress, CoreIngressError, InboundEvent, IngressCommit, IngressOutcome,
     IngressStatusResult, IngressSubmitReceipt, IngressSubmitRequest, parse_event, process_event,
     reconcile_inbound,
 };
-pub use intent::{CHANNEL_INTENT_RECORD_SCHEMA, ChannelIntent, IntentState};
 pub use ledger::PieceOutcome;
 pub use ledger::{
     ChannelLedger, EventKind, InboundEntry, InboundState, OutboundEntry, OutboundPiece,
@@ -64,13 +61,12 @@ pub use projection::{
     AttemptProjection, InboundProjection, LedgerSnapshotProjection, OutboundProjection,
 };
 pub use rate_limit::{OutboundAdmission, TokenBucket};
-pub use receiver::InboundReceiver;
-pub use receiver::{AuthenticatedChannelEvent, ChannelEventContent};
+pub use receiver::{AuthenticatedChannelEvent, ChannelEventContent, InboundReceiver};
 pub use result_validator::{
     RESULT_VALIDATOR_ID, RESULT_VALIDATOR_REVISION, SEND_RESULT_SCHEMA_ID, SEND_RESULT_SCHEMA_TAG,
     result_contract_matches, semantic_validate_send_result, validate_send_result,
 };
-pub use store::{ChannelStore, ChannelStoreOwner, SqliteChannelStore, create_channel_store_schema};
+pub use store::{SqliteChannelStore, create_channel_store_schema};
 pub use transport::{
     ChannelTransport, ScriptedTransport, TransportPiece, TransportPieceOutcome,
     TransportSendRequest, TransportSendResult,
