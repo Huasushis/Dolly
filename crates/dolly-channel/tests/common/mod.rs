@@ -2,6 +2,8 @@
 
 #![allow(dead_code)]
 
+pub mod g4;
+
 use std::collections::BTreeMap;
 use std::str::FromStr;
 

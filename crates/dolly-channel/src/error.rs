@@ -76,6 +76,11 @@ pub mod codes {
     pub const STALE_EVENT: &str = "CHANNEL_STALE_EVENT";
     pub const INGRESS_DISABLED: &str = "CHANNEL_INGRESS_DISABLED";
     pub const INTERNAL: &str = "CHANNEL_INTERNAL";
+    /// The durable Channel ledger record failed verification (tamper or
+    /// corruption); the receiver fails closed.
+    pub const LEDGER_CORRUPT: &str = "CHANNEL_LEDGER_CORRUPT";
+    /// The durable Channel ledger schema is missing or stale.
+    pub const LEDGER_MIGRATION_REQUIRED: &str = "CHANNEL_LEDGER_MIGRATION_REQUIRED";
 }
 
 /// The common Channel error envelope.
@@ -118,10 +123,7 @@ impl ChannelError {
     /// shape), with `details` as an object.
     pub fn to_json_object(&self) -> serde_json::Map<String, serde_json::Value> {
         let mut map = serde_json::Map::new();
-        map.insert(
-            "code".into(),
-            serde_json::Value::String(self.code.clone()),
-        );
+        map.insert("code".into(), serde_json::Value::String(self.code.clone()));
         map.insert("retryable".into(), serde_json::Value::Bool(self.retryable));
         map.insert(
             "outcome".into(),
