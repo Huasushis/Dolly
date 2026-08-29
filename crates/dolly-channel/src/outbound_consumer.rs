@@ -17,8 +17,6 @@
 //! implement to feed arbitrary Blocks or `SendAction`s into the transport
 //! path.
 
-use std::collections::BTreeMap;
-
 use dolly_core_reducer::CoreSnapshot;
 use dolly_storage::{HostCapabilityGrant, HostConnectionAuthority, SqliteCoreStore};
 use serde_json::Value;
@@ -29,7 +27,7 @@ use crate::error::{ChannelError, ChannelOutcome, codes};
 use crate::ledger::{ChannelLedger, OutboundEntry, OutboundState};
 use crate::outbound::{SendDispatchResult, build_prepared_entry, transport_and_settle};
 use crate::outbound_committed::{CommittedSendAction, committed_send_from_block};
-use crate::outbound_queue::{BoundedPendingQueue, PendingQueueSlot};
+use crate::outbound_queue::BoundedPendingQueue;
 use crate::principal::ChannelPrincipal;
 use crate::store::{DispatchClaim, DurableOutboundRecord, OutboundPreparedOutcome, SqliteChannelStore};
 
@@ -95,10 +93,6 @@ pub struct OutboundConsumer<'store, 'core, 'principal> {
     authority: &'principal HostConnectionAuthority,
     grant: &'principal HostCapabilityGrant,
     principal: ChannelPrincipal,
-    /// Granted queue slots held across passes for dispatched-but-unsettled
-    /// sends (the in-flight pending bound); released when a send reaches a
-    /// terminal outcome, dropped on worker teardown.
-    pending_slots: BTreeMap<String, PendingQueueSlot>,
 }
 
 impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
@@ -144,10 +138,7 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 format!("core snapshot store unavailable: {error}"),
             )
         })?;
-        let queue = std::sync::Arc::new(BoundedPendingQueue::new(
-            config.outbound_limits.max_pending_per_session,
-            config.outbound_limits.max_pending_total,
-        ));
+        let queue = std::sync::Arc::new(BoundedPendingQueue::new());
         Ok(Self {
             config,
             clock,
@@ -158,7 +149,6 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
             authority,
             grant,
             principal,
-            pending_slots: BTreeMap::new(),
         })
     }
 
@@ -202,10 +192,7 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 format!("core snapshot store unavailable: {error}"),
             )
         })?;
-        let queue = std::sync::Arc::new(BoundedPendingQueue::new(
-            config.outbound_limits.max_pending_per_session,
-            config.outbound_limits.max_pending_total,
-        ));
+        let queue = std::sync::Arc::new(BoundedPendingQueue::new());
         Ok(Self {
             config,
             clock,
@@ -216,7 +203,6 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
             authority,
             grant,
             principal,
-            pending_slots: BTreeMap::new(),
         })
     }
 
@@ -230,6 +216,18 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
     /// of truth.
     pub fn ledger(&mut self) -> Result<ChannelLedger, ChannelError> {
         self.store.project_ledger()
+    }
+
+    /// The durable outbound queue occupancy: every nonterminal outbound row
+    /// (Prepared/Queued/Dispatched), reconstructed from the single durable
+    /// source in FIFO order. Test/inspection seam.
+    pub fn pending_outbound(&mut self) -> Result<Vec<OutboundEntry>, ChannelError> {
+        Ok(self
+            .store
+            .fifo_pending()?
+            .into_iter()
+            .map(|record| record.entry)
+            .collect())
     }
 
     /// One consume pass: re-verify the current sealed authority, read the
@@ -454,7 +452,6 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 if let Some(entry) = settled {
                     let terminal_record = self.build_terminal_record_from_entry(&record, &entry);
                     self.store.commit_outbound_terminal(&terminal_record)?;
-                    self.pending_slots.remove(&action_id);
                 } else {
                     remaining += 1;
                 }
@@ -558,9 +555,43 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
             Err(error) => return Err(error),
         }
 
+        // 2a. Surviving durable row: only a `Prepared`/`Queued` row may be
+        //    dispatched. A `Dispatched`/terminal row is owned by status-first
+        //    recovery and must never re-enter the queue or the transport.
+        let durable = self
+            .store
+            .find_outbound(&committed.action.action_id)?
+            .expect("durable outbound row");
+        if !durable.entry.state.is_dispatchable() {
+            return Ok(ConsumerOutcome::Pending {
+                action_id: committed.action.action_id.clone(),
+            });
+        }
+
         // 2. Bounded queue admission (fair, caller deadline, no leak).
         let session_key = format!("{}\u{0}{}", self.principal.account(), committed.session_id);
-        let slot = match self.queue.admit(&*self.clock, &session_key, caller_deadline) {
+        let session = committed.session_id.clone();
+        let action_key = committed.action.action_id.clone();
+        let max_per = self.config.outbound_limits.max_pending_per_session;
+        let max_total = self.config.outbound_limits.max_pending_total;
+        if durable.entry.state == OutboundState::Queued {
+            // Already durably queued; the dispatch CAS below is the single winner.
+        } else {
+        let _ = match self.queue.admit(
+            || {
+                self.store.admit_to_queue(
+                    &action_key,
+                    &session,
+                    max_per,
+                    max_total,
+                    self.clock.now().as_str(),
+                )
+            },
+            &session_key,
+            &action_key,
+            crate::clock::timestamp_total_micros(caller_deadline),
+            &*self.clock,
+        ) {
             Ok(slot) => slot,
             Err(error) => {
                 return Ok(ConsumerOutcome::Rejected {
@@ -569,6 +600,7 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 })
             }
         };
+        }
 
         // 3. Atomic dispatch CAS: exactly one claimant wins the
         //    Prepared/Queued -> Dispatched transition. The CAS winner is the
@@ -617,10 +649,8 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                             .expect("settled outbound row");
                         let record = self.build_terminal_record(&committed, &entry);
                         if let Err(error) = self.store.commit_outbound_terminal(&record) {
-                            drop(slot);
-                            return Err(error);
+                                return Err(error);
                         }
-                        drop(slot);
                         let result_jcs = dolly_canonical_json::canonicalize(&result)
                             .map(|(bytes, _)| String::from_utf8(bytes.as_bytes().to_vec()))
                             .unwrap_or(Ok("canonicalize-failed".to_string()))
@@ -633,17 +663,15 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                     }
                     SendDispatchResult::DispatchedPending => {
                         // The transport response was lost; the durable
-                        // Dispatched marker is already recorded by the CAS.
-                        // Hold the slot so the pending bound is honored until
-                        // status-first recovery.
-                        self.pending_slots
-                            .insert(committed.action.action_id.clone(), slot);
+                        // Dispatched marker is already recorded by the CAS and
+                        // the row keeps its durable occupancy until status-
+                        // first recovery settles it. The slot marker is a
+                        // no-op (durable capacity was consumed at admission).
                         Ok(ConsumerOutcome::Pending {
                             action_id: committed.action.action_id.clone(),
                         })
                     }
                     SendDispatchResult::Rejected(error) => {
-                        drop(slot);
                         Err(ChannelError::new(
                             error.code,
                             error.retryable,
@@ -657,13 +685,11 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 // Another claimant won the CAS or the row was already
                 // dispatched: zero transport, return Pending for
                 // status-first reconciliation.
-                drop(slot);
                 Ok(ConsumerOutcome::Pending {
                     action_id: committed.action.action_id.clone(),
                 })
             }
             Ok(DispatchClaim::AlreadyTerminal { state, result_jcs }) => {
-                drop(slot);
                 Ok(ConsumerOutcome::Terminal {
                     action_id: committed.action.action_id.clone(),
                     state,
@@ -671,7 +697,6 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 })
             }
             Err(error) => {
-                drop(slot);
                 Err(error)
             }
         }

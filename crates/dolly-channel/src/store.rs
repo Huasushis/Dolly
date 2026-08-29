@@ -328,7 +328,10 @@ CREATE TABLE channel_echo (
 CREATE TABLE channel_outbound (
     outbound_key TEXT PRIMARY KEY NOT NULL,
     record_digest TEXT NOT NULL,
-    canonical_jcs BLOB NOT NULL
+    canonical_jcs BLOB NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('prepared','queued','dispatched','confirmed','partial','failed','unknown')),
+    session_id TEXT NOT NULL,
+    queued_seq INTEGER
 )
 "#;
 
@@ -356,13 +359,16 @@ pub(crate) const CHANNEL_ECHO_SCHEMA_SQL: &str = "CREATE TABLE channel_echo (
 pub(crate) const CHANNEL_OUTBOUND_SCHEMA_SQL: &str = "CREATE TABLE channel_outbound (
     outbound_key TEXT PRIMARY KEY NOT NULL,
     record_digest TEXT NOT NULL,
-    canonical_jcs BLOB NOT NULL
+    canonical_jcs BLOB NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('prepared','queued','dispatched','confirmed','partial','failed','unknown')),
+    session_id TEXT NOT NULL,
+    queued_seq INTEGER
 )";
 
 const OWNER_COLUMNS: &[&str] = &["singleton", "schema_version", "schema_discriminator", "owner_jcs", "owner_digest"];
 const INTENT_COLUMNS: &[&str] = &["intent_key", "record_digest", "canonical_jcs"];
 const ECHO_COLUMNS: &[&str] = &["echo_key", "record_digest", "canonical_jcs"];
-const OUTBOUND_COLUMNS: &[&str] = &["outbound_key", "record_digest", "canonical_jcs"];
+const OUTBOUND_COLUMNS: &[&str] = &["outbound_key", "record_digest", "canonical_jcs", "state", "session_id", "queued_seq"];
 
 /// The sealed store ownership, derived only from a [`ChannelPrincipal`] and
 /// carrying the COMPLETE principal fence facts. Constructed solely inside
@@ -761,6 +767,21 @@ impl<'connection> SqliteChannelStore<'connection> {
         if recomputed != stored_digest {
             return Err(corrupted("channel outbound record digest mismatch"));
         }
+        // Derived columns (state/session_id/queued_seq) must exactly mirror
+        // the canonical record; an independent column edit fails closed.
+        let (state, session_id, queued_seq): (String, String, Option<i64>) = connection
+            .query_row(
+                "SELECT state, session_id, queued_seq FROM channel_outbound WHERE outbound_key = ?1",
+                [outbound_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(map_sqlite)?;
+        if state != record.entry.state.as_str()
+            || session_id != record.entry.session_id
+            || queued_seq != record.entry.queued_seq
+        {
+            return Err(corrupted("channel outbound derived columns do not match the canonical record"));
+        }
         // Table key must equal the record key and the entry action id.
         if record.outbound_key != outbound_key {
             return Err(corrupted("channel outbound record key does not match the table key"));
@@ -1020,9 +1041,9 @@ impl<'connection> SqliteChannelStore<'connection> {
         let (bytes, digest) = Self::outbound_record_bytes(record)?;
         let inserted = transaction
             .execute(
-                "INSERT INTO channel_outbound (outbound_key, record_digest, canonical_jcs) VALUES (?1, ?2, ?3)
+                "INSERT INTO channel_outbound (outbound_key, record_digest, canonical_jcs, state, session_id, queued_seq) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(outbound_key) DO NOTHING",
-                params![record.outbound_key, digest, bytes.as_slice()],
+                params![record.outbound_key, digest, bytes.as_slice(), record.entry.state.as_str(), record.entry.session_id, record.entry.queued_seq],
             )
             .map_err(map_sqlite)?;
         Ok(inserted == 1)
@@ -1038,8 +1059,8 @@ impl<'connection> SqliteChannelStore<'connection> {
         let (bytes, digest) = Self::outbound_record_bytes(record)?;
         let changed = transaction
             .execute(
-                "UPDATE channel_outbound SET record_digest = ?2, canonical_jcs = ?3 WHERE outbound_key = ?1",
-                params![record.outbound_key, digest, bytes.as_slice()],
+                "UPDATE channel_outbound SET record_digest = ?2, canonical_jcs = ?3, state = ?4, session_id = ?5, queued_seq = ?6 WHERE outbound_key = ?1",
+                params![record.outbound_key, digest, bytes.as_slice(), record.entry.state.as_str(), record.entry.session_id, record.entry.queued_seq],
             )
             .map_err(map_sqlite)?;
         if changed == 0 {
@@ -1120,7 +1141,6 @@ impl<'connection> SqliteChannelStore<'connection> {
     }
 
     /// The verified durable outbound record for one action key.
-    #[cfg(feature = "test-support")]
     pub fn find_outbound(&mut self, outbound_key: &str) -> Result<Option<DurableOutboundRecord>, ChannelError> {
         self.load_outbound(outbound_key)
     }
@@ -1156,6 +1176,122 @@ impl<'connection> SqliteChannelStore<'connection> {
     /// transport. The CAS winner transitions to `Dispatched` BEFORE transport
     /// initiation; a CAS failure (already dispatched, terminal, or missing)
     /// means zero transport.
+    /// Atomically admit one `Prepared` row into the durable outbound FIFO:
+    /// transitions `Prepared` -> `Queued` with a monotonic `queued_seq`,
+    /// bounded by the configured pending occupancy (`max_pending_per_session`
+    /// and `max_pending_total` over nonterminal Prepared/Queued/Dispatched
+    /// rows). One Immediate transaction: a concurrent admission cannot
+    /// exceed the bound. Returns whether the row was admitted; `false` means
+    /// the queue is at capacity (the caller waits under its deadline, never
+    /// leaks a slot).
+    pub(crate) fn admit_to_queue(
+        &mut self,
+        outbound_key: &str,
+        session_id: &str,
+        max_pending_per_session: usize,
+        max_pending_total: usize,
+        now: &str,
+    ) -> Result<bool, ChannelError> {
+        self.verify_owner_meta()?;
+        // ONE Immediate transaction: load, occupancy-bound, and transition
+        // Prepared -> Queued atomically so the bound can never be exceeded by
+        // concurrent admissions.
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite)?;
+        let current_state: Option<String> = transaction
+            .query_row(
+                "SELECT state FROM channel_outbound WHERE outbound_key = ?1",
+                [outbound_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_sqlite)?;
+        let Some(current_state) = current_state else {
+            transaction.commit().map_err(map_sqlite)?;
+            return Ok(false);
+        };
+        if current_state != OutboundState::Prepared.as_str() {
+            // Already Queued by a prior admission or later state: idempotent,
+            // never downgraded.
+            transaction.commit().map_err(map_sqlite)?;
+            return Ok(false);
+        }
+        let nonterminal_filter = "state IN ('queued','dispatched')";
+        let per_session: i64 = transaction
+            .query_row(
+                &format!("SELECT COUNT(*) FROM channel_outbound WHERE session_id = ?1 AND {nonterminal_filter}"),
+                [session_id],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite)?;
+        let total: i64 = transaction
+            .query_row(
+                &format!("SELECT COUNT(*) FROM channel_outbound WHERE {nonterminal_filter}"),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite)?;
+        if per_session as usize >= max_pending_per_session || total as usize >= max_pending_total {
+            transaction.commit().map_err(map_sqlite)?;
+            return Ok(false);
+        }
+        // Load+verify the durable truth inside the same transaction.
+        let mut record = Self::load_outbound_txn(&transaction, outbound_key, &self.owner)?
+            .ok_or_else(|| corrupted("outbound row vanished during queue admission"))?;
+        let next_seq: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(queued_seq), 0) + 1 FROM channel_outbound",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite)?;
+        record.entry.state = OutboundState::Queued;
+        record.entry.queued_seq = Some(next_seq);
+        record.entry.attempts.push(AttemptRecord {
+            at: now.to_string(),
+            kind: "enqueue".to_string(),
+            detail_digest: Sha256Digest::compute(b"enqueue").to_canonical_string(),
+        });
+        Self::update_outbound_row(&transaction, &record)?;
+        transaction.commit().map_err(map_sqlite)?;
+        Ok(true)
+    }
+
+    /// The durable outbound FIFO (reconstructed from nonterminal rows in
+    /// `queued_seq` order), for tests and restart reconstruction.
+    pub(crate) fn fifo_pending(&mut self) -> Result<Vec<DurableOutboundRecord>, ChannelError> {
+        let mut pending = self.list_pending_outbound()?;
+        pending.sort_by_key(|r| r.entry.queued_seq.unwrap_or(i64::MAX));
+        Ok(pending)
+    }
+
+    fn load_outbound_txn(
+        transaction: &rusqlite::Transaction<'_>,
+        outbound_key: &str,
+        owner: &StoreOwner,
+    ) -> Result<Option<DurableOutboundRecord>, ChannelError> {
+        let row: Option<(String, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT record_digest, canonical_jcs FROM channel_outbound WHERE outbound_key = ?1",
+                [outbound_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(map_sqlite)?;
+        let Some((digest, jcs)) = row else { return Ok(None); };
+        let computed = Sha256Digest::compute(&jcs).to_canonical_string();
+        if computed != digest {
+            return Err(corrupted("channel outbound stored digest mismatch (tampered)"));
+        }
+        let text = std::str::from_utf8(&jcs).map_err(|_| corrupted("channel outbound record is not UTF-8"))?;
+        let record: DurableOutboundRecord = serde_json::from_str(text)
+            .map_err(|_| corrupted("channel outbound record is not a strict canonical record"))?;
+        Self::verify_outbound_record(transaction, outbound_key, &record, owner)?;
+        Ok(Some(record))
+    }
+
     pub(crate) fn claim_dispatch(
         &mut self,
         outbound_key: &str,
@@ -1180,6 +1316,7 @@ impl<'connection> SqliteChannelStore<'connection> {
         }
         // Build the Dispatched record (recomputed canonical bytes + digest
         // from the loaded+verified durable truth).
+        let original_state = record.entry.state;
         record.entry.state = OutboundState::Dispatched;
         record.entry.dispatched_at = Some(now.to_string());
         record.entry.attempts.push(AttemptRecord {
@@ -1188,28 +1325,28 @@ impl<'connection> SqliteChannelStore<'connection> {
             detail_digest: Sha256Digest::compute(b"dispatch-cas").to_canonical_string(),
         });
         let (bytes, digest) = Self::outbound_record_bytes(&record)?;
-        // Single CAS in one Immediate transaction: the UPDATE only fires
-        // when the durable row's current record_digest still equals the
-        // digest we loaded+verified above (which encodes the Prepared/Queued
-        // state). SQLite serializes the transaction, so exactly one
-        // concurrent claimant sees rows-changed == 1; all others see 0 and
-        // MUST NOT transport. A CAS failure means zero transport.
+        // Single CAS in one Immediate transaction: the UPDATE only fires when
+        // the durable row's state column still equals the Prepared/Queued
+        // state this caller loaded+verified. SQLite serializes the
+        // transaction, so exactly one concurrent claimant sees
+        // rows-changed == 1; all others see 0 and MUST NOT transport. A CAS
+        // failure means zero transport.
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite)?;
-        let prior_digest: String = transaction
-            .query_row(
-                "SELECT record_digest FROM channel_outbound WHERE outbound_key = ?1",
-                [outbound_key],
-                |row| row.get(0),
-            )
-            .map_err(map_sqlite)?;
         let changed = transaction
             .execute(
-                "UPDATE channel_outbound SET record_digest = ?2, canonical_jcs = ?3
-                 WHERE outbound_key = ?1 AND record_digest = ?4",
-                params![outbound_key, digest, bytes.as_slice(), prior_digest],
+                "UPDATE channel_outbound SET record_digest = ?2, canonical_jcs = ?3, state = ?5, queued_seq = ?6
+                 WHERE outbound_key = ?1 AND state = ?4",
+                params![
+                    outbound_key,
+                    digest,
+                    bytes.as_slice(),
+                    original_state.as_str(),
+                    record.entry.state.as_str(),
+                    record.entry.queued_seq,
+                ],
             )
             .map_err(map_sqlite)?;
         transaction.commit().map_err(map_sqlite)?;
@@ -2129,6 +2266,7 @@ mod tests {
                 attempts: vec![],
                 dispatched_at: None,
                 result_jcs: None,
+                queued_seq: None,
             },
         }
     }
@@ -2208,4 +2346,96 @@ mod tests {
         assert_eq!(err.code, codes::INTERNAL);
         assert!(store.find_outbound(action_id).unwrap().is_none(), "no durable row after a failed pre-admission write");
     }
+    #[test]
+    fn fifo_pending_reconstructs_the_durable_queue_after_restart() {
+        let mut connection = connection();
+        let account = outbound_account();
+        let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+        for (action_id, text) in [
+            ("0198ab31-6c44-7e8a-b2bb-000000000301", "first"),
+            ("0198ab31-6c44-7e8a-b2bb-000000000302", "second"),
+        ] {
+            store
+                .insert_prepared_or_replay(&valid_outbound_record(action_id, "session-main", "receiver", text))
+                .unwrap();
+            assert!(
+                store
+                    .admit_to_queue(action_id, "session-main", 8, 64, "2026-08-09T15:00:00.000000Z")
+                    .unwrap(),
+                "admission succeeds"
+            );
+        }
+        let order_before: Vec<String> = store
+            .fifo_pending()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.entry.action_id)
+            .collect();
+        assert_eq!(
+            order_before,
+            vec![
+                "0198ab31-6c44-7e8a-b2bb-000000000301".to_string(),
+                "0198ab31-6c44-7e8a-b2bb-000000000302".to_string()
+            ],
+            "durable FIFO order follows admission order"
+        );
+        drop(store);
+        // Restart: reopen the SAME store; the queue is reconstructed from
+        // durable nonterminal rows in queued_seq order.
+        let _ = account;
+        let mut reopened = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+        let order_after: Vec<(String, OutboundState)> = reopened
+            .fifo_pending()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.entry.action_id, r.entry.state))
+            .collect();
+        assert_eq!(order_after.len(), 2, "both nonterminal rows reconstructed");
+        assert_eq!(order_after[0].0, "0198ab31-6c44-7e8a-b2bb-000000000301");
+        assert_eq!(order_after[1].0, "0198ab31-6c44-7e8a-b2bb-000000000302");
+        assert!(
+            order_after.iter().all(|(_, s)| *s == OutboundState::Queued),
+            "restart retains Queued state"
+        );
+    }
+
+    #[test]
+    fn concurrent_dispatch_cas_has_exactly_one_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cas.sqlite3");
+        let action_id = "0198ab31-6c44-7e8a-b2bb-000000000303";
+        // Seed one Prepared row.
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            create_channel_store_schema(&mut conn).unwrap();
+            let mut store = SqliteChannelStore::new(&mut conn, &principal(), 1).unwrap();
+            store
+                .insert_prepared_or_replay(&valid_outbound_record(action_id, "session-main", "receiver", "hi"))
+                .unwrap();
+        }
+        // Two independent connections/stores over ONE SQLite file race the
+        // dispatch CAS on the same row.
+        let mut c1 = Connection::open(&path).unwrap();
+        let mut c2 = Connection::open(&path).unwrap();
+        let mut s1 = SqliteChannelStore::new(&mut c1, &principal(), 1).unwrap();
+        let mut s2 = SqliteChannelStore::new(&mut c2, &principal(), 1).unwrap();
+        let r1 = s1.claim_dispatch(action_id, "2026-08-09T15:00:00.000000Z").unwrap();
+        let r2 = s2.claim_dispatch(action_id, "2026-08-09T15:00:00.000000Z").unwrap();
+        let wins = [
+            matches!(r1, DispatchClaim::Won(_)),
+            matches!(r2, DispatchClaim::Won(_)),
+        ]
+        .iter()
+        .filter(|w| **w)
+        .count();
+        assert_eq!(wins, 1, "exactly one concurrent claimant wins the dispatch CAS");
+        // The loser must not have been given transport authority.
+        drop(s1);
+        // The row is now Dispatched (the winner's transition is durable).
+        let mut s3 = SqliteChannelStore::new(&mut c1, &principal(), 1).unwrap();
+        let record = s3.find_outbound(action_id).unwrap().unwrap();
+        assert_eq!(record.entry.state, OutboundState::Dispatched);
+}
+
+
 }

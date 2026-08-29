@@ -223,6 +223,12 @@ pub struct OutboundEntry {
     /// confirmed replay MUST return the existing result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_jcs: Option<String>,
+    /// Durable FIFO sequence assigned when the row is admitted to the
+    /// outbound queue (`Prepared` -> `Queued`). The queue is reconstructed
+    /// from nonterminal rows in this order after restart; no caller-visible
+    /// sequence exists before admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_seq: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
