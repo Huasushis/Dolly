@@ -12,10 +12,14 @@
 //! 2. a pending intent is reconciled `status`-first using the stored
 //!    deterministic identity and the CURRENT sealed authority/grant — only an
 //!    authoritative `absent` permits a byte-identical replay submit;
-//! 3. an accepted intent is replayed only after `status` re-verifies the same
-//!    authority/grant is still current;
-//! 4. the same key with a different operation digest (changed order/content/
-//!    relation of pages or authority fences) conflicts before any Core effect;
+//! 3. every Host mapping returned by `submit` or `status` is validated against
+//!    the exact prepared intent (principal/fences, external identity,
+//!    operation/request digest inputs, canonical payload/content, edit-delete
+//!    relation, ordered target Pages, block/delivery linkage) before it is
+//!    adopted; a same-key mapping for different content/targets/relation is a
+//!    conflict/corrupt pending — never success;
+//! 4. the same key with a different operation digest conflicts before any Core
+//!    effect;
 //! 5. after a Host decision, a failure to atomically write the terminal Channel
 //!    outcome is reported as retryable [`CoreIngressError::Unavailable`] (the
 //!    durable row stays `prepared`), never a terminal rejection.
@@ -24,12 +28,13 @@ use std::str::FromStr;
 
 use dolly_canonical_json::{CanonicalJsonValue, Sha256Digest};
 use dolly_core_domain::{
-    HostIngressError, HostIngressKind, HostIngressStatus, HostIngressStatusRequest,
-    HostIngressSubmitOutcome, HostIngressSubmitRequest, PageId,
+    HostIngressError, HostIngressKind, HostIngressMapping, HostIngressStatus,
+    HostIngressStatusRequest, HostIngressSubmitOutcome, HostIngressSubmitRequest, PageId,
 };
 use dolly_storage::{HostCapabilityGrant, HostConnectionAuthority, HostIngress};
 
 use crate::error::{ChannelError, ChannelOutcome, codes};
+use crate::ids;
 use crate::ingress::{
     CHANNEL_METADATA_NAMESPACE, CoreIngress, CoreIngressError, IngressCommit,
     IngressStatusResult, IngressSubmitReceipt, IngressSubmitRequest,
@@ -41,40 +46,51 @@ use crate::store::SqliteChannelStore;
 
 const INTENT_CONFLICT_CODE: &str = "STORAGE_IDEMPOTENCY_CONFLICT";
 
-/// The transport-sourced facts extracted from a Channel block draft's
-/// `org.dolly.channel` metadata, preserved in the durable intent for the
-/// lossless ChannelLedger projection.
+/// The transport-sourced facts derived from a Channel block draft's
+/// `org.dolly.channel` metadata. The draft is the single canonical source of
+/// content truth; projection fields are derived here, never stored alongside
+/// the draft.
 pub(crate) struct ChannelDraftFacts {
     pub external_event_id: String,
     pub kind: HostIngressKind,
     pub references_external_event_id: Option<String>,
     pub channel_id: String,
-    pub transport: String,
+    pub session_id: String,
     pub external_conversation_id: String,
     pub sender_class: String,
     pub received_at: String,
 }
 
+pub(crate) fn parse_draft_metadata(
+    draft: &CanonicalJsonValue,
+) -> Result<&dolly_canonical_json::CanonicalJsonObject, CoreIngressError> {
+    let invalid = || CoreIngressError::Rejected { code: "CORE_INVALID_JSON".to_string() };
+    let CanonicalJsonValue::Object(root) = draft else { return Err(invalid()); };
+    let Some(CanonicalJsonValue::Object(metadata)) = root.get("metadata") else { return Err(invalid()); };
+    let Some(CanonicalJsonValue::Object(channel)) = metadata.get(CHANNEL_METADATA_NAMESPACE) else { return Err(invalid()); };
+    Ok(channel)
+}
+
+fn channel_text(channel: &dolly_canonical_json::CanonicalJsonObject, field: &str) -> Result<String, CoreIngressError> {
+    let invalid = CoreIngressError::Rejected { code: "CORE_INVALID_JSON".to_string() };
+    match channel.get(field) {
+        Some(CanonicalJsonValue::String(value)) if !value.is_empty() => Ok(value.clone()),
+        _ => Err(invalid),
+    }
+}
+
 /// Extract the external event identity, lifecycle kind, edit/delete relation,
-/// and the real transport content facts from a Channel block draft's
-/// `org.dolly.channel` metadata.
+/// and the real transport content facts from a Channel block draft.
 pub(crate) fn channel_facts_from_draft(
     draft: &CanonicalJsonValue,
 ) -> Result<ChannelDraftFacts, CoreIngressError> {
-    let invalid = |_field: &str| CoreIngressError::Rejected { code: "CORE_INVALID_JSON".to_string() };
-    let CanonicalJsonValue::Object(root) = draft else { return Err(invalid("draft")); };
-    let Some(CanonicalJsonValue::Object(metadata)) = root.get("metadata") else { return Err(invalid("metadata")); };
-    let Some(CanonicalJsonValue::Object(channel)) = metadata.get(CHANNEL_METADATA_NAMESPACE) else { return Err(invalid("channel metadata")); };
-    let channel_text = |field: &str| match channel.get(field) {
-        Some(CanonicalJsonValue::String(value)) if !value.is_empty() => Ok(value.clone()),
-        _ => Err(invalid(field)),
-    };
-    let external_event_id = channel_text("external_message_id")?;
-    let kind = match channel_text("event_kind")?.as_str() {
+    let channel = parse_draft_metadata(draft)?;
+    let external_event_id = channel_text(channel, "external_message_id")?;
+    let kind = match channel_text(channel, "event_kind")?.as_str() {
         "message" => HostIngressKind::Message,
         "edit" => HostIngressKind::Edit,
         "delete" => HostIngressKind::Delete,
-        _ => return Err(invalid("event_kind")),
+        _ => return Err(CoreIngressError::Rejected { code: "CORE_INVALID_JSON".to_string() }),
     };
     let references_external_event_id = match channel.get("references_external_message_id") {
         Some(CanonicalJsonValue::String(value)) if !value.is_empty() => Some(value.clone()),
@@ -84,11 +100,11 @@ pub(crate) fn channel_facts_from_draft(
         external_event_id,
         kind,
         references_external_event_id,
-        channel_id: channel_text("channel_id")?,
-        transport: channel_text("transport")?,
-        external_conversation_id: channel_text("external_conversation_id")?,
-        sender_class: channel_text("sender_class")?,
-        received_at: channel_text("received_at")?,
+        channel_id: channel_text(channel, "channel_id")?,
+        session_id: channel_text(channel, "session_id")?,
+        external_conversation_id: channel_text(channel, "external_conversation_id")?,
+        sender_class: channel_text(channel, "sender_class")?,
+        received_at: channel_text(channel, "received_at")?,
     })
 }
 
@@ -152,7 +168,8 @@ fn rejected(code: &str) -> CoreIngressError {
 }
 
 /// Build a `prepared` durable intent from the submitted request and the
-/// sealed principal, preserving the real transport content facts.
+/// sealed principal. The canonical draft (`request_jcs`) is the single
+/// content source; the digest binds the derived event facts.
 pub(crate) fn prepare_intent(
     principal: &ChannelPrincipal,
     config_revision: i64,
@@ -174,7 +191,7 @@ pub(crate) fn prepare_intent(
         config_revision, &facts.external_event_id, event_kind,
         facts.references_external_event_id.as_deref(), &request.target_page_ids, &payload_digest,
     );
-    let intent_key = crate::ids::inbound_ingress_key(principal.account(), &facts.external_event_id);
+    let intent_key = ids::inbound_ingress_key(principal.account(), &facts.external_event_id);
     Ok(ChannelIntent {
         schema: CHANNEL_INTENT_RECORD_SCHEMA.to_string(),
         intent_key,
@@ -191,11 +208,6 @@ pub(crate) fn prepare_intent(
         config_revision,
         account: principal.account().to_string(),
         external_event_id: facts.external_event_id.clone(),
-        channel_id: facts.channel_id.clone(),
-        transport: facts.transport.clone(),
-        external_conversation_id: facts.external_conversation_id.clone(),
-        sender_class: facts.sender_class.clone(),
-        received_at: facts.received_at.clone(),
         kind: event_kind,
         references_external_event_id: facts.references_external_event_id.clone(),
         target_page_ids: request.target_page_ids.clone(),
@@ -206,7 +218,86 @@ pub(crate) fn prepare_intent(
     })
 }
 
-fn commit_from_mapping(mapping: &dolly_core_domain::HostIngressMapping) -> IngressCommit {
+/// Validate a returned Host mapping against the exact prepared intent before
+/// any terminal commit: sealed principal/owner/source/module/instance/fences,
+/// external identity, operation/request digest inputs, canonical payload/
+/// content, edit-delete relation, ordered target Pages, and block/delivery
+/// linkage. A same-key mapping with different content/targets/relation is a
+/// conflict that must never be adopted as success.
+pub(crate) fn validate_host_mapping(
+    intent: &ChannelIntent,
+    mapping: &HostIngressMapping,
+) -> Result<(), ChannelError> {
+    let mismatch = |what: &str| {
+        ChannelError::new(codes::OPERATION_CONFLICT, false, ChannelOutcome::NotApplied, format!("host mapping does not match the prepared intent: {what}"))
+    };
+    let corrupt = |what: &str| {
+        ChannelError::new(codes::LEDGER_CORRUPT, false, ChannelOutcome::NotApplied, format!("host mapping is inconsistent: {what}"))
+    };
+    if mapping.external_event_id != intent.external_event_id {
+        return Err(mismatch("external identity"));
+    }
+    if mapping.owner != intent.owner
+        || mapping.extension_id != intent.extension_id
+        || mapping.module_id != intent.module_id
+        || mapping.instance_id != intent.instance_id
+    {
+        return Err(mismatch("principal/source"));
+    }
+    if mapping.generation != intent.generation
+        || mapping.revision != intent.revision
+        || mapping.graph_revision != intent.graph_revision
+        || mapping.graph_revision < 1
+    {
+        return Err(mismatch("authority fences"));
+    }
+    let account = ids::channel_account(&mapping.owner, &mapping.extension_id, &mapping.module_id, &mapping.instance_id);
+    if account != intent.account {
+        return Err(mismatch("account"));
+    }
+    let kind = match mapping.kind.as_str() {
+        "message" => EventKind::Message,
+        "edit" => EventKind::Edit,
+        "delete" => EventKind::Delete,
+        _ => return Err(mismatch("kind")),
+    };
+    if kind != intent.kind {
+        return Err(mismatch("kind"));
+    }
+    if mapping.references_external_event_id.as_deref() != intent.references_external_event_id.as_deref() {
+        return Err(mismatch("edit/delete relation"));
+    }
+    if mapping.target_page_ids != intent.target_page_ids {
+        return Err(mismatch("ordered target pages"));
+    }
+    // Canonical payload/content: recompute and compare the payload digest.
+    let payload_bytes = dolly_canonical_json::canonicalize(&mapping.payload)
+        .map_err(|e| corrupt(&format!("payload canonicalization: {e}")))?
+        .0
+        .as_bytes()
+        .to_vec();
+    let payload_text = String::from_utf8(payload_bytes).map_err(|_| corrupt("payload is not UTF-8"))?;
+    let recomputed_payload = payload_digest_of(&payload_text);
+    if recomputed_payload != mapping.payload_digest {
+        return Err(corrupt("payload digest does not match the payload bytes"));
+    }
+    if mapping.payload_digest != intent.payload_digest {
+        return Err(mismatch("content"));
+    }
+    // Block/delivery linkage: a committed mapping must mint a block delivered
+    // only to the intent's ordered target pages.
+    if mapping.block_id.is_empty() || mapping.ingress_id.is_empty() {
+        return Err(corrupt("mapping lacks block/ingress identity"));
+    }
+    for delivery in &mapping.deliveries {
+        if !intent.target_page_ids.contains(&delivery.page_id) {
+            return Err(mismatch("delivery target"));
+        }
+    }
+    Ok(())
+}
+
+fn commit_from_mapping(mapping: &HostIngressMapping) -> IngressCommit {
     let deliveries = mapping
         .deliveries
         .iter()
@@ -250,17 +341,43 @@ impl<'host, 'conn, 'principal, H: HostIngress + ?Sized> HostIngressCoreAdapter<'
         }
     }
 
-    /// Ask `host.ingress.status` for one external event.
+    /// Raw `host.ingress.status` for one external event, returning the mapping
+    /// for validation.
+    pub(crate) fn status_mapping_for_event(
+        &mut self,
+        external_event_id: &str,
+    ) -> Result<Option<Box<HostIngressMapping>>, CoreIngressError> {
+        let request = HostIngressStatusRequest { external_event_id: external_event_id.to_string() };
+        match self.core.status(self.authority, self.grant, &request) {
+            Ok(HostIngressStatus::Committed(mapping)) => Ok(Some(mapping)),
+            Ok(HostIngressStatus::Absent) => Ok(None),
+            Err(error) => Err(Self::map_host_error(&error)),
+        }
+    }
+
     pub(crate) fn status_for_event(
         &mut self,
         external_event_id: &str,
     ) -> Result<IngressStatusResult, CoreIngressError> {
-        let request = HostIngressStatusRequest { external_event_id: external_event_id.to_string() };
-        match self.core.status(self.authority, self.grant, &request) {
-            Ok(HostIngressStatus::Committed(mapping)) => Ok(IngressStatusResult::Committed { commit: commit_from_mapping(&mapping) }),
-            Ok(HostIngressStatus::Absent) => Ok(IngressStatusResult::Absent),
-            Err(error) => Err(Self::map_host_error(&error)),
+        match self.status_mapping_for_event(external_event_id)? {
+            Some(mapping) => Ok(IngressStatusResult::Committed { commit: commit_from_mapping(&mapping) }),
+            None => Ok(IngressStatusResult::Absent),
         }
+    }
+
+    /// Adopt a validated committed mapping onto the prepared intent: validates
+    /// the mapping against the intent and atomically commits the terminal
+    /// outcome. A failure is retryable [`CoreIngressError::Unavailable`];
+    /// a mapping mismatch is a conflict/corrupt pending, never success.
+    pub(crate) fn adopt_committed(
+        &mut self,
+        intent: &ChannelIntent,
+        mapping: &HostIngressMapping,
+    ) -> Result<IngressCommit, CoreIngressError> {
+        validate_host_mapping(intent, mapping).map_err(|e| rejected(&e.code))?;
+        let commit = commit_from_mapping(mapping);
+        self.commit_outcome(&intent.intent_key, Some(&commit.block_id), None)?;
+        Ok(commit)
     }
 
     /// Atomically commit the terminal outcome to the Channel store. A failure
@@ -303,23 +420,23 @@ impl<H: HostIngress + ?Sized> CoreIngress for HostIngressCoreAdapter<'_, '_, '_,
             }
             match intent.state {
                 IntentState::Accepted => {
-                    // Status-first revalidation with current authority.
-                    match self.status_for_event(&facts.external_event_id) {
-                        Ok(IngressStatusResult::Committed { commit }) => {
-                            return Ok(IngressSubmitReceipt::Committed { idempotent: true, commit });
+                    // Status-first revalidation with current authority + the
+                    // mapping must still validate against the intent.
+                    return match self.status_mapping_for_event(&facts.external_event_id)? {
+                        Some(mapping) => {
+                            let commit = self.adopt_committed(intent, &mapping)?;
+                            Ok(IngressSubmitReceipt::Committed { idempotent: true, commit })
                         }
-                        Ok(IngressStatusResult::Absent) => return Err(rejected("CHANNEL_INTENT_INCONSISTENT")),
-                        Err(e) => return Err(e),
-                    }
+                        None => Err(rejected("CHANNEL_INTENT_INCONSISTENT")),
+                    };
                 }
                 IntentState::Prepared => {
-                    match self.status_for_event(&facts.external_event_id) {
-                        Ok(IngressStatusResult::Committed { commit }) => {
-                            self.commit_outcome(&intent_key, Some(&commit.block_id), None)?;
+                    match self.status_mapping_for_event(&facts.external_event_id)? {
+                        Some(mapping) => {
+                            let commit = self.adopt_committed(intent, &mapping)?;
                             return Ok(IngressSubmitReceipt::Committed { idempotent: true, commit });
                         }
-                        Ok(IngressStatusResult::Absent) => {} // replay the byte-identical request
-                        Err(e) => return Err(e),
+                        None => {} // replay the byte-identical request
                     }
                 }
                 IntentState::Rejected => {
@@ -331,7 +448,6 @@ impl<H: HostIngress + ?Sized> CoreIngress for HostIngressCoreAdapter<'_, '_, '_,
             let intent = prepare_intent(&principal, self.config_revision, request, &facts)
                 .map_err(|e| rejected(&e.code))?;
             if let Err(persist_error) = self.store.write_prepared(&intent) {
-                // Initial persistence failure: no Host/Core effect runs.
                 if persist_error.code == codes::OPERATION_CONFLICT {
                     return Err(rejected(INTENT_CONFLICT_CODE));
                 }
@@ -349,18 +465,18 @@ impl<H: HostIngress + ?Sized> CoreIngress for HostIngressCoreAdapter<'_, '_, '_,
         };
         match self.core.submit(self.authority, self.grant, &premise) {
             Ok(HostIngressSubmitOutcome::Committed { mapping, idempotent }) => {
-                let commit = commit_from_mapping(&mapping);
-                // 3. Atomically commit the terminal outcome. If this fails the
-                //    row stays Prepared and the outcome is retryable.
-                self.commit_outcome(&intent_key, Some(&commit.block_id), None)?;
+                // 3. Validate the returned mapping against the fresh intent
+                //    (a recreated Channel row must never adopt an unrelated
+                //    existing Host effect), then commit atomically.
+                let intent = self.store.find_intent(&intent_key).map_err(|e| rejected(&e.code))?
+                    .ok_or_else(|| rejected("CHANNEL_INTENT_INCONSISTENT"))?;
+                let commit = self.adopt_committed(&intent, &mapping)?;
                 Ok(IngressSubmitReceipt::Committed { idempotent, commit })
             }
             Ok(HostIngressSubmitOutcome::Conflict { .. }) => Err(rejected(INTENT_CONFLICT_CODE)),
             Err(error) => {
                 let mapped = Self::map_host_error(&error);
                 if let CoreIngressError::Rejected { code } = &mapped {
-                    // Record the durable rejection; on Channel-DB failure the
-                    // outcome stays uncertain (retryable), never terminal.
                     if self.commit_outcome(&intent_key, None, Some(code)).is_err() {
                         return Err(CoreIngressError::Unavailable);
                     }
@@ -371,11 +487,20 @@ impl<H: HostIngress + ?Sized> CoreIngress for HostIngressCoreAdapter<'_, '_, '_,
     }
 
     fn status(&mut self, _operation_id: &str, _module_id: &str, idempotency_key: &str, _deadline: &str) -> Result<IngressStatusResult, CoreIngressError> {
-        // Look up the external event id from the durable intent (no cache).
         let intent = self.store.find_intent(idempotency_key).map_err(|e| rejected(&e.code))?;
         let Some(intent) = intent else {
             return Err(CoreIngressError::UnknownOutcome);
         };
-        self.status_for_event(&intent.external_event_id)
+        match self.status_mapping_for_event(&intent.external_event_id)? {
+            Some(mapping) => {
+                // Validate before exposing the mapping; an unrelated Host
+                // effect for the same key is a conflict, never success.
+                if validate_host_mapping(&intent, &mapping).is_err() {
+                    return Err(rejected(INTENT_CONFLICT_CODE));
+                }
+                Ok(IngressStatusResult::Committed { commit: commit_from_mapping(&mapping) })
+            }
+            None => Ok(IngressStatusResult::Absent),
+        }
     }
 }

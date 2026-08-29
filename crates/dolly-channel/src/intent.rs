@@ -78,13 +78,6 @@ pub struct ChannelIntent {
     pub config_revision: i64,
     pub account: String,
     pub external_event_id: String,
-    /// Transport-sourced content facts preserved for the lossless ChannelLedger
-    /// projection (real conversation/session/channel/sender/time).
-    pub channel_id: String,
-    pub transport: String,
-    pub external_conversation_id: String,
-    pub sender_class: String,
-    pub received_at: String,
     pub kind: EventKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub references_external_event_id: Option<String>,

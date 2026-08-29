@@ -151,6 +151,15 @@ impl RuntimeHarness {
         Self { connection, authority, grant, grant_other, graph_digest }
     }
 
+    pub fn reinstall_grant_with_graph(&mut self, graph_revision: i64, graph_digest: &str) -> HostCapabilityGrant {
+        let mut store = SqliteCoreStore::new(&mut self.connection).unwrap();
+        store.install_host_capability_grant(&self.authority, EXTENSION_ID, MODULE_ID, 1,
+            1, &descriptor_digest(MODULE_ID), 1, &digest(&json!({"manifest": 1})),
+            graph_revision, graph_digest, &["host.ingress.submit"]).unwrap();
+        SqliteCoreStore::new(&mut self.connection).unwrap()
+            .current_host_capability_grant(&self.authority, EXTENSION_ID, MODULE_ID).unwrap().unwrap()
+    }
+
     pub fn reinstall_grant_with_generation(&mut self, generation: i64) -> HostCapabilityGrant {
         let mut store = SqliteCoreStore::new(&mut self.connection).unwrap();
         store.install_host_capability_grant(&self.authority, EXTENSION_ID, MODULE_ID, generation,

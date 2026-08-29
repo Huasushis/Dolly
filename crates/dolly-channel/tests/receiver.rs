@@ -77,18 +77,16 @@ fn post_host_final_transaction_failure_reconciles_alone_to_one_effect() {
         drop(receiver);
     }
 
-    // Phase B: a store with an injected commit_outcome failure, and a host
-    // whose submit commits durably but drops the response.
+    // Phase B: the Host submits with PLAIN SUCCESS (no lost response); the
+    // commit_outcome SQLite failpoint fires AFTER the Host commit.
     {
-        let inner = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
-        let mut faulty = FaultyHostIngress::new(inner);
-        faulty.commit_then_drop_submits = 1;
+        let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
         // `principal` was computed before borrowing harness.connection.
         let mut store = SqliteChannelStore::new(&mut channel_connection, &principal).unwrap();
         store.inject_commit_outcome_failure(1);
         let mut receiver = InboundReceiver::new_with_store(
             channel_config(), Box::new(channel_clock()), store,
-            faulty, &harness.authority, &harness.grant).unwrap();
+            host, &harness.authority, &harness.grant).unwrap();
         let outcome = receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-cf", "once"));
         assert!(matches!(outcome, IngressOutcome::SubmissionPending), "commit_outcome failure must yield retryable SubmissionPending, got {outcome:?}");
         // No terminal ledger row while the durable intent is Prepared.
@@ -222,11 +220,15 @@ fn cross_module_store_reuse_fails_closed_at_receiver() {
             host, &harness.authority, &harness.grant).unwrap();
         drop(receiver);
     }
-    // Opening the same store under a DIFFERENT module principal must fail at
-    // the receiver boundary via the store owner check.
+    // A second otherwise-valid principal/grant for the same owner (module-b)
+    // with its own matching config attempts the SAME Channel DB: the receiver
+    // must reach the store-owner rejection (cross-principal reuse fails at the
+    // public boundary), not the config-mismatch check.
+    let module_b_config = dolly_channel::ChannelConfigBuilder::new("web", "account-b", MODULE_OTHER, 1)
+        .target_pages(&["page-a"]).build();
     let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
     let result = InboundReceiver::new(
-        channel_config(), Box::new(channel_clock()), &mut channel_connection,
+        module_b_config, Box::new(channel_clock()), &mut channel_connection,
         host, &harness.authority, &harness.grant_other);
     match result {
         Err(e) => assert_eq!(e.code, "CHANNEL_AUTHENTICATION_FAILED"),
@@ -318,7 +320,7 @@ fn durable_echo_marker_suppresses_matching_inbound_with_zero_core() {
     // Record a durable echo marker in the owner-bound store.
     {
         let mut store = SqliteChannelStore::new(&mut channel_connection, &principal).unwrap();
-        store.record_echo(&acct, "transport-echo-1").unwrap();
+        store.record_echo(&principal_of(&harness), "transport-echo-1").unwrap();
     }
     let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
     let mut receiver = InboundReceiver::new(
@@ -485,4 +487,84 @@ fn edit_delete_relation_and_stale_reference_fails_closed() {
     drop(receiver);
     assert_eq!(harness.mapping_count(), 2, "original + edit only");
     assert_eq!(harness.operation_count(), 2);
+}
+
+#[test]
+fn graph_crossing_replay_is_rejected() {
+    let mut harness = RuntimeHarness::new("recv-graph-cross");
+    let dir = tempdir().unwrap();
+    let (mut channel_connection, _path) = channel_store_connection(dir.path());
+    {
+        let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+        let mut receiver = InboundReceiver::new(
+            channel_config(), Box::new(channel_clock()), &mut channel_connection,
+            host, &harness.authority, &harness.grant).unwrap();
+        assert!(matches!(receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-g", "g")), IngressOutcome::Committed { .. }));
+    }
+    // Install a NEW grant pinned to a different graph revision AND digest.
+    let other_body = graph_with_outputs(&[MODULE_ID, MODULE_OTHER], &[], &["page-x", "page-y"]);
+    let new_grant = harness.reinstall_grant_with_graph(2, &digest(&other_body));
+    let mut fresh_connection = Connection::open_in_memory().unwrap();
+    create_channel_store_schema(&mut fresh_connection).unwrap();
+    let host2 = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+    let mut receiver2 = InboundReceiver::new(
+        channel_config(), Box::new(channel_clock()), &mut fresh_connection,
+        host2, &harness.authority, &new_grant).unwrap();
+    let old_event = sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-g", "g");
+    match receiver2.ingest_event(&old_event) {
+        IngressOutcome::RejectedBeforeMutation { error } => assert_eq!(error.code, "CHANNEL_AUTHENTICATION_FAILED"),
+        other => panic!("expected graph crossing to be rejected, got {other:?}"),
+    }
+    drop(receiver2);
+    assert_eq!(harness.mapping_count(), 1, "one durable mapping from phase A");
+    assert_eq!(harness.operation_count(), 1, "no second Core effect");
+}
+
+#[test]
+fn host_conflict_for_changed_content_then_reconcile_rejects() {
+    let mut harness = RuntimeHarness::new("recv-hostconflict");
+    let dir = tempdir().unwrap();
+    let (mut channel_connection, _path) = channel_store_connection(dir.path());
+    let acct = account(&harness.authority, &harness.grant);
+    // 1. Accept msg content A under targets [page-a].
+    {
+        let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+        let mut receiver = InboundReceiver::new(
+            channel_config(), Box::new(channel_clock()), &mut channel_connection,
+            host, &harness.authority, &harness.grant).unwrap();
+        assert!(matches!(receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-hc", "A")), IngressOutcome::Committed { .. }));
+    }
+    // 2. Delete the Channel intent row (recreated Channel) so the same key
+    //    re-ingests with DIFFERENT content B.
+    let key = dolly_channel::ids::inbound_ingress_key(&acct, "msg-hc");
+    channel_connection.execute("DELETE FROM channel_intent WHERE intent_key = ?1", [&key]).unwrap();
+    {
+        let host = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+        let mut receiver = InboundReceiver::new(
+            channel_config(), Box::new(channel_clock()), &mut channel_connection,
+            host, &harness.authority, &harness.grant).unwrap();
+        let outcome = receiver.ingest_event(&sealed_event(&harness.authority, &harness.grant, "conv-1", "msg-hc", "B"));
+        // The Host has a committed mapping for the ORIGINAL content A under
+        // the same key; the recreated Channel row with content B must never
+        // adopt it — success is impossible.
+        assert!(
+            !matches!(outcome, IngressOutcome::Committed { .. } | IngressOutcome::IdempotentReplay { .. }),
+            "a recreated row for changed content must not adopt the old Host effect: {outcome:?}"
+        );
+        drop(receiver);
+    }
+    assert_eq!(harness.mapping_count(), 1, "only the original A mapping exists");
+    assert_eq!(harness.operation_count(), 1, "no second Core effect");
+
+    // 3. reconcile() over the durable prepared B intent must REJECT the
+    //    conflicting Host mapping, keeping the row pending.
+    let host2 = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+    let mut receiver2 = InboundReceiver::new(
+        channel_config(), Box::new(channel_clock()), &mut channel_connection,
+        host2, &harness.authority, &harness.grant).unwrap();
+    let err = receiver2.reconcile().expect_err("conflicting host mapping must be rejected");
+    assert_eq!(err.code, "CHANNEL_OPERATION_CONFLICT");
+    drop(receiver2);
+    assert_eq!(harness.mapping_count(), 1, "no new premise after rejected reconcile");
+    assert_eq!(harness.operation_count(), 1, "exactly one Core effect");
 }

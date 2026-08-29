@@ -29,10 +29,29 @@ use dolly_canonical_json::Sha256Digest;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::error::{ChannelError, ChannelOutcome, codes};
-use crate::host_adapter::{channel_intent_digest, payload_digest_of};
+use crate::host_adapter::{channel_facts_from_draft, channel_intent_digest, payload_digest_of};
 use crate::intent::{CHANNEL_INTENT_RECORD_SCHEMA, ChannelIntent, IntentState};
-use crate::ledger::{ChannelLedger, InboundEntry, InboundState};
+use crate::ledger::{ChannelLedger, EventKind, InboundEntry, InboundState};
 use crate::principal::ChannelPrincipal;
+
+/// Derive the content facts from the canonical draft (`request_jcs`) — the
+/// single source of content truth. Projection fields and digest inputs are
+/// re-derived here and compared, never trusted from divergent stored copies.
+fn derive_draft_facts(intent: &ChannelIntent) -> Result<crate::host_adapter::ChannelDraftFacts, ChannelError> {
+    let parsed = serde_json::from_str::<serde_json::Value>(&intent.request_jcs)
+        .map_err(|_| corrupted("channel intent draft is not JSON"))?;
+    let draft = dolly_canonical_json::CanonicalJsonValue::try_from(parsed)
+        .map_err(|_| corrupted("channel intent draft is not canonical JSON"))?;
+    channel_facts_from_draft(&draft).map_err(|_| corrupted("channel intent draft metadata is malformed"))
+}
+
+fn facts_event_kind(facts: &crate::host_adapter::ChannelDraftFacts) -> EventKind {
+    match facts.kind {
+        dolly_core_domain::HostIngressKind::Message => EventKind::Message,
+        dolly_core_domain::HostIngressKind::Edit => EventKind::Edit,
+        dolly_core_domain::HostIngressKind::Delete => EventKind::Delete,
+    }
+}
 
 /// The logical table holding the per-event intent rows.
 const CHANNEL_INTENT_TABLE: &str = "channel_intent";
@@ -340,13 +359,26 @@ impl<'connection> SqliteChannelStore<'connection> {
         if recomputed_payload != record.payload_digest {
             return Err(corrupted("channel intent payload digest mismatch"));
         }
+        // Derive event identity/kind/relation from the canonical draft (the
+        // single source of truth) and require the stored fields to agree —
+        // no divergent copies.
+        let facts = derive_draft_facts(record)?;
+        if facts.external_event_id != record.external_event_id {
+            return Err(corrupted("channel intent external identity does not match the canonical draft"));
+        }
+        if facts_event_kind(&facts) != record.kind
+            || facts.references_external_event_id.as_deref() != record.references_external_event_id.as_deref()
+        {
+            return Err(corrupted("channel intent kind/relation does not match the canonical draft"));
+        }
         // Recompute the operation digest binding full authority incl. graph
-        // digest, ordered targets, content, relation, config revision.
+        // digest, ordered targets, content, relation, config revision — from
+        // the DERIVED facts.
         let recomputed_digest = channel_intent_digest(
             &record.account, &record.extension_id, &record.module_id, &record.instance_id,
             record.generation as u64, record.revision, record.graph_revision, &record.graph_digest,
-            record.config_revision, &record.external_event_id, record.kind,
-            record.references_external_event_id.as_deref(), &record.target_page_ids,
+            record.config_revision, &facts.external_event_id, facts_event_kind(&facts),
+            facts.references_external_event_id.as_deref(), &record.target_page_ids,
             &record.payload_digest,
         );
         if recomputed_digest != record.digest {
@@ -525,17 +557,32 @@ impl<'connection> SqliteChannelStore<'connection> {
     }
 
     /// Durably record a sent-transport echo marker (distinct from inbound
-    /// event state: its only purpose is inbound-echo suppression). This is the
-    /// write seam for the outbound registration side; the receiver only reads
-    /// markers for suppression, and tests exercise durability.
+    /// event state: its only purpose is inbound-echo suppression). The record
+    /// is a canonical, owner-bound JSON document carrying schema/version, the
+    /// full sealed principal (owner, Extension, module, instance, account),
+    /// the transport event ID, and the derived echo key, guarded by its record
+    /// digest. This is the write seam for the outbound registration side; the
+    /// receiver only reads markers for suppression, and tests exercise
+    /// durability and tamper isolation.
     #[allow(dead_code)]
-    pub fn record_echo(&mut self, account: &str, transport_message_id: &str) -> Result<(), ChannelError> {
+    pub fn record_echo(
+        &mut self,
+        principal: &ChannelPrincipal,
+        transport_event_id: &str,
+    ) -> Result<(), ChannelError> {
         self.verify_owner_meta()?;
-        let echo_key = format!("{account}\u{0}{transport_message_id}");
+        let account = principal.account();
+        let echo_key = format!("{account}\u{0}{transport_event_id}");
         let record = serde_json::json!({
             "schema": "dolly.channel-echo/v1",
+            "version": 1,
+            "owner": principal.owner(),
+            "extension_id": principal.extension_id(),
+            "module_id": principal.module_id(),
+            "instance_id": principal.instance_id(),
             "account": account,
-            "transport_message_id": transport_message_id,
+            "transport_event_id": transport_event_id,
+            "echo_key": echo_key,
         });
         let bytes = dolly_canonical_json::canonicalize(&record)
             .map_err(|e| corrupted(&format!("channel echo failed canonicalization: {e}")))?
@@ -555,35 +602,75 @@ impl<'connection> SqliteChannelStore<'connection> {
         transaction.commit().map_err(map_sqlite)
     }
 
-    /// Whether a sent-transport echo marker exists for the account+message id.
-    #[allow(dead_code)]
-    pub fn is_echo(&mut self, account: &str, transport_message_id: &str) -> Result<bool, ChannelError> {
-        self.verify_owner_meta()?;
-        let echo_key = format!("{account}\u{0}{transport_message_id}");
+    /// Fully verify ONE echo row (schema, re-encoded digest, derived echo key
+    /// == table key == recompute, full principal == bound store owner) and
+    /// return its transport event ID.
+    fn verified_echo_id(&self, echo_key: &str) -> Result<String, ChannelError> {
         let row: Option<(String, Vec<u8>)> = self
             .connection
-            .query_row("SELECT record_digest, canonical_jcs FROM channel_echo WHERE echo_key = ?1", [&echo_key], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_row("SELECT record_digest, canonical_jcs FROM channel_echo WHERE echo_key = ?1", [echo_key], |row| Ok((row.get(0)?, row.get(1)?)))
             .optional()
             .map_err(map_sqlite)?;
-        let Some((digest, jcs)) = row else { return Ok(false); };
-        let computed = Sha256Digest::compute(&jcs).to_canonical_string();
-        if computed != digest {
-            return Err(corrupted("channel echo marker digest mismatch (tampered)"));
+        let Some((digest, jcs)) = row else { return Ok("".to_string()); };
+        let recomputed = Sha256Digest::compute(&jcs).to_canonical_string();
+        if recomputed != digest {
+            return Err(corrupted("channel echo marker record digest mismatch (tampered)"));
         }
         let text = std::str::from_utf8(&jcs).map_err(|_| corrupted("channel echo marker is not UTF-8"))?;
         let record: serde_json::Value = serde_json::from_str(text).map_err(|_| corrupted("channel echo marker is not a canonical record"))?;
-        if record.get("account").and_then(serde_json::Value::as_str) != Some(account) {
-            return Err(corrupted("channel echo marker account mismatch"));
+        if record.get("schema").and_then(serde_json::Value::as_str) != Some("dolly.channel-echo/v1") {
+            return Err(corrupted("channel echo marker schema mismatch"));
         }
-        Ok(true)
+        if record.get("version").and_then(serde_json::Value::as_i64) != Some(1) {
+            return Err(corrupted("channel echo marker version mismatch"));
+        }
+        if record.get("echo_key").and_then(serde_json::Value::as_str) != Some(echo_key) {
+            return Err(corrupted("channel echo marker key does not match the table key"));
+        }
+        // Full principal equality against the bound store owner.
+        for (field, expected) in [
+            ("owner", self.owner.owner.as_str()),
+            ("extension_id", self.owner.extension_id.as_str()),
+            ("module_id", self.owner.module_id.as_str()),
+            ("instance_id", self.owner.instance_id.as_str()),
+            ("account", self.owner.account.as_str()),
+        ] {
+            if record.get(field).and_then(serde_json::Value::as_str) != Some(expected) {
+                return Err(corrupted("channel echo marker owner/meta does not match the bound principal"));
+            }
+        }
+        // Derived echo key must equal the recomputed key.
+        let account = self.owner.account.as_str();
+        let event_id = record.get("transport_event_id").and_then(serde_json::Value::as_str).ok_or_else(|| corrupted("channel echo marker lacks transport_event_id"))?;
+        let derived = format!("{account}\u{0}{event_id}");
+        if derived != echo_key {
+            return Err(corrupted("channel echo marker derived key mismatch"));
+        }
+        Ok(event_id.to_string())
     }
 
-    /// Every durable echo key, seeded into the ledger projection so
-    /// `process_event` suppresses a matching inbound echo before Host/Core.
-    fn list_echo_keys(&mut self) -> Result<Vec<String>, ChannelError> {
+    /// Whether a sent-transport echo marker exists for the account+message id,
+    /// after full canonical verification.
+    #[allow(dead_code)]
+    pub fn is_echo(&mut self, account: &str, transport_event_id: &str) -> Result<bool, ChannelError> {
+        self.verify_owner_meta()?;
+        let echo_key = format!("{account}\u{0}{transport_event_id}");
+        match self.verified_echo_id(&echo_key)? {
+            id if id.is_empty() => Ok(false),
+            id => Ok(id == transport_event_id),
+        }
+    }
+
+    /// Fully verified echo keys, seeded into the ledger projection so
+    /// `process_event` suppresses a matching inbound echo before Host/Core. A
+    /// malformed or forged echo row fails closed here (never suppresses).
+    fn list_verified_echo_keys(&mut self) -> Result<Vec<String>, ChannelError> {
         self.verify_owner_meta()?;
         let mut statement = self.connection.prepare("SELECT echo_key FROM channel_echo ORDER BY echo_key").map_err(map_sqlite)?;
         let keys = statement.query_map([], |row| row.get::<_, String>(0)).map_err(map_sqlite)?.collect::<Result<Vec<_>, _>>().map_err(map_sqlite)?;
+        for key in &keys {
+            let _ = self.verified_echo_id(key)?;
+        }
         Ok(keys)
     }
 
@@ -611,17 +698,22 @@ impl<'connection> SqliteChannelStore<'connection> {
                     IntentState::Accepted => InboundState::Accepted,
                     _ => InboundState::Rejected,
                 };
+                // Projection fields are DERIVED from the canonical draft (the
+                // single content source), not persisted copies: real
+                // channel/session(session_id)/conversation/sender/time/relation
+                // round-trip exactly, including non-default session mappings.
+                let facts = derive_draft_facts(&record)?;
                 let entry = InboundEntry {
                     transport_account: record.account.clone(),
-                    external_message_id: record.external_event_id.clone(),
-                    references_external_message_id: record.references_external_event_id.clone(),
+                    external_message_id: facts.external_event_id.clone(),
+                    references_external_message_id: facts.references_external_event_id.clone(),
                     state,
-                    event_kind: record.kind,
-                    session_id: crate::ids::dolly_session_id(&record.account, &record.external_conversation_id),
-                    external_conversation_id: record.external_conversation_id.clone(),
-                    channel_id: record.channel_id.clone(),
-                    sender_class: record.sender_class.clone(),
-                    received_at: record.received_at.clone(),
+                    event_kind: facts_event_kind(&facts),
+                    session_id: facts.session_id.clone(),
+                    external_conversation_id: facts.external_conversation_id.clone(),
+                    channel_id: facts.channel_id.clone(),
+                    sender_class: facts.sender_class.clone(),
+                    received_at: facts.received_at.clone(),
                     ingress_key: record.intent_key.clone(),
                     operation_digest: record.digest.clone(),
                     block_id: record.block_id.clone(),
@@ -636,16 +728,19 @@ impl<'connection> SqliteChannelStore<'connection> {
         }
         // Seed durable sent-transport echo markers for suppression (keys are
         // `{account} NUL {message_id}`, exactly the ledger's echo-key shape).
-        for key in self.list_echo_keys()? {
+        // Every marker is fully verified; a malformed/forged row fails closed
+        // here and never suppresses.
+        for key in self.list_verified_echo_keys()? {
             ledger.echoed_message_ids.insert(key);
         }
         Ok(ledger)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 mod tests {
     use super::*;
+    use crate::host_adapter::channel_intent_digest;
     use crate::intent::CHANNEL_INTENT_RECORD_SCHEMA as SCHEMA;
     use crate::ledger::EventKind;
 
@@ -659,11 +754,43 @@ mod tests {
         connection
     }
 
-    fn intent(key: &str, account: &str) -> ChannelIntent {
+    /// A canonical draft whose `org.dolly.channel` metadata carries the full
+    /// transport content facts (the single content source for the projection).
+    fn draft(external_message_id: &str) -> String {
+        let draft = serde_json::json!({
+            "schema": "dolly.block-draft/v1",
+            "parts": [{"kind": "text", "text": "hello", "format": "plain"}],
+            "actions": [],
+            "metadata": {
+                "org.dolly.channel": {
+                    "channel_id": "web-primary",
+                    "transport": "web",
+                    "session_id": "session-mapped",
+                    "external_conversation_id": "conv-1",
+                    "external_message_id": external_message_id,
+                    "sender_class": "user",
+                    "received_at": "2026-08-28T00:00:00.000000Z",
+                    "event_kind": "message"
+                }
+            }
+        });
+        String::from_utf8(dolly_canonical_json::canonicalize(&draft).unwrap().0.as_bytes().to_vec()).expect("draft is UTF-8")
+    }
+
+    /// A semantically valid prepared intent (correct key, payload and
+    /// operation digests derived from the canonical draft).
+    fn valid_intent(key: &str, account: &str, external_message_id: &str) -> ChannelIntent {
+        let request_jcs = draft(external_message_id);
+        let payload_digest = crate::host_adapter::payload_digest_of(&request_jcs);
+        let digest = channel_intent_digest(
+            account, "org.dolly.channel", "receiver", "worker-1", 1, 1, 1, "digest-g",
+            1, external_message_id, EventKind::Message, None,
+            &["page-a".to_string()], &payload_digest,
+        );
         ChannelIntent {
             schema: SCHEMA.to_string(),
             intent_key: key.to_string(),
-            digest: "sha256:deadbeef".to_string(),
+            digest,
             state: IntentState::Prepared,
             owner: "owner-1".to_string(),
             extension_id: "org.dolly.channel".to_string(),
@@ -675,17 +802,12 @@ mod tests {
             graph_digest: "digest-g".to_string(),
             config_revision: 1,
             account: account.to_string(),
-            external_event_id: "msg-1".to_string(),
-            channel_id: "web-primary".to_string(),
-            transport: "web".to_string(),
-            external_conversation_id: "conv-1".to_string(),
-            sender_class: "user".to_string(),
-            received_at: "2026-08-28T00:00:00.000000Z".to_string(),
+            external_event_id: external_message_id.to_string(),
             kind: EventKind::Message,
             references_external_event_id: None,
             target_page_ids: vec!["page-a".to_string()],
-            payload_digest: "sha256:ab".to_string(),
-            request_jcs: "{}".to_string(),
+            payload_digest,
+            request_jcs,
             block_id: None,
             rejected_code: None,
         }
@@ -709,20 +831,13 @@ mod tests {
         let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
         let key = crate::ids::inbound_ingress_key(&account, "msg-1");
         {
-            // Record a semantically valid intent (correct payload/digest/key).
-            let mut intent = intent(&key, &account);
-            intent.payload_digest = crate::host_adapter::payload_digest_of(&intent.request_jcs);
-            intent.digest = crate::host_adapter::channel_intent_digest(
-                &account, "org.dolly.channel", "receiver", "worker-1",
-                1, 1, 1, "digest-g", 1, "msg-1", EventKind::Message, None,
-                &["page-a".to_string()], &intent.payload_digest,
-            );
             let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
-            store.write_prepared(&intent).unwrap();
+            store.write_prepared(&valid_intent(&key, &account, "msg-1")).unwrap();
+            // Sanity: the valid record reads back.
+            assert!(store.find_intent(&key).unwrap().is_some());
         }
-        // Semantic tamper: change target pages AND recompute the outer hash so
-        // the record parses and its hash matches — verify_intent must still
-        // fail because the operation digest no longer matches.
+        // Semantic tamper: change the ordered target pages AND recompute the
+        // outer hash; verify_intent must still fail (operation digest match).
         {
             let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
             let mut intent = store.find_intent(&key).unwrap().unwrap();
@@ -742,12 +857,64 @@ mod tests {
     }
 
     #[test]
-    fn echo_markers_survive_reopen() {
+    fn metadata_tamper_with_recomputed_hash_fails_closed() {
+        // Semantic tamper on the CANONICAL DRAFT metadata (external identity):
+        // the outer hash is recomputed, but the derived facts no longer match
+        // the stored key/digest, so verification fails closed.
+        let mut connection = connection();
+        let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
+        let key = crate::ids::inbound_ingress_key(&account, "msg-1");
+        {
+            let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
+            store.write_prepared(&valid_intent(&key, &account, "msg-1")).unwrap();
+        }
+        // Rewrite the draft metadata to a different external message id.
+        let intent = {
+            let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
+            let mut i = store.find_intent(&key).unwrap().unwrap();
+            i.request_jcs = draft("msg-9");
+            i
+        };
+        let canonical = intent.canonical_string().unwrap();
+        let digest = Sha256Digest::compute(canonical.as_bytes()).to_canonical_string();
+        connection.execute(
+            "UPDATE channel_intent SET record_digest = ?1, canonical_jcs = ?2 WHERE intent_key = ?3",
+            rusqlite::params![digest, canonical.as_bytes(), key],
+        ).unwrap();
+        let error = {
+            let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
+            store.find_intent(&key).expect_err("metadata tamper must fail closed")
+        };
+        assert_eq!(error.code, codes::LEDGER_CORRUPT);
+    }
+
+    #[test]
+    fn project_derives_real_facts_from_the_canonical_draft() {
+        let mut connection = connection();
+        let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
+        let key = crate::ids::inbound_ingress_key(&account, "msg-1");
+        let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
+        let intent = valid_intent(&key, &account, "msg-1");
+        store.write_prepared(&intent).unwrap();
+        store.commit_outcome(&key, Some("block-1"), None).unwrap();
+        let ledger = store.project_ledger().unwrap();
+        let entry = ledger.inbound_entry(&account, "msg-1").expect("projected entry");
+        assert_eq!(entry.channel_id, "web-primary");
+        assert_eq!(entry.session_id, "session-mapped", "non-default session mapping round-trips exactly");
+        assert_eq!(entry.external_conversation_id, "conv-1");
+        assert_eq!(entry.sender_class, "user");
+        assert_eq!(entry.received_at, "2026-08-28T00:00:00.000000Z");
+        assert_eq!(entry.block_id.as_deref(), Some("block-1"));
+        assert_eq!(entry.event_kind, EventKind::Message);
+    }
+
+    #[test]
+    fn echo_markers_survive_reopen_and_forgery_fails_closed() {
         let mut connection = connection();
         let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
         {
             let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
-            store.record_echo(&account, "transport-msg-1").unwrap();
+            store.record_echo(&principal(), "transport-msg-1").unwrap();
             assert!(store.is_echo(&account, "transport-msg-1").unwrap());
         }
         {
@@ -756,6 +923,27 @@ mod tests {
             assert!(!store.is_echo(&account, "other").unwrap());
             let ledger = store.project_ledger().unwrap();
             assert!(ledger.is_echo(&account, "transport-msg-1"));
+        }
+        // Forged/rehashed echo record: recompute the outer hash after editing
+        // the transport event ID; full verification must fail closed and the
+        // forged marker must NEVER suppress (project_ledger errors).
+        {
+            let echo_key = format!("{account}\u{0}transport-msg-1");
+            let row: (String, Vec<u8>) = connection.query_row(
+                "SELECT record_digest, canonical_jcs FROM channel_echo WHERE echo_key = ?1",
+                [&echo_key], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            let text = String::from_utf8(row.1).unwrap();
+            let mut record: serde_json::Value = serde_json::from_str(&text).unwrap();
+            record["transport_event_id"] = serde_json::json!("forged-id");
+            let forged = serde_json::to_string(&record).unwrap();
+            let digest = Sha256Digest::compute(forged.as_bytes()).to_canonical_string();
+            connection.execute(
+                "UPDATE channel_echo SET record_digest = ?1, canonical_jcs = ?2 WHERE echo_key = ?3",
+                rusqlite::params![digest, forged.as_bytes(), echo_key],
+            ).unwrap();
+            let mut store = SqliteChannelStore::new(&mut connection, &principal()).unwrap();
+            let err = store.project_ledger().expect_err("forged echo must fail closed");
+            assert_eq!(err.code, codes::LEDGER_CORRUPT);
         }
     }
 }

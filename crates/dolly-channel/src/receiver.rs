@@ -330,14 +330,22 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
                     &mut self.store,
                     self.config.revision,
                 );
-                match adapter.status_for_event(&intent.external_event_id) {
-                    Ok(IngressStatusResult::Committed { commit }) => {
-                        match adapter.commit_outcome(&intent_key, Some(&commit.block_id), None) {
-                            Ok(()) => true,
-                            Err(_) => false,
+                match adapter.status_mapping_for_event(&intent.external_event_id) {
+                    Ok(Some(mapping)) => {
+                        // Validate the Host mapping against the exact prepared
+                        // intent BEFORE terminal commit; a same-key mapping for
+                        // different content/targets/relation is a conflict that
+                        // must never be adopted as success (the row stays
+                        // Prepared and reconcile fails closed).
+                        if crate::host_adapter::validate_host_mapping(&intent, &mapping).is_err() {
+                            // Same external key but a different Host effect:
+                            // conflict/corrupt pending — never adopted as
+                            // success. The durable row stays Prepared.
+                            return Err(ChannelError::new(codes::OPERATION_CONFLICT, false, ChannelOutcome::NotApplied, "host mapping conflicts with the prepared intent"));
                         }
+                        matches!(adapter.commit_outcome(&intent_key, Some(&mapping.block_id), None), Ok(()))
                     }
-                    Ok(IngressStatusResult::Absent) => {
+                    Ok(None) => {
                         let request = rebuild_request(&intent, &self.config, &*self.clock)?;
                         matches!(
                             adapter.submit(&request),
