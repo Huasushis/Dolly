@@ -26,9 +26,12 @@
 //!   for the seam it names, so every crate contract exercised above is proven
 //!   working; only the exact absent Host/runtime adapter seam named in
 //!   `causal_red` turns the case red. Remaining REDs are confined to the four
-//!   Host/runtime adapter seams: (A) Asset Host — no route from a committed
-//!   `asset_input` block into `AssetService`, no `host.asset.import`/
-//!   `host.asset.status` including an authoritative `absent` outcome;
+//!   Host/runtime adapter seams: (A) Asset Host — no runtime
+//!   `host.asset.import`/`host.asset.status` registration routing an already
+//!   Host-authorized Asset capability/import request into `AssetService`
+//!   (durable ImportRecord, AVAILABLE canonical AssetRef, authoritative
+//!   `absent`); Core ingress never mints or imports asset authority and a
+//!   later consumer may only reference the AVAILABLE AssetRef;
 //!   (B) Core ingress Host — no `host.ingress.submit`/`host.ingress.status`
 //!   adapter backed by the real Core (the only `CoreIngress` impls in the
 //!   workspace are test doubles); (C) Channel inbound persistence/wiring —
@@ -1350,7 +1353,7 @@ fn g4_wp010_bounded_import_and_crash_recovery_round_trip() {
     product_red(
         "G4-WP010-IMPORT-BOUND-001",
         seam,
-        "the exercised dolly_asset surface implements bounded ACCEPTED->AVAILABLE import, crash recovery, and answers the authoritative explicit absent StatusResult for a never-created import (all proven above); this probe does not drive the runtime Core route, and no host.asset.import/status service exists that would let a committed asset_input block reach this service, so no ImportId/AssetRef can enter a committed record through the runtime route and no host can observe absent across it (Asset Host seam A)",
+        "the exercised dolly_asset surface implements bounded ACCEPTED->AVAILABLE import, crash recovery, and answers the authoritative explicit absent StatusResult for a never-created import (all proven above); this probe does not drive the runtime Core route, and no runtime host.asset.import/status registration routes an already Host-authorized Asset capability/import request to this service — asset_input is not a Block member and Core ingress never mints or imports asset authority, so a later consumer may only reference the AVAILABLE AssetRef and no host can observe status across the runtime route (Asset Host seam A)",
         "WP-010 Asset Host seam (A)",
     );
 }
