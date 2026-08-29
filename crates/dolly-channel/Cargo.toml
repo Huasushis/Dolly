@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 dolly-canonical-json = { path = "../dolly-canonical-json" }
 dolly-core-domain = { path = "../dolly-core-domain" }
+dolly-core-reducer = { path = "../dolly-core-reducer" }
 dolly-schema = { path = "../dolly-schema" }
 dolly-storage = { path = "../dolly-storage" }
 rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
@@ -24,5 +25,4 @@ default = []
 test-support = []
 
 [dev-dependencies]
-dolly-core-reducer = { path = "../dolly-core-reducer" }
 tempfile = "3"
