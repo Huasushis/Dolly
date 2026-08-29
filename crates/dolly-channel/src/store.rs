@@ -55,6 +55,12 @@ const CHANNEL_METADATA_KEYS: &[&str] = &[
     "external_message_id", "sender_class", "received_at", "event_kind",
     "references_external_message_id",
 ];
+/// Channel metadata fields REQUIRED by the draft builder (all non-empty
+/// strings); `references_external_message_id` is the only optional field.
+const CHANNEL_REQUIRED_KEYS: &[&str] = &[
+    "channel_id", "transport", "session_id", "external_conversation_id",
+    "external_message_id", "sender_class", "received_at", "event_kind",
+];
 
 /// Strict canonical verification of the stored draft (`request_jcs`): it must
 /// parse as Dolly-core canonical JSON, re-encode byte-identically, and carry
@@ -74,7 +80,9 @@ fn verify_draft_canonical(intent: &ChannelIntent) -> Result<(), ChannelError> {
     if recanon != intent.request_jcs.as_bytes() {
         return Err(corrupted("channel intent draft is not canonically encoded"));
     }
-    // Top-level key set is exactly the accepted draft fields.
+    // ---- Exact authoritative `dolly.block-draft/v1` shape ----
+    // 1. Top level: required {schema, parts, actions, metadata} only, with the
+    //    required types and the exact schema tag.
     let CanonicalJsonValue::Object(root) = &parsed else {
         return Err(corrupted("channel intent draft is not an object"));
     };
@@ -83,23 +91,52 @@ fn verify_draft_canonical(intent: &ChannelIntent) -> Result<(), ChannelError> {
             return Err(corrupted("channel intent draft carries an unknown top-level field"));
         }
     }
-    // Metadata namespaces are exactly `org.dolly.channel`.
+    for key in DRAFT_ROOT_KEYS {
+        if root.get(key).is_none() {
+            return Err(corrupted(&format!("channel intent draft lacks required top-level field {key}")));
+        }
+    }
+    match root.get("schema") {
+        Some(CanonicalJsonValue::String(tag)) if tag == crate::ingress::BLOCK_DRAFT_SCHEMA_TAG => {}
+        _ => return Err(corrupted("channel intent draft schema must equal dolly.block-draft/v1")),
+    }
+    if !matches!(root.get("parts"), Some(CanonicalJsonValue::Array(_))) {
+        return Err(corrupted("channel intent draft parts must be an array"));
+    }
+    if !matches!(root.get("actions"), Some(CanonicalJsonValue::Array(_))) {
+        return Err(corrupted("channel intent draft actions must be an array"));
+    }
+    // 2. Metadata namespaces: exactly `org.dolly.channel`.
     let Some(CanonicalJsonValue::Object(metadata)) = root.get("metadata") else {
-        return Err(corrupted("channel intent draft lacks a metadata object"));
+        return Err(corrupted("channel intent draft metadata must be an object"));
     };
     for key in metadata.iter().map(|(k, _)| k) {
         if !DRAFT_NAMESPACE_KEYS.contains(&key) {
             return Err(corrupted("channel intent draft carries an unknown metadata namespace"));
         }
     }
-    // Channel metadata fields are exactly the accepted set (references is
-    // optional, the rest are required by the draft builder).
+    // 3. Channel metadata: every spec-required field present with the correct
+    //    type (non-empty strings used by the lossless projection), no unknown
+    //    fields; the edit/delete reference is the only optional field.
     let Some(CanonicalJsonValue::Object(channel)) = metadata.get("org.dolly.channel") else {
         return Err(corrupted("channel intent draft lacks the channel metadata namespace"));
     };
     for key in channel.iter().map(|(k, _)| k) {
         if !CHANNEL_METADATA_KEYS.contains(&key) {
             return Err(corrupted("channel intent draft carries an unknown metadata field"));
+        }
+    }
+    for key in CHANNEL_REQUIRED_KEYS {
+        if channel.get(key).is_none() {
+            return Err(corrupted(&format!("channel metadata lacks required field {key}")));
+        }
+        if !matches!(channel.get(key), Some(CanonicalJsonValue::String(value)) if !value.is_empty()) {
+            return Err(corrupted(&format!("channel metadata field {key} must be a non-empty string")));
+        }
+    }
+    if let Some(references) = channel.get("references_external_message_id") {
+        if !matches!(references, CanonicalJsonValue::String(_)) {
+            return Err(corrupted("channel metadata references_external_message_id must be a string"));
         }
     }
     Ok(())
@@ -1129,6 +1166,71 @@ mod tests {
             store.find_intent(&key).expect_err("unknown top-level draft field must fail closed")
         };
         assert_eq!(error.code, codes::LEDGER_CORRUPT);
+    }
+
+    /// Parameterized draft-shape invariants: a canonical fully-rehashed
+    /// intent with a removed required root/namespace/channel field, a wrong
+    /// schema, or a wrong type must fail closed; the valid draft passes.
+    #[test]
+    fn draft_exact_shape_invariants_fail_closed() {
+        let mut connection = connection();
+        let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
+        let key = crate::ids::inbound_ingress_key(&account, "msg-1");
+
+        // Each case re-seeds a valid base intent, tampers one invariant in the
+        // stored draft, recomputes the outer record hash so the record is
+        // self-consistent, and requires exact-shape verification to fail
+        // closed. A valid draft always passes.
+        fn tamper_case(connection: &mut Connection, key: &str, account: &str, label: &str,
+            mutate: impl FnOnce(&mut serde_json::Value)) {
+            connection.execute("DELETE FROM channel_intent WHERE intent_key = ?1", [key]).unwrap();
+            {
+                let mut store = SqliteChannelStore::new(connection, &principal(), 1).unwrap();
+                store.write_prepared(&valid_intent(key, account, "msg-1")).unwrap();
+            }
+            let intent = {
+                let mut store = SqliteChannelStore::new(connection, &principal(), 1).unwrap();
+                let intent = store.find_intent(key).unwrap().expect("base intent");
+                let mut draft: serde_json::Value = serde_json::from_str(&intent.request_jcs).unwrap();
+                mutate(&mut draft);
+                let mut i2 = intent;
+                i2.request_jcs = draft.to_string();
+                i2
+            };
+            let canonical = intent.canonical_string().unwrap();
+            let digest = Sha256Digest::compute(canonical.as_bytes()).to_canonical_string();
+            connection.execute(
+                "UPDATE channel_intent SET record_digest = ?1, canonical_jcs = ?2 WHERE intent_key = ?3",
+                rusqlite::params![digest, canonical.as_bytes(), key],
+            ).unwrap();
+            let error = {
+                let mut store = SqliteChannelStore::new(connection, &principal(), 1).unwrap();
+                store.find_intent(key).expect_err(&format!("{label} must fail closed"))
+            };
+            assert_eq!(error.code, codes::LEDGER_CORRUPT);
+        }
+
+        tamper_case(&mut connection, &key, &account, "missing root schema", |d| { d.as_object_mut().unwrap().remove("schema"); });
+        tamper_case(&mut connection, &key, &account, "wrong root schema", |d| { d["schema"] = serde_json::json!("dolly.evil/v1"); });
+        tamper_case(&mut connection, &key, &account, "missing root parts", |d| { d.as_object_mut().unwrap().remove("parts"); });
+        tamper_case(&mut connection, &key, &account, "missing root actions", |d| { d.as_object_mut().unwrap().remove("actions"); });
+        tamper_case(&mut connection, &key, &account, "wrong parts type", |d| { d["parts"] = serde_json::json!("text"); });
+        tamper_case(&mut connection, &key, &account, "wrong actions type", |d| { d["actions"] = serde_json::json!({"a": 1}); });
+        tamper_case(&mut connection, &key, &account, "wrong schema type", |d| { d["schema"] = serde_json::json!(1); });
+        tamper_case(&mut connection, &key, &account, "missing channel transport", |d| { d["metadata"]["org.dolly.channel"].as_object_mut().unwrap().remove("transport"); });
+        tamper_case(&mut connection, &key, &account, "missing channel sender_class", |d| { d["metadata"]["org.dolly.channel"].as_object_mut().unwrap().remove("sender_class"); });
+        tamper_case(&mut connection, &key, &account, "missing channel session_id", |d| { d["metadata"]["org.dolly.channel"].as_object_mut().unwrap().remove("session_id"); });
+        tamper_case(&mut connection, &key, &account, "wrong channel transport type", |d| { d["metadata"]["org.dolly.channel"]["transport"] = serde_json::json!(3); });
+        tamper_case(&mut connection, &key, &account, "missing metadata namespace", |d| { d["metadata"].as_object_mut().unwrap().remove("org.dolly.channel"); });
+
+        // A valid, unmodified draft still passes exact-shape verification.
+        connection.execute("DELETE FROM channel_intent WHERE intent_key = ?1", [&key]).unwrap();
+        {
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+            store.write_prepared(&valid_intent(&key, &account, "msg-1")).unwrap();
+        }
+        let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+        assert!(store.find_intent(&key).unwrap().is_some(), "valid draft must pass");
     }
 
     #[test]
