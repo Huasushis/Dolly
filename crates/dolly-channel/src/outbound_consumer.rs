@@ -151,7 +151,10 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 "the outbound transport must be idempotency-keyed (durable idempotency keys are required before any transport effect)",
             ));
         }
-        let queue = std::sync::Arc::new(BoundedPendingQueue::new());
+        let queue = std::sync::Arc::new(BoundedPendingQueue::new(
+            config.outbound_limits.max_pending_per_session,
+            config.outbound_limits.max_pending_total,
+        ));
         Ok(Self {
             config,
             clock,
@@ -214,7 +217,10 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 "the outbound transport must be idempotency-keyed (durable idempotency keys are required before any transport effect)",
             ));
         }
-        let queue = std::sync::Arc::new(BoundedPendingQueue::new());
+        let queue = std::sync::Arc::new(BoundedPendingQueue::new(
+            config.outbound_limits.max_pending_per_session,
+            config.outbound_limits.max_pending_total,
+        ));
         Ok(Self {
             config,
             clock,

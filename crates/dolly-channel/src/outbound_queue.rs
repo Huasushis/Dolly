@@ -66,10 +66,14 @@ struct QueueInner {
 pub struct BoundedPendingQueue {
     inner: Mutex<QueueInner>,
     changed: Condvar,
+    /// Maximum waiters per session (bounded admission gate).
+    per_session_capacity: usize,
+    /// Maximum waiters ledger-wide.
+    total_capacity: usize,
 }
 
 impl BoundedPendingQueue {
-    pub fn new() -> Self {
+    pub fn new(per_session_capacity: usize, total_capacity: usize) -> Self {
         Self {
             inner: Mutex::new(QueueInner {
                 next_ticket: 1,
@@ -78,6 +82,8 @@ impl BoundedPendingQueue {
                 cancelled: BTreeSet::new(),
             }),
             changed: Condvar::new(),
+            per_session_capacity,
+            total_capacity,
         }
     }
 
@@ -145,7 +151,25 @@ impl BoundedPendingQueue {
                 }
                 Ok(false) => {
                     // At durable capacity: (re)register this caller in FIFO
-                    // order and wait exactly the remaining duration.
+                    // order and wait exactly the remaining duration. The
+                    // WAITER registry itself is bounded per-session and
+                    // ledger-wide (saturation backpressures deterministically
+                    // with zero durable change).
+                    if my_ticket.is_none() {
+                        let per = guard
+                            .sessions
+                            .get(session_key)
+                            .map(|s| s.len())
+                            .unwrap_or(0);
+                        if per >= self.per_session_capacity
+                            || guard.waiters.len() >= self.total_capacity
+                        {
+                            return Err(Self::backpressure(
+                                session_key,
+                                "admission gate is saturated at bounded waiters",
+                            ));
+                        }
+                    }
                     let ticket = match my_ticket {
                         Some(t) => t,
                         None => {
@@ -253,7 +277,7 @@ mod tests {
 
     #[test]
     fn expired_deadline_never_grants_and_leaves_no_waiter() {
-        let gate = BoundedPendingQueue::new();
+        let gate = BoundedPendingQueue::new(2, 8);
         let c = clock();
         let mut calls = 0;
         // Capacity stays full and the deadline is already passed: the call
@@ -276,7 +300,7 @@ mod tests {
 
     #[test]
     fn cancel_removes_waiter_and_admission_backpressures() {
-        let gate = BoundedPendingQueue::new();
+        let gate = BoundedPendingQueue::new(2, 8);
         let gate = std::sync::Arc::new(gate);
         let g = std::sync::Arc::clone(&gate);
         let handle = std::thread::spawn(move || {
@@ -306,7 +330,7 @@ mod tests {
 
     #[test]
     fn granted_when_capacity_frees_and_admission_is_durable_marker() {
-        let gate = BoundedPendingQueue::new();
+        let gate = BoundedPendingQueue::new(2, 8);
         let c = clock();
         let slot = gate
             .admit(
