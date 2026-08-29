@@ -135,11 +135,45 @@ fn verify_draft_canonical(intent: &ChannelIntent) -> Result<(), ChannelError> {
         }
     }
     if let Some(references) = channel.get("references_external_message_id") {
-        if !matches!(references, CanonicalJsonValue::String(_)) {
-            return Err(corrupted("channel metadata references_external_message_id must be a string"));
+        // If present it must be a nonempty valid external identity string; a
+        // present empty/invalid value is rejected, never normalized to None.
+        match references {
+            CanonicalJsonValue::String(value) if !value.is_empty() && value.len() <= crate::ingress::MAX_EXTERNAL_ID_BYTES
+                && !value.chars().any(|c| c.is_control()) => {}
+            _ => return Err(corrupted("channel metadata references_external_message_id must be a nonempty valid external identity")),
         }
     }
+    // Exact relation shape consistent with the accepted builder: a message
+    // must not carry a reference; edit/delete must carry a nonempty reference.
+    let kind = match channel_text_value(channel, "event_kind") {
+        Some(kind) => kind,
+        None => return Err(corrupted("channel metadata lacks event_kind")),
+    };
+    let has_reference = channel.get("references_external_message_id").is_some();
+    match kind {
+        "message" => {
+            if has_reference {
+                return Err(corrupted("message draft must not carry a reference"));
+            }
+        }
+        "edit" | "delete" => {
+            if !has_reference {
+                return Err(corrupted("edit/delete draft must carry a nonempty reference"));
+            }
+        }
+        _ => return Err(corrupted("channel metadata event_kind is invalid")),
+    }
     Ok(())
+}
+
+fn channel_text_value<'a>(
+    channel: &'a dolly_canonical_json::CanonicalJsonObject,
+    field: &str,
+) -> Option<&'a str> {
+    match channel.get(field) {
+        Some(CanonicalJsonValue::String(value)) if !value.is_empty() => Some(value),
+        _ => None,
+    }
 }
 
 fn facts_event_kind(facts: &crate::host_adapter::ChannelDraftFacts) -> EventKind {
@@ -914,35 +948,41 @@ mod tests {
 
     /// A canonical draft whose `org.dolly.channel` metadata carries the full
     /// transport content facts (the single content source for the projection).
-    fn draft(external_message_id: &str) -> String {
+    fn draft(external_message_id: &str, kind: &str, references: Option<&str>) -> String {
+        let mut channel = serde_json::Map::new();
+        channel.insert("channel_id".into(), serde_json::json!("web-primary"));
+        channel.insert("transport".into(), serde_json::json!("web"));
+        channel.insert("session_id".into(), serde_json::json!("session-mapped"));
+        channel.insert("external_conversation_id".into(), serde_json::json!("conv-1"));
+        channel.insert("external_message_id".into(), serde_json::json!(external_message_id));
+        channel.insert("sender_class".into(), serde_json::json!("user"));
+        channel.insert("received_at".into(), serde_json::json!("2026-08-28T00:00:00.000000Z"));
+        channel.insert("event_kind".into(), serde_json::json!(kind));
+        if let Some(references) = references {
+            channel.insert("references_external_message_id".into(), serde_json::json!(references));
+        }
         let draft = serde_json::json!({
             "schema": "dolly.block-draft/v1",
             "parts": [{"kind": "text", "text": "hello", "format": "plain"}],
             "actions": [],
-            "metadata": {
-                "org.dolly.channel": {
-                    "channel_id": "web-primary",
-                    "transport": "web",
-                    "session_id": "session-mapped",
-                    "external_conversation_id": "conv-1",
-                    "external_message_id": external_message_id,
-                    "sender_class": "user",
-                    "received_at": "2026-08-28T00:00:00.000000Z",
-                    "event_kind": "message"
-                }
-            }
+            "metadata": { "org.dolly.channel": serde_json::Value::Object(channel) }
         });
         String::from_utf8(dolly_canonical_json::canonicalize(&draft).unwrap().0.as_bytes().to_vec()).expect("draft is UTF-8")
     }
 
     /// A semantically valid prepared intent (correct key, payload and
     /// operation digests derived from the canonical draft).
-    fn valid_intent(key: &str, account: &str, external_message_id: &str) -> ChannelIntent {
-        let request_jcs = draft(external_message_id);
+    fn valid_intent(key: &str, account: &str, external_message_id: &str, kind: EventKind, references: Option<&str>) -> ChannelIntent {
+        let (kind_name, reference_opt) = match kind {
+            EventKind::Message => ("message", None),
+            EventKind::Edit => ("edit", Some(references.expect("edit requires a reference"))),
+            EventKind::Delete => ("delete", Some(references.expect("delete requires a reference"))),
+        };
+        let request_jcs = draft(external_message_id, kind_name, reference_opt);
         let payload_digest = crate::host_adapter::payload_digest_of(&request_jcs);
         let digest = channel_intent_digest(
             account, "org.dolly.channel", "receiver", "worker-1", 1, 1, 1, "digest-g",
-            1, external_message_id, EventKind::Message, None,
+            1, external_message_id, kind, reference_opt,
             &["page-a".to_string()], &payload_digest,
         );
         ChannelIntent {
@@ -961,8 +1001,8 @@ mod tests {
             config_revision: 1,
             account: account.to_string(),
             external_event_id: external_message_id.to_string(),
-            kind: EventKind::Message,
-            references_external_event_id: None,
+            kind,
+            references_external_event_id: reference_opt.map(str::to_owned),
             target_page_ids: vec!["page-a".to_string()],
             payload_digest,
             request_jcs,
@@ -990,7 +1030,7 @@ mod tests {
         let key = crate::ids::inbound_ingress_key(&account, "msg-1");
         {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-            store.write_prepared(&valid_intent(&key, &account, "msg-1")).unwrap();
+            store.write_prepared(&valid_intent(&key, &account, "msg-1", EventKind::Message, None)).unwrap();
             // Sanity: the valid record reads back.
             assert!(store.find_intent(&key).unwrap().is_some());
         }
@@ -1024,13 +1064,13 @@ mod tests {
         let key = crate::ids::inbound_ingress_key(&account, "msg-1");
         {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-            store.write_prepared(&valid_intent(&key, &account, "msg-1")).unwrap();
+            store.write_prepared(&valid_intent(&key, &account, "msg-1", EventKind::Message, None)).unwrap();
         }
         // Rewrite the draft metadata to a different external message id.
         let intent = {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
             let mut i = store.find_intent(&key).unwrap().unwrap();
-            i.request_jcs = draft("msg-9");
+            i.request_jcs = draft("msg-9", "message", None);
             i
         };
         let canonical = intent.canonical_string().unwrap();
@@ -1052,7 +1092,7 @@ mod tests {
         let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
         let key = crate::ids::inbound_ingress_key(&account, "msg-1");
         let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-        let intent = valid_intent(&key, &account, "msg-1");
+        let intent = valid_intent(&key, &account, "msg-1", EventKind::Message, None);
         store.write_prepared(&intent).unwrap();
         store.commit_outcome(&key, Some("block-1"), None).unwrap();
         let ledger = store.project_ledger().unwrap();
@@ -1073,7 +1113,7 @@ mod tests {
         let key = crate::ids::inbound_ingress_key(&account, "msg-1");
         {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-            store.write_prepared(&valid_intent(&key, &account, "msg-1")).unwrap();
+            store.write_prepared(&valid_intent(&key, &account, "msg-1", EventKind::Message, None)).unwrap();
         }
         // Rewrite the stored draft with the SAME canonical value but serialized
         // in a noncanonical key order (object keys unsorted), and recompute the
@@ -1112,7 +1152,7 @@ mod tests {
         let key = crate::ids::inbound_ingress_key(&account, "msg-1");
         {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-            store.write_prepared(&valid_intent(&key, &account, "msg-1")).unwrap();
+            store.write_prepared(&valid_intent(&key, &account, "msg-1", EventKind::Message, None)).unwrap();
         }
         // Inject an unknown field into the channel metadata and recompute the
         // outer hash: strict metadata key-set verification must fail closed.
@@ -1145,7 +1185,7 @@ mod tests {
         let key = crate::ids::inbound_ingress_key(&account, "msg-1");
         {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-            store.write_prepared(&valid_intent(&key, &account, "msg-1")).unwrap();
+            store.write_prepared(&valid_intent(&key, &account, "msg-1", EventKind::Message, None)).unwrap();
         }
         let intent = {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
@@ -1186,7 +1226,7 @@ mod tests {
             connection.execute("DELETE FROM channel_intent WHERE intent_key = ?1", [key]).unwrap();
             {
                 let mut store = SqliteChannelStore::new(connection, &principal(), 1).unwrap();
-                store.write_prepared(&valid_intent(key, account, "msg-1")).unwrap();
+                store.write_prepared(&valid_intent(key, account, "msg-1", EventKind::Message, None)).unwrap();
             }
             let intent = {
                 let mut store = SqliteChannelStore::new(connection, &principal(), 1).unwrap();
@@ -1227,7 +1267,7 @@ mod tests {
         connection.execute("DELETE FROM channel_intent WHERE intent_key = ?1", [&key]).unwrap();
         {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-            store.write_prepared(&valid_intent(&key, &account, "msg-1")).unwrap();
+            store.write_prepared(&valid_intent(&key, &account, "msg-1", EventKind::Message, None)).unwrap();
         }
         let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
         assert!(store.find_intent(&key).unwrap().is_some(), "valid draft must pass");
@@ -1240,7 +1280,7 @@ mod tests {
         let key = crate::ids::inbound_ingress_key(&account, "msg-1");
         {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
-            store.write_prepared(&valid_intent(&key, &account, "msg-1")).unwrap();
+            store.write_prepared(&valid_intent(&key, &account, "msg-1", EventKind::Message, None)).unwrap();
         }
         let intent = {
             let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
@@ -1261,6 +1301,80 @@ mod tests {
             store.find_intent(&key).expect_err("unknown metadata namespace must fail closed")
         };
         assert_eq!(error.code, codes::LEDGER_CORRUPT);
+    }
+
+    /// Focused optional-reference invariant: a present-but-empty reference on
+    /// message/edit/delete (canonical, fully rehashed) must fail closed; a
+    /// valid absent-message and valid nonempty edit/delete pass.
+    #[test]
+    fn references_shape_invariants_fail_closed_and_valid_relations_pass() {
+        #[allow(clippy::too_many_arguments)]
+        fn reference_case(connection: &mut Connection, key: &str, account: &str,
+            external_message_id: &str, kind: EventKind, references: Option<&str>, label: &str,
+            mutate: impl FnOnce(&mut serde_json::Value)) {
+            connection.execute("DELETE FROM channel_intent WHERE intent_key = ?1", [key]).unwrap();
+            {
+                let mut store = SqliteChannelStore::new(connection, &principal(), 1).unwrap();
+                store.write_prepared(&valid_intent(key, account, external_message_id, kind, references)).unwrap();
+            }
+            let intent = {
+                let mut store = SqliteChannelStore::new(connection, &principal(), 1).unwrap();
+                let intent = store.find_intent(key).unwrap().expect("base intent");
+                let mut draft: serde_json::Value = serde_json::from_str(&intent.request_jcs).unwrap();
+                mutate(&mut draft);
+                let mut i2 = intent;
+                i2.request_jcs = draft.to_string();
+                i2
+            };
+            let canonical = intent.canonical_string().unwrap();
+            let digest = Sha256Digest::compute(canonical.as_bytes()).to_canonical_string();
+            connection.execute(
+                "UPDATE channel_intent SET record_digest = ?1, canonical_jcs = ?2 WHERE intent_key = ?3",
+                rusqlite::params![digest, canonical.as_bytes(), key],
+            ).unwrap();
+            let error = {
+                let mut store = SqliteChannelStore::new(connection, &principal(), 1).unwrap();
+                store.find_intent(key).expect_err(&format!("{label} must fail closed"))
+            };
+            assert_eq!(error.code, codes::LEDGER_CORRUPT);
+        }
+
+        let mut connection = connection();
+        let account = crate::ids::channel_account("owner-1", "org.dolly.channel", "receiver", "worker-1");
+        // Message carrying a present BUT empty reference must fail closed (an
+        // empty string is never normalized to None).
+        let key_msg = crate::ids::inbound_ingress_key(&account, "mref");
+        reference_case(&mut connection, &key_msg, &account, "mref", EventKind::Message, None, "empty reference on message",
+            |d| { d["metadata"]["org.dolly.channel"]["references_external_message_id"] = serde_json::json!(""); });
+        // Edit carrying a present BUT empty reference must fail closed.
+        let key_edit = crate::ids::inbound_ingress_key(&account, "eref");
+        reference_case(&mut connection, &key_edit, &account, "eref", EventKind::Edit, Some("msg-original"), "empty reference on edit",
+            |d| { d["metadata"]["org.dolly.channel"]["references_external_message_id"] = serde_json::json!(""); });
+        // Delete carrying a present BUT empty reference must fail closed.
+        let key_del = crate::ids::inbound_ingress_key(&account, "dref");
+        reference_case(&mut connection, &key_del, &account, "dref", EventKind::Delete, Some("msg-original"), "empty reference on delete",
+            |d| { d["metadata"]["org.dolly.channel"]["references_external_message_id"] = serde_json::json!(""); });
+        // A message whose draft illegally GAINS a reference must fail closed.
+        let key_gain = crate::ids::inbound_ingress_key(&account, "gref");
+        reference_case(&mut connection, &key_gain, &account, "gref", EventKind::Message, None, "message gaining a reference",
+            |d| { d["metadata"]["org.dolly.channel"]["references_external_message_id"] = serde_json::json!("msg-original"); });
+
+        // Valid absent-message passes.
+        connection.execute("DELETE FROM channel_intent WHERE intent_key = ?1", [&crate::ids::inbound_ingress_key(&account, "vm")]).unwrap();
+        {
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+            let key = crate::ids::inbound_ingress_key(&account, "vm");
+            store.write_prepared(&valid_intent(&key, &account, "vm", EventKind::Message, None)).unwrap();
+            assert!(store.find_intent(&key).unwrap().is_some(), "valid absent-message draft must pass");
+        }
+        // Valid nonempty edit/delete pass.
+        for (kind, suffix) in [(EventKind::Edit, "ve"), (EventKind::Delete, "vd")] {
+            connection.execute("DELETE FROM channel_intent WHERE intent_key = ?1", [&crate::ids::inbound_ingress_key(&account, suffix)]).unwrap();
+            let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
+            let key = crate::ids::inbound_ingress_key(&account, suffix);
+            store.write_prepared(&valid_intent(&key, &account, suffix, kind, Some("msg-original"))).unwrap();
+            assert!(store.find_intent(&key).unwrap().is_some(), "valid {kind:?} draft must pass");
+        }
     }
 
     #[test]

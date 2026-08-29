@@ -92,9 +92,22 @@ pub(crate) fn channel_facts_from_draft(
         "delete" => HostIngressKind::Delete,
         _ => return Err(CoreIngressError::Rejected { code: "CORE_INVALID_JSON".to_string() }),
     };
+    // The edit/delete reference is optional, but if PRESENT it must be a
+    // nonempty valid external identity string (the accepted builder emits only
+    // validated references); a present empty or malformed value is rejected,
+    // never normalized to None.
     let references_external_event_id = match channel.get("references_external_message_id") {
-        Some(CanonicalJsonValue::String(value)) if !value.is_empty() => Some(value.clone()),
-        _ => None,
+        None | Some(CanonicalJsonValue::Null) => None,
+        Some(CanonicalJsonValue::String(value)) => {
+            if value.is_empty()
+                || value.len() > crate::ingress::MAX_EXTERNAL_ID_BYTES
+                || value.chars().any(|character| character.is_control())
+            {
+                return Err(CoreIngressError::Rejected { code: "CORE_INVALID_JSON".to_string() });
+            }
+            Some(value.clone())
+        }
+        Some(_) => return Err(CoreIngressError::Rejected { code: "CORE_INVALID_JSON".to_string() }),
     };
     Ok(ChannelDraftFacts {
         external_event_id,
