@@ -260,3 +260,47 @@ impl<H: HostIngress> HostIngress for FaultyHostIngress<H> {
         self.inner.status(authority, grant, request)
     }
 }
+
+/// A `HostIngress` wrapper that captures the real committed mapping from
+/// `submit` and can override the `status` response with a CRAFTED mapping, so
+/// tests exercise the Channel-side validate_host_mapping against bad
+/// schema/key/operation-digest/identity/delivery mappings.
+pub struct MappingOverrideHost<H: HostIngress> {
+    inner: H,
+    pub last_mapping: Option<dolly_core_domain::HostIngressMapping>,
+    pub status_override: Option<dolly_core_domain::HostIngressStatus>,
+    pub submit_calls: u64,
+    pub status_calls: u64,
+}
+
+impl<H: HostIngress> MappingOverrideHost<H> {
+    pub fn new(inner: H) -> Self {
+        Self { inner, last_mapping: None, status_override: None, submit_calls: 0, status_calls: 0 }
+    }
+
+    pub fn with_status_override(mut self, status: dolly_core_domain::HostIngressStatus) -> Self {
+        self.status_override = Some(status);
+        self
+    }
+}
+
+impl<H: HostIngress> HostIngress for MappingOverrideHost<H> {
+    fn submit(&mut self, authority: &HostConnectionAuthority, grant: &HostCapabilityGrant,
+        request: &HostIngressSubmitRequest) -> Result<HostIngressSubmitOutcome, HostIngressError> {
+        self.submit_calls += 1;
+        let result = self.inner.submit(authority, grant, request);
+        if let Ok(HostIngressSubmitOutcome::Committed { mapping, .. }) = &result {
+            self.last_mapping = Some((**mapping).clone());
+        }
+        result
+    }
+    fn status(&mut self, authority: &HostConnectionAuthority, grant: &HostCapabilityGrant,
+        request: &HostIngressStatusRequest) -> Result<HostIngressStatus, HostIngressError> {
+        self.status_calls += 1;
+        if let Some(override_status) = &self.status_override {
+            return Ok(override_status.clone());
+        }
+        self.inner.status(authority, grant, request)
+    }
+}
+

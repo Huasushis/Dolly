@@ -29,11 +29,10 @@ use crate::error::{ChannelError, ChannelOutcome, codes};
 use crate::host_adapter::{HostIngressCoreAdapter, channel_intent_digest, payload_digest_of};
 use crate::ids;
 use crate::ingress::{
-    CoreIngress, CoreIngressError, IngressOutcome, IngressStatusResult, IngressSubmitReceipt,
+    CoreIngress, CoreIngressError, IngressOutcome, IngressSubmitReceipt,
     IngressSubmitRequest, InboundEvent, process_event,
 };
 use crate::intent::IntentState;
-use crate::ledger::ChannelLedger;
 use crate::principal::ChannelPrincipal;
 use crate::store::SqliteChannelStore;
 
@@ -236,38 +235,51 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
         // 2. Pre-replay conflict and prior-rejection binding against the
         //    durable intent: the Channel-local digest includes the ordered
         //    target Pages, so a same-key replay whose targets/order changed
-        //    conflicts BEFORE any Core path is reached.
-        if let Ok(Some(intent)) = self.store.find_intent(&intent_key) {
-            if intent.state == IntentState::Rejected {
-                let code = intent.rejected_code.clone().unwrap_or_else(|| codes::INTERNAL.to_string());
-                return IngressOutcome::RejectedBeforeMutation {
-                    error: ChannelError::new(code, false, ChannelOutcome::NotApplied, "the event key was already durably rejected"),
-                };
-            }
-            if intent.state == IntentState::Accepted {
-                let current_payload_digest = payload_digest_of(&intent.request_jcs);
-                let current_digest = channel_intent_digest(
-                    principal.account(), principal.extension_id(), principal.module_id(), principal.instance_id(),
-                    principal.generation(), principal.revision(), principal.graph_revision(), principal.graph_digest(),
-                    self.config.revision, &intent.external_event_id, intent.kind,
-                    intent.references_external_event_id.as_deref(), &self.config.target_page_ids,
-                    &current_payload_digest);
-                if current_digest != intent.digest {
+        //    conflicts BEFORE any Core path is reached. The accepted intent
+        //    is retained for the full Host-mapping validation on replay.
+        let accepted_pre_intent: Option<crate::intent::ChannelIntent> = match self.store.find_intent(&intent_key) {
+            Ok(Some(intent)) => {
+                if intent.state == IntentState::Rejected {
+                    let code = intent.rejected_code.clone().unwrap_or_else(|| codes::INTERNAL.to_string());
                     return IngressOutcome::RejectedBeforeMutation {
-                        error: ChannelError::new(codes::OPERATION_CONFLICT, false, ChannelOutcome::NotApplied, "the same event key now carries different pages/content/relation"),
+                        error: ChannelError::new(code, false, ChannelOutcome::NotApplied, "the event key was already durably rejected"),
                     };
                 }
+                if intent.state == IntentState::Accepted {
+                    let current_payload_digest = payload_digest_of(&intent.request_jcs);
+                    let current_digest = channel_intent_digest(
+                        principal.account(), principal.extension_id(), principal.module_id(), principal.instance_id(),
+                        principal.generation(), principal.revision(), principal.graph_revision(), principal.graph_digest(),
+                        self.config.revision, &intent.external_event_id, intent.kind,
+                        intent.references_external_event_id.as_deref(), &self.config.target_page_ids,
+                        &current_payload_digest);
+                    if current_digest != intent.digest {
+                        return IngressOutcome::RejectedBeforeMutation {
+                            error: ChannelError::new(codes::OPERATION_CONFLICT, false, ChannelOutcome::NotApplied, "the same event key now carries different pages/content/relation"),
+                        };
+                    }
+                    Some(intent)
+                } else {
+                    None
+                }
             }
-        }
+            Ok(None) => None,
+            Err(e) => return IngressOutcome::RejectedBeforeMutation { error: e },
+        };
 
         // 3. The accepted pipeline runs with a fresh adapter over the owned
         //    store. Suppress a durable sent-transport echo before Host/Core
         //    via the projection seeded with echo markers.
-        let mut ledger = ChannelLedger::new();
         let outcome = {
-            if let Ok(projected) = self.store.project_ledger() {
-                ledger = projected;
-            }
+            let ledger = match self.store.project_ledger() {
+                Ok(projected) => projected,
+                Err(_) => {
+                    // Corrupt Channel state (forged/noncanonical echo row or
+                    // intent) fails closed: no Host/Core effect, no success.
+                    return IngressOutcome::SubmissionPending;
+                }
+            };
+            let mut ledger = ledger;
             let mut adapter = HostIngressCoreAdapter::new(
                 &mut self.host,
                 self.authority,
@@ -279,34 +291,43 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
         };
 
         // 4. A replay must still revalidate the CURRENT authority/grant and
-        //    status before acknowledging.
+        //    status, and the returned Host mapping goes through the FULL
+        //    validate_host_mapping before the cached success is acknowledged.
         match outcome {
-            IngressOutcome::IdempotentReplay { block_id } => {
-                let mut adapter = HostIngressCoreAdapter::new(
-                    &mut self.host,
-                    self.authority,
-                    self.grant,
-                    &mut self.store,
-                    self.config.revision,
-                );
-                match adapter.status_for_event(&inbound.external_message_id) {
-                    Ok(IngressStatusResult::Committed { commit }) if commit.block_id == block_id => {
-                        IngressOutcome::IdempotentReplay { block_id }
+            IngressOutcome::IdempotentReplay { block_id } => match accepted_pre_intent {
+                Some(accepted_intent) => {
+                    let mut adapter = HostIngressCoreAdapter::new(
+                        &mut self.host,
+                        self.authority,
+                        self.grant,
+                        &mut self.store,
+                        self.config.revision,
+                    );
+                    match adapter.status_mapping_for_event(&inbound.external_message_id) {
+                        Ok(Some(mapping)) => {
+                            match crate::host_adapter::validate_host_mapping(&accepted_intent, &mapping) {
+                                Ok(()) if mapping.block_id == block_id => IngressOutcome::IdempotentReplay { block_id },
+                                Ok(()) => IngressOutcome::RejectedBeforeMutation {
+                                    error: ChannelError::new(codes::LEDGER_CORRUPT, false, ChannelOutcome::NotApplied, "replayed block identity does not match the durable Host mapping"),
+                                },
+                                Err(validation_error) => IngressOutcome::RejectedBeforeMutation { error: validation_error },
+                            }
+                        }
+                        Ok(None) => IngressOutcome::RejectedBeforeMutation {
+                            error: ChannelError::new(codes::LEDGER_CORRUPT, false, ChannelOutcome::NotApplied, "the accepted Channel row has no durable Host mapping"),
+                        },
+                        Err(CoreIngressError::Rejected { code }) => IngressOutcome::RejectedBeforeMutation {
+                            error: ChannelError::new(code, false, ChannelOutcome::NotApplied, "the current authority/grant revalidation rejected the replay"),
+                        },
+                        Err(_) => IngressOutcome::RejectedBeforeMutation {
+                            error: ChannelError::new(codes::INTERNAL, false, ChannelOutcome::NotApplied, "the current authority/grant revalidation outcome is unknown"),
+                        },
                     }
-                    Ok(IngressStatusResult::Committed { .. }) => IngressOutcome::RejectedBeforeMutation {
-                        error: ChannelError::new(codes::LEDGER_CORRUPT, false, ChannelOutcome::NotApplied, "replayed block identity does not match the durable Host mapping"),
-                    },
-                    Ok(IngressStatusResult::Absent) => IngressOutcome::RejectedBeforeMutation {
-                        error: ChannelError::new(codes::LEDGER_CORRUPT, false, ChannelOutcome::NotApplied, "the accepted Channel row has no durable Host mapping"),
-                    },
-                    Err(CoreIngressError::Rejected { code }) => IngressOutcome::RejectedBeforeMutation {
-                        error: ChannelError::new(code, false, ChannelOutcome::NotApplied, "the current authority/grant revalidation rejected the replay"),
-                    },
-                    Err(_) => IngressOutcome::RejectedBeforeMutation {
-                        error: ChannelError::new(codes::INTERNAL, false, ChannelOutcome::NotApplied, "the current authority/grant revalidation outcome is unknown"),
-                    },
                 }
-            }
+                None => IngressOutcome::RejectedBeforeMutation {
+                    error: ChannelError::new(codes::INTERNAL, false, ChannelOutcome::NotApplied, "accepted intent row vanished before replay validation"),
+                },
+            },
             other => other,
         }
     }

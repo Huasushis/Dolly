@@ -219,21 +219,40 @@ pub(crate) fn prepare_intent(
 }
 
 /// Validate a returned Host mapping against the exact prepared intent before
-/// any terminal commit: sealed principal/owner/source/module/instance/fences,
-/// external identity, operation/request digest inputs, canonical payload/
-/// content, edit-delete relation, ordered target Pages, and block/delivery
-/// linkage. A same-key mapping with different content/targets/relation is a
-/// conflict that must never be adopted as success.
+/// any terminal commit. This is the ONE complete validation path used by
+/// submit, status, reconcile and receiver-local replay adoption:
+///
+/// - exact mapping schema/version;
+/// - full sealed principal/owner/source/module/instance/fences + account;
+/// - deterministic Host ingress key recomputed from the mapping fields;
+/// - operation digest recomputed from the prepared intent / canonical request;
+/// - canonical payload/content byte-equal to the intent's canonical draft, and
+///   the payload digest recomputed;
+/// - edit-delete relation and exactly ordered target Pages;
+/// - ingress/block/command identity linkage and exact stored block identity;
+/// - an EXACT delivery sequence: count == ordered targets, same order, unique
+///   and strictly increasing commit sequences, every delivery on a target page
+///   of the mapping's block.
+///
+/// A same-key mapping with different content/targets/relation or any broken
+/// linkage is a conflict/corrupt that must never be adopted as success.
 pub(crate) fn validate_host_mapping(
     intent: &ChannelIntent,
     mapping: &HostIngressMapping,
 ) -> Result<(), ChannelError> {
+    use dolly_core_domain::{HOST_INGRESS_RECORD_SCHEMA, HostIngressKind};
+    use dolly_core_reducer::{derive_ingress_identity, derive_ingress_key};
+
     let mismatch = |what: &str| {
         ChannelError::new(codes::OPERATION_CONFLICT, false, ChannelOutcome::NotApplied, format!("host mapping does not match the prepared intent: {what}"))
     };
     let corrupt = |what: &str| {
         ChannelError::new(codes::LEDGER_CORRUPT, false, ChannelOutcome::NotApplied, format!("host mapping is inconsistent: {what}"))
     };
+    // Exact mapping schema/version.
+    if mapping.schema != HOST_INGRESS_RECORD_SCHEMA {
+        return Err(mismatch("schema/version"));
+    }
     if mapping.external_event_id != intent.external_event_id {
         return Err(mismatch("external identity"));
     }
@@ -255,13 +274,26 @@ pub(crate) fn validate_host_mapping(
     if account != intent.account {
         return Err(mismatch("account"));
     }
+    // Deterministic Host ingress key recomputed from the mapping fields.
+    let recomputed_key = derive_ingress_key(
+        &mapping.owner, &mapping.extension_id, &mapping.module_id, &mapping.instance_id,
+        &mapping.external_event_id,
+    );
+    if recomputed_key.as_str() != mapping.ingress_key {
+        return Err(mismatch("ingress key"));
+    }
     let kind = match mapping.kind.as_str() {
-        "message" => EventKind::Message,
-        "edit" => EventKind::Edit,
-        "delete" => EventKind::Delete,
+        "message" => HostIngressKind::Message,
+        "edit" => HostIngressKind::Edit,
+        "delete" => HostIngressKind::Delete,
         _ => return Err(mismatch("kind")),
     };
-    if kind != intent.kind {
+    let event_kind = match kind {
+        HostIngressKind::Message => EventKind::Message,
+        HostIngressKind::Edit => EventKind::Edit,
+        HostIngressKind::Delete => EventKind::Delete,
+    };
+    if event_kind != intent.kind {
         return Err(mismatch("kind"));
     }
     if mapping.references_external_event_id.as_deref() != intent.references_external_event_id.as_deref() {
@@ -270,13 +302,17 @@ pub(crate) fn validate_host_mapping(
     if mapping.target_page_ids != intent.target_page_ids {
         return Err(mismatch("ordered target pages"));
     }
-    // Canonical payload/content: recompute and compare the payload digest.
+    // Canonical payload/content: byte-equal to the intent's canonical draft,
+    // and the payload digest recomputed.
     let payload_bytes = dolly_canonical_json::canonicalize(&mapping.payload)
         .map_err(|e| corrupt(&format!("payload canonicalization: {e}")))?
         .0
         .as_bytes()
         .to_vec();
-    let payload_text = String::from_utf8(payload_bytes).map_err(|_| corrupt("payload is not UTF-8"))?;
+    let payload_text = String::from_utf8(payload_bytes.clone()).map_err(|_| corrupt("payload is not UTF-8"))?;
+    if payload_bytes != intent.request_jcs.as_bytes() {
+        return Err(mismatch("content"));
+    }
     let recomputed_payload = payload_digest_of(&payload_text);
     if recomputed_payload != mapping.payload_digest {
         return Err(corrupt("payload digest does not match the payload bytes"));
@@ -284,15 +320,57 @@ pub(crate) fn validate_host_mapping(
     if mapping.payload_digest != intent.payload_digest {
         return Err(mismatch("content"));
     }
-    // Block/delivery linkage: a committed mapping must mint a block delivered
-    // only to the intent's ordered target pages.
-    if mapping.block_id.is_empty() || mapping.ingress_id.is_empty() {
-        return Err(corrupt("mapping lacks block/ingress identity"));
+    // Operation digest recomputed from the intent/canonical request must match
+    // the mapping's stored operation digest.
+    let host_request = HostIngressSubmitRequest {
+        external_event_id: mapping.external_event_id.clone(),
+        kind,
+        references_external_event_id: mapping.references_external_event_id.clone(),
+        target_page_ids: mapping
+            .target_page_ids
+            .iter()
+            .map(|page| PageId::from_str(page).map_err(|_| mismatch("target page syntax")))
+            .collect::<Result<Vec<PageId>, ChannelError>>()?,
+        payload: mapping.payload.clone(),
+    };
+    let identity = derive_ingress_identity(
+        &mapping.owner, &mapping.extension_id, &mapping.module_id, &mapping.instance_id,
+        mapping.generation as u64, mapping.revision, mapping.graph_revision, &host_request,
+    )
+    .map_err(|_| corrupt("operation digest derivation"))?;
+    if identity.operation_digest != mapping.operation_digest {
+        return Err(corrupt("operation digest does not match the canonical request"));
     }
-    for delivery in &mapping.deliveries {
-        if !intent.target_page_ids.contains(&delivery.page_id) {
+    // Ingress/block/command linkage and exact stored block identity.
+    if mapping.ingress_id.is_empty() || mapping.block_id.is_empty() {
+        return Err(corrupt("mapping lacks ingress/block identity"));
+    }
+    let expected_command_id = format!("host-ingress-{}-{}", mapping.ingress_key, mapping.ingress_id);
+    if mapping.command_id != expected_command_id {
+        return Err(corrupt("ingress/command linkage"));
+    }
+    if let Some(stored_block_id) = &intent.block_id {
+        if stored_block_id != &mapping.block_id {
+            return Err(mismatch("block identity"));
+        }
+    }
+    // Exact delivery sequence: count/order/unique-commit/blob of the ordered
+    // target pages, all belonging to this mapping's block.
+    if mapping.deliveries.len() != intent.target_page_ids.len() {
+        return Err(mismatch("deliveries count"));
+    }
+    let mut previous_commit_seq = 0i64;
+    for (index, delivery) in mapping.deliveries.iter().enumerate() {
+        if delivery.page_id != intent.target_page_ids[index] {
+            return Err(mismatch("deliveries order"));
+        }
+        if delivery.commit_seq <= previous_commit_seq {
+            return Err(mismatch("deliveries uniqueness/order"));
+        }
+        if delivery.page_id.is_empty() {
             return Err(mismatch("delivery target"));
         }
+        previous_commit_seq = delivery.commit_seq;
     }
     Ok(())
 }
@@ -355,6 +433,7 @@ impl<'host, 'conn, 'principal, H: HostIngress + ?Sized> HostIngressCoreAdapter<'
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn status_for_event(
         &mut self,
         external_event_id: &str,
