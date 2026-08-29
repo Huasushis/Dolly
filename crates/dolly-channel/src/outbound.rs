@@ -45,6 +45,7 @@ pub struct SendAction {
     pub result_validator_revision: Option<i64>,
 }
 
+#[cfg(feature = "test-support")]
 /// Extract the channel send action from a committed Block. The block must
 /// carry an action named `org.dolly.channel.send` targeted at the configured
 /// module; anything else is not an outbound Channel operation.
@@ -127,6 +128,88 @@ pub fn parse_send_action(block: &Value) -> Result<SendAction, ChannelError> {
     }
     Err(rejected("outbound block has no targeted channel send action"))
 }
+/// Parse the frozen action object at `action_index` inside a committed
+/// Block's `body.actions` as a channel send (structural name/arguments/
+/// contract extraction only; see [`parse_send_action`] for the first-action
+/// form). Used by the manifest-selected boundary to honor the Action array
+/// order exactly.
+pub fn parse_send_action_at(block: &Value, action_index: usize) -> Result<SendAction, ChannelError> {
+    let rejected = |message: &str| {
+        ChannelError::new(
+            codes::MALFORMED_EVENT,
+            false,
+            ChannelOutcome::NotApplied,
+            message,
+        )
+    };
+    let obj = block
+        .as_object()
+        .ok_or_else(|| rejected("outbound block must be a JSON object"))?;
+    let body = obj
+        .get("body")
+        .and_then(Value::as_object)
+        .ok_or_else(|| rejected("outbound block missing body"))?;
+    let actions = body
+        .get("actions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| rejected("outbound block body missing actions"))?;
+    let action = actions
+        .get(action_index)
+        .ok_or_else(|| rejected("outbound block has no action at manifest-selected index"))?;
+    let action_obj = action
+        .as_object()
+        .ok_or_else(|| rejected("action must be an object"))?;
+    let name = action_obj
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| rejected("action missing name"))?;
+    if name != crate::config::SEND_ACTION_NAME {
+        return Err(ChannelError::new(
+            codes::AUTHORIZATION_FAILED,
+            false,
+            ChannelOutcome::NotApplied,
+            format!("action {name} is not owned by the channel, not a channel send"),
+        ));
+    }
+    let action_id = action_obj
+        .get("action_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| rejected("action missing action_id"))?;
+    let target_module_id = action_obj
+        .get("target")
+        .and_then(|t| t.get("module_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| rejected("action missing target module_id"))?;
+    let arguments = serde_json::from_value::<CanonicalJsonValue>(
+        action_obj
+            .get("arguments")
+            .cloned()
+            .ok_or_else(|| rejected("action missing arguments"))?,
+    )
+    .map_err(|e| rejected(&format!("action arguments are not canonical JSON: {e}")))?;
+    let binding = action_obj.get("contract_binding");
+    let (result_validator_id, result_validator_revision) = binding
+        .and_then(|b| b.get("action_contract"))
+        .and_then(|c| c.get("result_schema"))
+        .and_then(|s| s.get("semantic_validator"))
+        .and_then(Value::as_object)
+        .map(|v| {
+            (
+                v.get("id").and_then(Value::as_str).map(|s| s.to_string()),
+                v.get("revision").and_then(Value::as_i64),
+            )
+        })
+        .unwrap_or((None, None));
+    Ok(SendAction {
+        action_id: action_id.to_string(),
+        name: name.to_string(),
+        target_module_id: target_module_id.to_string(),
+        arguments,
+        result_validator_id,
+        result_validator_revision,
+    })
+}
+
 
 /// The outcome of one outbound send attempt.
 #[derive(Debug, Clone, PartialEq)]

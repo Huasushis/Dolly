@@ -278,10 +278,21 @@ pub struct DurableOutboundRecord {
     pub version: i64,
     /// The durable row key: the committed Action's `action_id`.
     pub outbound_key: String,
-    /// Authority-bound operation digest (fences + target + canonical Action).
+    /// Authority-bound operation digest (fences + target + canonical Action +
+    /// exact Manifest coordinates).
     pub digest: String,
     /// The canonical committed `org.dolly.channel.send` Action bytes.
     pub action_jcs: String,
+    /// The Activation whose persisted manifest selected the input.
+    pub activation_id: String,
+    /// Deterministic digest of the frozen manifest bytes.
+    pub manifest_digest: String,
+    /// The input item's index in Manifest Delivery order.
+    pub input_index: usize,
+    /// The send Action's index within the frozen Block's `body.actions`.
+    pub action_index: usize,
+    /// The committed Block that delivered the Action.
+    pub block_id: String,
     /// The exactly targeted module of the committed Action.
     pub target_module_id: String,
     pub owner: String,
@@ -817,9 +828,9 @@ impl<'connection> SqliteChannelStore<'connection> {
             return Err(corrupted("channel outbound action bytes are not canonically encoded"));
         }
         // Recompute the authority-bound operation digest from the exact
-        // committed Action bytes, the targeted module, the config revision
-        // and the complete principal fences.
-        let recomputed_digest = crate::host_adapter::outbound_operation_digest(
+        // committed Action bytes, the targeted module, the config revision,
+        // the complete principal fences AND the exact Manifest coordinates.
+        let base_digest = crate::host_adapter::outbound_operation_digest(
             &record.extension_id,
             &record.module_id,
             &record.instance_id,
@@ -832,6 +843,24 @@ impl<'connection> SqliteChannelStore<'connection> {
             &record.action_jcs,
             &record.target_module_id,
         );
+        let mut identity = serde_json::Map::new();
+        identity.insert(
+            "schema".into(),
+            serde_json::json!("dolly.channel-outbound/manifest-selected/v1"),
+        );
+        identity.insert("base".into(), serde_json::json!(base_digest));
+        identity.insert("activation_id".into(), serde_json::json!(record.activation_id));
+        identity.insert("manifest_digest".into(), serde_json::json!(record.manifest_digest));
+        identity.insert("input_index".into(), serde_json::json!(record.input_index));
+        identity.insert("action_index".into(), serde_json::json!(record.action_index));
+        identity.insert("block_id".into(), serde_json::json!(record.block_id));
+        let recomputed_digest = Sha256Digest::compute(
+            dolly_canonical_json::canonicalize(&serde_json::Value::Object(identity))
+                .expect("identity is canonical JSON")
+                .0
+                .as_bytes(),
+        )
+        .to_canonical_string();
         if recomputed_digest != record.digest {
             return Err(corrupted("channel outbound operation digest mismatch (semantic tamper)"));
         }
@@ -2266,16 +2295,37 @@ mod tests {
     fn valid_outbound_record(action_id: &str, session_id: &str, target: &str, text: &str) -> DurableOutboundRecord {
         let action_jcs = send_action_jcs(action_id, session_id, target, text);
         let account = outbound_account();
-        let digest = crate::host_adapter::outbound_operation_digest(
+        let base_digest = crate::host_adapter::outbound_operation_digest(
             "org.dolly.channel", "receiver", "worker-1", 1, 1, 1, "digest-g",
             1, &account, &action_jcs, target,
         );
+        // Extended manifest-selected digest (matches verify_outbound_record).
+        let mut identity = serde_json::Map::new();
+        identity.insert("schema".into(), serde_json::json!("dolly.channel-outbound/manifest-selected/v1"));
+        identity.insert("base".into(), serde_json::json!(base_digest));
+        identity.insert("activation_id".into(), serde_json::json!("activation-test"));
+        identity.insert("manifest_digest".into(), serde_json::json!("sha256:manifest-test"));
+        identity.insert("input_index".into(), serde_json::json!(0usize));
+        identity.insert("action_index".into(), serde_json::json!(0usize));
+        identity.insert("block_id".into(), serde_json::json!("block-test"));
+        let digest = Sha256Digest::compute(
+            dolly_canonical_json::canonicalize(&serde_json::Value::Object(identity))
+                .expect("identity is canonical JSON")
+                .0
+                .as_bytes(),
+        )
+        .to_canonical_string();
         DurableOutboundRecord {
             schema: OUTBOUND_RECORD_SCHEMA.to_string(),
             version: 1,
             outbound_key: action_id.to_string(),
             digest,
             action_jcs,
+            activation_id: "activation-test".to_string(),
+            manifest_digest: "sha256:manifest-test".to_string(),
+            input_index: 0,
+            action_index: 0,
+            block_id: "block-test".to_string(),
             target_module_id: target.to_string(),
             owner: "owner-1".to_string(),
             extension_id: "org.dolly.channel".to_string(),

@@ -65,7 +65,7 @@ struct QueueInner {
 /// The per-store/account outbound admission gate. Capacity bounds, atomic
 /// admission, and the durable FIFO order live in the Channel DB; this gate
 /// adds the waiters, exact caller deadlines, FIFO fairness, and cancellation.
-pub struct BoundedPendingQueue {
+pub(crate) struct BoundedPendingQueue {
     inner: Mutex<QueueInner>,
     changed: Condvar,
     /// Maximum waiters per session (bounded admission gate).
@@ -447,6 +447,13 @@ impl OutboundQueueGate {
     /// occupancy.
     pub fn wake_all(&self) {
         self.gate.wake_all();
+    }
+
+    /// Cancel a waiting admission by its durable action key (removes the
+    /// waiter; zero durable change). The cancellation seam for the integrator.
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
+    pub fn cancel(&self, action_key: &str) {
+        self.gate.cancel(action_key);
     }
 
     pub fn waiting(&self, session_key: &str) -> usize {

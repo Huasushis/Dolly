@@ -26,67 +26,11 @@ use crate::config::ChannelConfig;
 use crate::error::{ChannelError, ChannelOutcome, codes};
 use crate::ledger::{ChannelLedger, OutboundEntry, OutboundState};
 use crate::outbound::{SendDispatchResult, build_prepared_entry, transport_and_settle};
-use crate::outbound_committed::{CommittedSendAction, committed_send_from_block};
+use crate::outbound_committed::CommittedSendAction;
 use crate::outbound_queue::OutboundQueueGate;
 use crate::principal::ChannelPrincipal;
 use crate::store::{DispatchClaim, DurableOutboundRecord, OutboundPreparedOutcome, SqliteChannelStore};
 
-/// The EXACT committed outbound Action transition (A): a Block becomes a
-/// downstream send authority ONLY when all of the following hold against the
-/// authoritative Core snapshot (which is journal-verified on load):
-///   1. the Block is recorded by an `IngressCommitted` journal event in the
-///      immutable Core journal — never a caller-shaped or enumerated
-///      operation, and never a `runtime_events` record;
-///   2. the ingress operation's `runtime_source` is a module present in the
-///      CURRENT authoritative graph descriptors (any foreign/inbound source,
-///      including `model/web-channel` or an arbitrary `CoreCommand::Ingress`)
-///      cannot mint send authority;
-///   3. the graph's `authorized_action_names` authorizes
-///      `org.dolly.channel.send`.
-/// `committed_send_from_block` then validates target module, result contract,
-/// arguments schema, and the account-owned session under the sealed principal.
-fn exact_outbound_transition(snapshot: &CoreSnapshot, block_id: &str) -> bool {
-    let journal_recorded = snapshot.journal.iter().any(|event| {
-        event.event == "IngressCommitted"
-            && event
-                .details
-                .as_ref()
-                .and_then(|details| details.get("block_id"))
-                .and_then(Value::as_str)
-                == Some(block_id)
-    });
-    if !journal_recorded {
-        return false;
-    }
-    // The ingress operation identity is `{runtime_source}\0{ingress_key}`;
-    // the emitter names the graph module that produced the action.
-    let emitter = snapshot
-        .ingress
-        .iter()
-        .find(|(_, record)| record.block_id == block_id)
-        .map(|(key, _)| key.split('\u{0}').next().unwrap_or("").to_string());
-    let Some(emitter) = emitter else { return false; };
-    // The authoritative graph document: the snapshot's top-level `graph` is
-    // the operable wrapper `{digest, graph, revision}`; the installed
-    // document (descriptors + authorized_action_names) is under `graph`.
-    let document = snapshot
-        .graph
-        .get("graph")
-        .unwrap_or(&snapshot.graph);
-    let Some(descriptors) = document.get("descriptors").and_then(Value::as_object) else {
-        return false;
-    };
-    if !descriptors.contains_key(&emitter) {
-        return false;
-    }
-    document
-        .get("authorized_action_names")
-        .and_then(Value::as_array)
-        .map(|actions| {
-            actions.iter().any(|v| v.as_str() == Some(crate::config::SEND_ACTION_NAME))
-        })
-        .unwrap_or(false)
-}
 
 /// The closed outcome of processing one committed Action.
 #[derive(Debug, Clone, PartialEq)]
@@ -123,6 +67,11 @@ pub struct OutboundConsumer<'store, 'core, 'principal> {
     /// waiter gate AND the configured per-session rate limiters, so
     /// constructors never create independent gates/buckets.
     gate: std::sync::Arc<OutboundQueueGate>,
+    /// Test-support: barrier hook called at every effect boundary
+    /// ("after_queue_wait", "before_transport", "before_commit") so fence
+    /// changes can be raced deterministically without sleeps.
+    #[cfg(feature = "test-support")]
+    effect_hook: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
     authority: &'principal HostConnectionAuthority,
     grant: &'principal HostCapabilityGrant,
     principal: ChannelPrincipal,
@@ -144,11 +93,43 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
     /// authoritative Runtime Core snapshot reader, and build the bounded
     /// queue from the configured outbound limits. Every durable effect
     /// re-verifies the full principal against the store.
+    /// Test/dev convenience: builds ONE injected gate for the consumer's
+    /// account+config, then delegates to [`Self::new`]. Production callers
+    /// MUST inject their own identity-enforced gate (the consumer never
+    /// constructs a gate or limiter in the production path).
+    #[cfg(feature = "test-support")]
+    pub fn new_dev(
+        config: ChannelConfig,
+        clock: Box<dyn Clock>,
+        module_connection: &'store mut rusqlite::Connection,
+        runtime_connection: &'core mut rusqlite::Connection,
+        transport: Box<dyn crate::transport::ChannelTransport>,
+        authority: &'principal HostConnectionAuthority,
+        grant: &'principal HostCapabilityGrant,
+    ) -> Result<Self, ChannelError> {
+        let principal = ChannelPrincipal::from_authority_grant(authority, grant)?;
+        let gate = std::sync::Arc::new(OutboundQueueGate::new(
+            principal.account(),
+            config.outbound_limits,
+        ));
+        Self::new(
+            config,
+            clock,
+            module_connection,
+            runtime_connection,
+            gate,
+            transport,
+            authority,
+            grant,
+        )
+    }
+
     pub fn new(
         config: ChannelConfig,
         clock: Box<dyn Clock>,
         module_connection: &'store mut rusqlite::Connection,
         runtime_connection: &'core mut rusqlite::Connection,
+        gate: std::sync::Arc<OutboundQueueGate>,
         transport: Box<dyn crate::transport::ChannelTransport>,
         authority: &'principal HostConnectionAuthority,
         grant: &'principal HostCapabilityGrant,
@@ -170,6 +151,17 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 "channel config Module does not match the granted Module",
             ));
         }
+        // Identity-enforced gate: the injected gate must belong to the SAME
+        // store/account this consumer is bound to. The gate is integrator-
+        // owned (ONE per store/account); the consumer never constructs one.
+        if gate.account() != principal.account() {
+            return Err(ChannelError::new(
+                codes::AUTHENTICATION_FAILED,
+                false,
+                ChannelOutcome::NotApplied,
+                "injected outbound gate belongs to a different account",
+            ));
+        }
         let mut config = config;
         config.transport_account = principal.account().to_string();
         let store = SqliteChannelStore::new(module_connection, &principal, config.revision)?;
@@ -189,10 +181,6 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 "the outbound transport must be idempotency-keyed (durable idempotency keys are required before any transport effect)",
             ));
         }
-        let gate = std::sync::Arc::new(OutboundQueueGate::new(
-            principal.account(),
-            config.outbound_limits,
-        ));
         Ok(Self {
             config,
             clock,
@@ -200,6 +188,8 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
             core,
             transport,
             gate,
+            #[cfg(feature = "test-support")]
+            effect_hook: None,
             authority,
             grant,
             principal,
@@ -265,6 +255,8 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
             core,
             transport,
             gate,
+            #[cfg(feature = "test-support")]
+            effect_hook: None,
             authority,
             grant,
             principal,
@@ -275,6 +267,21 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
     /// enforced by identity).
     pub fn gate(&self) -> std::sync::Arc<OutboundQueueGate> {
         std::sync::Arc::clone(&self.gate)
+    }
+
+    /// Test-support: install a barrier hook invoked at each effect boundary.
+    #[cfg(feature = "test-support")]
+    pub fn set_effect_barrier(&mut self, hook: std::sync::Arc<dyn Fn(&str) + Send + Sync>) {
+        self.effect_hook = Some(hook);
+    }
+
+    #[cfg(not(feature = "test-support"))]
+    fn effect_ts(&self, _label: &str) {}
+    #[cfg(feature = "test-support")]
+    fn effect_ts(&self, label: &str) {
+        if let Some(hook) = &self.effect_hook {
+            hook(label);
+        }
     }
 
     /// The current in-memory Channel ledger projection (sessions + durable
@@ -395,6 +402,14 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
     /// the journal and whose body carries a channel send Action targeting the
     /// configured module are returned; everything else is skipped (never
     /// caller-shaped, never a generic Block scan).
+    /// Select the committed, targeted `org.dolly.channel.send` Actions from
+    /// the configured Module's persisted ActivationManifest (Commit 1):
+    /// iterate `CoreSnapshot.activations[*].manifest` input_items in Manifest
+    /// Delivery order, then each Action in `body.actions` order, and construct
+    /// [`CommittedSendAction`] only from a frozen committed Block delivered
+    /// through a configured input Page. `CoreSnapshot.blocks`, journal,
+    /// ingress, runtime_events, and graph-descriptor membership alone never
+    /// mint send authority.
     fn committed_targeted_actions(
         &mut self,
     ) -> Result<Vec<CommittedSendAction>, ChannelError> {
@@ -407,25 +422,71 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
             )
         })?;
         let ledger = self.store.project_ledger()?;
+        // Configured input Pages for this module (frozen graph bytes are
+        // interpretation authority; they never mint identity by themselves).
+        let configured_pages = configured_input_pages(&snapshot, &self.config.module_id);
         let mut actions = Vec::new();
-        for (block_id, block) in &snapshot.blocks {
-            // Exact committed outbound Action transition (A): only a
-            // journal-recorded ingress from a current graph module with the
-            // send action authorized can become send authority; arbitrary
-            // ingress/runtime_events blocks cannot.
-            if !exact_outbound_transition(&snapshot, block_id) {
+        for activation in snapshot.activations.values() {
+            let Some(manifest) = &activation.manifest else { continue };
+            if manifest.get("module_id").and_then(Value::as_str) != Some(self.config.module_id.as_str()) {
                 continue;
             }
-            if !block_has_send_action(block) {
+            if manifest.get("reason").and_then(Value::as_str) != Some("input") {
                 continue;
             }
-            match committed_send_from_block(block_id, block, &self.principal, &self.config, &ledger) {
-                Ok(action) => actions.push(action),
-                Err(_) => {
-                    // A Block carrying a channel send name but failing the
-                    // sealed authority/contract/session validation is not a
-                    // consumable targeted Action. It is skipped (zero effect),
-                    // never enqueued or transported.
+            let Some(input_items) = manifest.get("input_items").and_then(Value::as_array) else {
+                continue;
+            };
+            for (input_index, item) in input_items.iter().enumerate() {
+                // The frozen Block must have been delivered through a
+                // configured input Page (an occurrence on a configured Page).
+                let delivered_on_configured_page = item
+                    .get("occurrences")
+                    .and_then(Value::as_array)
+                    .map(|occurrences| {
+                        occurrences.iter().any(|occ| {
+                            occ.get("page_id")
+                                .and_then(Value::as_str)
+                                .map(|page| configured_pages.contains(page))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false);
+                if !delivered_on_configured_page {
+                    continue;
+                }
+                let Some(actions_in_block) = item
+                    .get("block")
+                    .and_then(|b| b.get("body"))
+                    .and_then(Value::as_object)
+                    .and_then(|body| body.get("actions"))
+                    .and_then(Value::as_array)
+                else {
+                    continue;
+                };
+                for (action_index, action) in actions_in_block.iter().enumerate() {
+                    if action.get("name").and_then(Value::as_str)
+                        != Some(crate::config::SEND_ACTION_NAME)
+                    {
+                        continue;
+                    }
+                    match CommittedSendAction::from_manifest_input(
+                        manifest,
+                        item,
+                        input_index,
+                        action_index,
+                        &self.principal,
+                        &self.config,
+                        &ledger,
+                    ) {
+                        Ok(action) => actions.push(action),
+                        Err(_) => {
+                            // An input carrying a channel send name but failing
+                            // the sealed authority/contract/session validation
+                            // is skipped (zero effect), never enqueued or
+                            // transported.
+                        }
+                    }
                 }
             }
         }
@@ -458,15 +519,21 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 );
                 let settled = match status {
                     crate::transport::TransportStatusResult::Confirmed { message_ids } => {
-                        // Reject BEFORE frozen-envelope settlement: every piece
-                        // must carry a real, non-empty transport id from the
-                        // status; a missing/malformed id is NEVER fabricated.
-                        let all_ids = record.entry.pieces.iter().all(|p| {
-                            message_ids
-                                .get(p.ordinal as usize)
-                                .map(|id| !id.is_empty())
-                                .unwrap_or(false)
-                        });
+                        // Reject BEFORE frozen-envelope settlement: the status
+                        // must carry EXACTLY one real, non-empty, unique
+                        // transport id per piece (missing, empty, duplicate,
+                        // gapped, or out-of-range IDs are NEVER fabricated).
+                        let len_ok = message_ids.len() == record.entry.pieces.len();
+                        let no_dup = (1..message_ids.len())
+                            .all(|i| !message_ids[..i].contains(&message_ids[i]));
+                        let all_ids = len_ok
+                            && no_dup
+                            && record.entry.pieces.iter().all(|p| {
+                                message_ids
+                                    .get(p.ordinal as usize)
+                                    .map(|id| !id.is_empty())
+                                    .unwrap_or(false)
+                            });
                         if !all_ids {
                             None
                         } else {
@@ -498,18 +565,25 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                         }
                     }
                     crate::transport::TransportStatusResult::Partial { pieces } => {
+                        if pieces.len() != record.entry.pieces.len() {
+                            // Gapped/out-of-range per-piece outcomes: reject
+                            // the whole settle before envelope settlement.
+                            None
+                        } else {
                         let mut entry = record.entry.clone();
                         let mut reject_partial = false;
+                        let mut confirmed_ids: Vec<String> = Vec::new();
                         for obs in pieces {
                             if let Some(piece) = entry.pieces.iter_mut().find(|p| p.ordinal == obs.ordinal()) {
                                 match obs {
                                     crate::transport::TransportPieceOutcome::Confirmed { message_id, .. } => {
-                                        if message_id.is_empty() {
-                                            // Malformed id: reject the whole
-                                            // settle (never fabricate).
+                                        if message_id.is_empty() || confirmed_ids.contains(&message_id) {
+                                            // Malformed/duplicate id: reject the
+                                            // whole settle (never fabricate).
                                             reject_partial = true;
                                             continue;
                                         }
+                                        confirmed_ids.push(message_id.clone());
                                         piece.transport_message_id = Some(message_id.clone());
                                         piece.outcome = Some(crate::ledger::PieceOutcome::Confirmed {
                                             transport_message_id: message_id,
@@ -541,6 +615,7 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                                 ledger.outbound_entry(&action_id).cloned()
                             }
                             _ => None,
+                        }
                         }
                         }
                     }
@@ -622,6 +697,11 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
             outbound_key: committed.action.action_id.clone(),
             digest: committed.operation_digest.clone(),
             action_jcs: committed.action_jcs.clone(),
+            activation_id: committed.activation_id.clone(),
+            manifest_digest: committed.manifest_digest.clone(),
+            input_index: committed.input_index,
+            action_index: committed.action_index,
+            block_id: committed.block_id.clone(),
             target_module_id: committed.action.target_module_id.clone(),
             owner: self.principal.owner().to_string(),
             extension_id: self.principal.extension_id().to_string(),
@@ -742,6 +822,7 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
         //    past the admit attempt, refuses the effect immediately. The row
         //    (if just admitted) stays durably Queued and is drained by FIFO
         //    on a later claim; zero transport now.
+        self.effect_ts("after_queue_wait");
         self.revalidate_current_grant()?;
         if crate::clock::timestamp_total_micros(self.clock.now().as_str())
             >= crate::clock::timestamp_total_micros(caller_deadline)
@@ -807,6 +888,7 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                         let record = self.build_terminal_record(committed, &entry);
                         // Fresh authority immediately before the recovery/
                         // result effect.
+                        self.effect_ts("before_commit");
                         self.revalidate_current_grant()?;
                         self.store.commit_outbound_terminal(&record)?;
                         // Terminal release frees durable occupancy; wake every
@@ -860,20 +942,25 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
     }
 }
 
-/// Cheap filter: does this committed block carry any `org.dolly.channel.send`
-/// Action at all? Blocks without one are not Channel outbound work.
-fn block_has_send_action(block: &Value) -> bool {
-    block
-        .get("body")
-        .and_then(Value::as_object)
-        .and_then(|body| body.get("actions"))
-        .and_then(Value::as_array)
-        .is_some_and(|actions| {
-            actions.iter().any(|action| {
-                action
-                    .get("name")
-                    .and_then(Value::as_str)
-                    == Some(crate::config::SEND_ACTION_NAME)
-            })
-        })
+/// The configured input Pages for `module_id`: the frozen graph document's
+/// `input_pages` map entry for the module (interpretation authority only —
+/// it validates which Page delivered a manifest-selected Block, it never
+/// mints identity). The operable graph wrapper is `{digest, graph, revision}`;
+/// the installed document is under `graph`.
+fn configured_input_pages(snapshot: &CoreSnapshot, module_id: &str) -> std::collections::BTreeSet<String> {
+    let document = snapshot
+        .graph
+        .get("graph")
+        .unwrap_or(&snapshot.graph);
+    let mut out = std::collections::BTreeSet::new();
+    if let Some(map) = document.get("input_pages").and_then(Value::as_object) {
+        if let Some(pages) = map.get(module_id).and_then(Value::as_array) {
+            for page in pages {
+                if let Some(p) = page.as_str() {
+                    out.insert(p.to_string());
+                }
+            }
+        }
+    }
+    out
 }

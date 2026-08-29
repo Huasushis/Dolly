@@ -21,18 +21,24 @@ mod common;
 use common::g4::*;
 use dolly_channel::{
     ChannelConfigBuilder, ChannelPrincipal, InboundReceiver, IngressOutcome, OutboundConsumer,
-    OutboundState, SqliteChannelStore, create_channel_store_schema,
+    OutboundQueueGate, OutboundState, SqliteChannelStore, create_channel_store_schema,
     timestamp_plus_seconds,
 };
 use dolly_channel::error::codes;
 use dolly_channel::transport::{
     ChannelTransport, TransportSendRequest, TransportSendResult, TransportPieceOutcome,
 };
-use dolly_core_reducer::{CoreCommand, EnvironmentInput, IngressCommand, TransitionOutcome};
+use dolly_core_reducer::{
+    BuildManifestCommand, CoreCommand, EnvironmentInput, IngressCommand, TransitionOutcome,
+};
 use dolly_storage::{SqliteCoreStore, SqliteHostIngressStore, create_host_ingress_schema};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use tempfile::TempDir;
+
+/// Canonical digest of `{}`, the empty effective config used in test manifests.
+const EMPTY_OBJECT_DIGEST: &str =
+    "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 
 /// A deterministic shared transport: the consumer owns a boxed copy while the
 /// test drives the script and inspects recorded calls through the Arc.
@@ -175,6 +181,7 @@ fn commit_block(
         .unwrap()
         .1
         .to_canonical_string();
+    let (block_for_manifest, pages_for_manifest) = (block.clone(), pages.clone());
     let mut store = SqliteCoreStore::new(connection).expect("core schema");
     let transition = store
         .transact(
@@ -198,6 +205,76 @@ fn commit_block(
         TransitionOutcome::Committed,
         "committed send block must commit"
     );
+    // Commit 1: SELECT the committed Block into the configured Module's
+    // persisted ActivationManifest.input_items (the ONLY authority that may
+    // mint send identity). BuildManifest freezes the manifest in Core.
+    persist_manifest_selection(connection, mark, key, block_id, &block_for_manifest, &pages_for_manifest);
+}
+
+/// Persist an ActivationManifest for the configured module whose input_items
+/// select `block` (delivered through `pages`). Only
+/// `CoreSnapshot.activations[*].manifest` may mint downstream send authority.
+fn persist_manifest_selection(
+    connection: &mut Connection,
+    mark: &str,
+    key: &str,
+    block_id: &str,
+    block: &Value,
+    pages: &[String],
+) {
+    let activation_id = format!("activation-{mark}-{key}");
+    let occurrences: Vec<Value> = pages
+        .iter()
+        .enumerate()
+        .map(|(i, page_id)| {
+            json!({"page_id": page_id, "page_seq": (i as i64) + 1, "commit_seq": (i as i64) + 1})
+        })
+        .collect();
+    let manifest = json!({
+        "schema": "dolly.activation-manifest/v1",
+        "activation_id": activation_id,
+        "module_id": MODULE_ID,
+        "reason": "input",
+        "created_at": CHANNEL_NOW,
+        "graph_revision": 1,
+        "config_revision": 1,
+        "descriptor_revision": 1,
+        "effective_config": {},
+        "effective_config_digest": EMPTY_OBJECT_DIGEST,
+        "required_frame_bytes": 2048,
+        "required_frame_nesting_depth": 4,
+        "input_items": [{
+            "block": block.clone(),
+            "occurrences": occurrences,
+            "occurrence_count": pages.len() as i64
+        }],
+        "cursor_spans": [],
+        "lossy_gaps": [],
+        "output_page_ids": [],
+        "neighbor_descriptors": [],
+        "deadline": timestamp_plus_seconds(CHANNEL_NOW, 60)
+    });
+    let mut store = SqliteCoreStore::new(connection).expect("core schema");
+    let transition = store
+        .transact(
+            &CoreCommand::BuildManifest(BuildManifestCommand {
+                command_id: format!("{mark}-build-{key}"),
+                activation_id,
+                manifest,
+                expected_graph_revision: None,
+                expected_descriptor_revision: None,
+            }),
+            &EnvironmentInput {
+                now: CHANNEL_NOW.into(),
+                ..Default::default()
+            },
+        )
+        .expect("manifest build must execute");
+    assert_eq!(
+        transition.outcome,
+        TransitionOutcome::Committed,
+        "activation manifest must commit"
+    );
 }
 
 struct Fixture {
@@ -213,7 +290,7 @@ struct Fixture {
 /// store FILE, and a real committed inbound premise so the session is
 /// account-owned and restores from the durable intent's projection.
 fn setup(mark: &str) -> Fixture {
-    let mut harness = RuntimeHarness::new(mark);
+    let mut harness = RuntimeHarness::new_with_inputs(mark, &["page-c"]);
     let dir = TempDir::new().expect("temp dir");
     let module_path = dir.path().join("channel.sqlite3");
     let mut module_conn = Connection::open(&module_path).expect("module store");
@@ -300,7 +377,7 @@ fn consume_one(
     transport: &SharedTransport,
 ) -> (Connection, dolly_channel::ConsumerOutcome) {
     let mut module_conn = reopen_module_store(fixture);
-    let mut consumer = OutboundConsumer::new(
+    let mut consumer = OutboundConsumer::new_dev(
         channel_config(),
         Box::new(channel_clock()),
         &mut module_conn,
@@ -327,7 +404,7 @@ fn committed_send_consumes_durably_with_exact_result_and_echo() {
         "ing-1",
         &format!("{action_id}-block"),
         send_block_for(MODULE_ID, action_id, &fixture.session, &["It will be sunny."]),
-        vec!["page-a".to_string()],
+        vec!["page-c".to_string()],
     );
     let transport = SharedTransport::new(true);
     transport.push(TransportSendResult::AllConfirmed {
@@ -392,7 +469,7 @@ fn pre_admission_durability_failure_yields_zero_effect() {
         "ing-1",
         &format!("{action_id}-block"),
         send_block_for(MODULE_ID, action_id, &fixture.session, &["Hello."]),
-        vec!["page-a".to_string()],
+        vec!["page-c".to_string()],
     );
     let transport = SharedTransport::new(true);
     {
@@ -441,7 +518,7 @@ fn wrong_target_foreign_owner_and_unowned_session_are_rejected_with_zero_effect(
         "ing-other",
         "block-other",
         other,
-        vec!["page-a".to_string()],
+        vec!["page-c".to_string()],
     );
     let mut foreign = send_block_for(
         MODULE_ID,
@@ -456,7 +533,7 @@ fn wrong_target_foreign_owner_and_unowned_session_are_rejected_with_zero_effect(
         "ing-foreign",
         "block-foreign",
         foreign,
-        vec!["page-a".to_string()],
+        vec!["page-c".to_string()],
     );
     let unowned = send_block_for(
         MODULE_ID,
@@ -470,12 +547,12 @@ fn wrong_target_foreign_owner_and_unowned_session_are_rejected_with_zero_effect(
         "ing-unowned",
         "block-unowned",
         unowned,
-        vec!["page-a".to_string()],
+        vec!["page-c".to_string()],
     );
 
     let transport = SharedTransport::new(true);
     let mut module_conn = reopen_module_store(&fixture);
-    let mut consumer = OutboundConsumer::new(
+    let mut consumer = OutboundConsumer::new_dev(
         channel_config(),
         Box::new(channel_clock()),
         &mut module_conn,
@@ -507,7 +584,7 @@ fn same_key_different_content_conflicts_before_enqueue() {
         "ing-a",
         &format!("{action_id}-block-a"),
         send_block_for(MODULE_ID, action_id, &fixture.session, &["Hello."]),
-        vec!["page-a".to_string()],
+        vec!["page-c".to_string()],
     );
     commit_block(
         &mut fixture.harness.connection,
@@ -515,14 +592,14 @@ fn same_key_different_content_conflicts_before_enqueue() {
         "ing-b",
         &format!("{action_id}-block-b"),
         send_block_for(MODULE_ID, action_id, &fixture.session, &["Different."]),
-        vec!["page-a".to_string()],
+        vec!["page-c".to_string()],
     );
     let transport = SharedTransport::new(true);
     transport.push(TransportSendResult::AllConfirmed {
         message_ids: vec!["m-conflict".to_string()],
     });
     let mut module_conn = reopen_module_store(&fixture);
-    let mut consumer = OutboundConsumer::new(
+    let mut consumer = OutboundConsumer::new_dev(
         channel_config(),
         Box::new(channel_clock()),
         &mut module_conn,
@@ -573,7 +650,7 @@ fn bounded_queue_waits_then_expires_and_releases_no_slot() {
         "ing-1",
         &format!("{a1}-block"),
         send_block_for(MODULE_ID, a1, &fixture.session, &["one"]),
-        vec!["page-a".to_string()],
+        vec!["page-c".to_string()],
     );
     commit_block(
         &mut fixture.harness.connection,
@@ -581,14 +658,14 @@ fn bounded_queue_waits_then_expires_and_releases_no_slot() {
         "ing-2",
         &format!("{a2}-block"),
         send_block_for(MODULE_ID, a2, &fixture.session, &["two"]),
-        vec!["page-a".to_string()],
+        vec!["page-c".to_string()],
     );
     let clock = SharedClock::at(CHANNEL_NOW);
     // a1's transport response is lost (Timeout -> dispatched-pending).
     let transport = SharedTransport::new(true);
     transport.push(TransportSendResult::Timeout); // a1 stays dispatched-pending
     let mut module_conn = reopen_module_store(&fixture);
-    let mut consumer = OutboundConsumer::new(
+    let mut consumer = OutboundConsumer::new_dev(
         config,
         Box::new(clock.clone()),
         &mut module_conn,
@@ -658,7 +735,7 @@ fn bounded_queue_waits_then_expires_and_releases_no_slot() {
         },
     );
     let mut module_conn2 = reopen_module_store(&fixture);
-    let mut consumer2 = OutboundConsumer::new(
+    let mut consumer2 = OutboundConsumer::new_dev(
         channel_config(),
         Box::new(channel_clock()),
         &mut module_conn2,
@@ -705,7 +782,7 @@ fn crash_after_prepared_before_dispatch_redispatch_and_never_duplicates() {
         "ing-1",
         &format!("{action_id}-block"),
         send_block_for(MODULE_ID, action_id, &fixture.session, &["Hello."]),
-        vec!["page-a".to_string()],
+        vec!["page-c".to_string()],
     );
     let transport = SharedTransport::new(true); // idempotency-keyed (required)
     transport.push(TransportSendResult::AllConfirmed {
@@ -755,7 +832,7 @@ fn crash_after_dispatch_marker_never_blind_resends_and_reconciles_status_first()
         "ing-1",
         &format!("{action_id}-block"),
         send_block_for(MODULE_ID, action_id, &fixture.session, &["Hello."]),
-        vec!["page-a".to_string()],
+        vec!["page-c".to_string()],
     );
     let transport = SharedTransport::new(true); // idempotency-keyed (required)
     transport.push(TransportSendResult::AllConfirmed {
@@ -786,7 +863,7 @@ fn crash_after_dispatch_marker_never_blind_resends_and_reconciles_status_first()
     // Phase B: restart. The durable row is Dispatched: it MUST NOT be
     // re-dispatched (no blind resend) and MUST NOT be reported success.
     let mut module_conn = reopen_module_store(&fixture);
-    let mut consumer2 = OutboundConsumer::new(
+    let mut consumer2 = OutboundConsumer::new_dev(
         channel_config(),
         Box::new(channel_clock()),
         &mut module_conn,
@@ -817,7 +894,7 @@ fn crash_after_dispatch_marker_never_blind_resends_and_reconciles_status_first()
         },
     );
     {
-            let mut consumer3 = OutboundConsumer::new(
+            let mut consumer3 = OutboundConsumer::new_dev(
             channel_config(),
             Box::new(channel_clock()),
             &mut module_conn,
@@ -848,7 +925,7 @@ fn partial_outcome_is_exact_and_non_retryable_with_durable_echo() {
         "ing-1",
         &format!("{action_id}-block"),
         send_block_for(MODULE_ID, action_id, &fixture.session, &["part one", "part two"]),
-        vec!["page-a".to_string()],
+        vec!["page-c".to_string()],
     );
     let transport = SharedTransport::new(true);
     transport.push(TransportSendResult::PerPiece {
@@ -895,7 +972,7 @@ fn zero_reverse_echo_or_premise_leakage() {
     // Only the committed INBOUND premise (no send Action) exists in Core.
     let transport = SharedTransport::new(true);
     let mut module_conn = reopen_module_store(&fixture);
-    let mut consumer = OutboundConsumer::new(
+    let mut consumer = OutboundConsumer::new_dev(
         channel_config(),
         Box::new(channel_clock()),
         &mut module_conn,
@@ -930,7 +1007,7 @@ fn revoked_grant_or_changed_lifecycle_fence_refuses_consume_before_any_effect() 
         "ing-1",
         &format!("{action_id}-block"),
         send_block_for(MODULE_ID, action_id, &fixture.session, &["Hello."]),
-        vec!["page-a".to_string()],
+        vec!["page-c".to_string()],
     );
 
     // Revoke the current capability grant: the grant fence no longer holds.
@@ -942,7 +1019,7 @@ fn revoked_grant_or_changed_lifecycle_fence_refuses_consume_before_any_effect() 
         message_ids: vec!["m-revoked".to_string()],
     });
     let mut module_conn = reopen_module_store(&fixture);
-    let mut consumer = OutboundConsumer::new(
+    let mut consumer = OutboundConsumer::new_dev(
         channel_config(),
         Box::new(channel_clock()),
         &mut module_conn,
@@ -983,7 +1060,7 @@ fn configured_rate_limit_refuses_burst_with_zero_transport_then_refills() {
         "ing-1",
         &format!("{a1}-block"),
         send_block_for(MODULE_ID, a1, &fixture.session, &["one"]),
-        vec!["page-a".to_string()],
+        vec!["page-c".to_string()],
     );
     commit_block(
         &mut fixture.harness.connection,
@@ -991,7 +1068,7 @@ fn configured_rate_limit_refuses_burst_with_zero_transport_then_refills() {
         "ing-2",
         &format!("{a2}-block"),
         send_block_for(MODULE_ID, a2, &fixture.session, &["two"]),
-        vec!["page-a".to_string()],
+        vec!["page-c".to_string()],
     );
     let transport = SharedTransport::new(true);
     transport.push(TransportSendResult::AllConfirmed {
@@ -1001,7 +1078,7 @@ fn configured_rate_limit_refuses_burst_with_zero_transport_then_refills() {
         message_ids: vec!["m-rate-2".to_string()],
     });
     let mut module_conn = reopen_module_store(&fixture);
-    let mut consumer = OutboundConsumer::new(
+    let mut consumer = OutboundConsumer::new_dev(
         config,
         Box::new(channel_clock()),
         &mut module_conn,
@@ -1036,7 +1113,7 @@ fn configured_rate_limit_refuses_burst_with_zero_transport_then_refills() {
     let mut clock = channel_clock();
     clock.advance_seconds(2);
     let mut module_conn2 = Connection::open(&fixture.module_path).unwrap();
-    let mut consumer2 = OutboundConsumer::new(
+    let mut consumer2 = OutboundConsumer::new_dev(
         channel_config(),
         Box::new(clock),
         &mut module_conn2,
@@ -1074,7 +1151,7 @@ fn status_first_settles_rejected_and_unknown_exactly() {
             &format!("ing-{i}"),
             &format!("{action}-block"),
             send_block_for(MODULE_ID, action, &fixture.session, &[msg]),
-            vec!["page-a".to_string()],
+            vec!["page-c".to_string()],
         );
     }
     let transport = SharedTransport::new(true);
@@ -1084,7 +1161,7 @@ fn status_first_settles_rejected_and_unknown_exactly() {
     transport.push(TransportSendResult::Timeout);
     let mut module_conn = reopen_module_store(&fixture);
     {
-        let mut consumer = OutboundConsumer::new(
+        let mut consumer = OutboundConsumer::new_dev(
             channel_config(),
             Box::new(channel_clock()),
             &mut module_conn,
@@ -1113,7 +1190,7 @@ fn status_first_settles_rejected_and_unknown_exactly() {
         a2,
         dolly_channel::transport::TransportStatusResult::Unknown,
     );
-    let mut consumer2 = OutboundConsumer::new(
+    let mut consumer2 = OutboundConsumer::new_dev(
         channel_config(),
         Box::new(channel_clock()),
         &mut module_conn,
@@ -1162,7 +1239,7 @@ fn generic_ingress_from_non_graph_source_cannot_mint_send_authority() {
                     operation_digest,
                     block_id: format!("{action_id}-block"),
                     block,
-                    pages: vec!["page-a".to_string()],
+                    pages: vec!["page-c".to_string()],
                 }),
                 &EnvironmentInput {
                     now: CHANNEL_NOW.into(),
@@ -1177,7 +1254,7 @@ fn generic_ingress_from_non_graph_source_cannot_mint_send_authority() {
         message_ids: vec!["m-foreign".to_string()],
     });
     let mut module_conn = reopen_module_store(&fixture);
-    let mut consumer = OutboundConsumer::new(
+    let mut consumer = OutboundConsumer::new_dev(
         channel_config(),
         Box::new(channel_clock()),
         &mut module_conn,
@@ -1196,27 +1273,29 @@ fn generic_ingress_from_non_graph_source_cannot_mint_send_authority() {
     );
 }
 
-/// A: revoke after the queue wait, immediately before the transport effect.
-/// The runtime DB is FILE-backed so a second connection can revoke the grant
-/// while the consumer's admission is blocked at the durable boundary; the
-/// post-wait revalidation must refuse with zero transport for the waiting
-/// action.
+/// A/Commit-1: fence changes are BARRIER-controlled at each effect boundary.
+/// A shared identity-enforced gate is used by two consumers; while the second
+/// consumer's admission is blocked at the durable gate, the first frees the
+/// slot (status-first reconcile) so the waiter is admitted, and the grant is
+/// revoked exactly at the "after_queue_wait" barrier — the post-wait fresh-
+/// authority recheck MUST refuse with zero transport. No sleeps or polling.
 #[test]
 fn revoke_after_queue_wait_refuses_before_transport_effect() {
     let dir = tempfile::TempDir::new().unwrap();
     let runtime_path = dir.path().join("runtime.sqlite3");
-    // File-backed harness = common::g4 RuntimeHarness::build over a file.
-    let (mut runtime, authority, grant, _graph_digest) = {
+    let (mut runtime, authority, grant) = {
         let mut connection = Connection::open(&runtime_path).unwrap();
         let authority = {
             let mut store = SqliteCoreStore::new(&mut connection).unwrap();
             configured(&mut store, "consumer-revoke-after-wait", 1);
-            let body = graph(&[MODULE_ID, MODULE_OTHER], &[]);
+            let body = graph(&[MODULE_ID, MODULE_OTHER], &["page-c"]);
             let graph_digest = digest(&body);
             install_graph(&mut store, "consumer-revoke-after-wait", 1, &body);
             let authority = store.bootstrap_host_connection().unwrap();
-            install_grant(&mut store, &authority, MODULE_ID, 1, 1, &graph_digest, &["host.ingress.submit"]);
-            install_grant(&mut store, &authority, MODULE_OTHER, 1, 1, &graph_digest, &["host.ingress.submit"]);
+            install_grant(
+                &mut store, &authority, MODULE_ID, 1, 1, &graph_digest,
+                &["host.ingress.submit"],
+            );
             authority
         };
         create_host_ingress_schema(&mut connection).unwrap();
@@ -1227,7 +1306,7 @@ fn revoke_after_queue_wait_refuses_before_transport_effect() {
                 .unwrap()
                 .unwrap()
         };
-        (connection, authority, grant, String::new())
+        (connection, authority, grant)
     };
     let module_path = dir.path().join("channel.sqlite3");
     {
@@ -1255,26 +1334,28 @@ fn revoke_after_queue_wait_refuses_before_transport_effect() {
         authority.worker_epoch().as_str(),
     );
     let session = dolly_channel::ids::dolly_session_id(&account, "conv-1");
-    let principal = dolly_channel::ChannelPrincipal::from_authority_grant(&authority, &grant).unwrap();
+    let principal = ChannelPrincipal::from_authority_grant(&authority, &grant).unwrap();
     let a1 = "0198ab31-6c44-7e8a-b2bb-000000000819";
     let a2 = "0198ab31-6c44-7e8a-b2bb-000000000820";
-    for (i, (action, msg)) in [(a1, "m-hold"), (a2, "m-wait")].into_iter().enumerate() {
+    // Pass 0: ONLY a1 is manifest-selected+committed; its transport response
+    // is lost (Timeout), holding the one durable slot as Dispatched-pending.
+    for (i, (action, msg)) in [(a1, "m-hold")].into_iter().enumerate() {
         let block = send_block_for(MODULE_ID, action, &session, &[msg]);
+        let mut store = SqliteCoreStore::new(&mut runtime).unwrap();
         let operation_digest = dolly_canonical_json::canonicalize(&block)
             .unwrap()
             .1
             .to_canonical_string();
-        let mut store = SqliteCoreStore::new(&mut runtime).unwrap();
-        let transition = store
+        let t = store
             .transact(
                 &CoreCommand::Ingress(IngressCommand {
-                    command_id: format!("rw-{i}"),
+                    command_id: format!("rw0-{i}"),
                     runtime_source: MODULE_ID.to_string(),
-                    ingress_key: format!("ing-{i}"),
+                    ingress_key: format!("ing0-{i}"),
                     operation_digest,
                     block_id: format!("{action}-block"),
-                    block,
-                    pages: vec!["page-a".to_string()],
+                    block: block.clone(),
+                    pages: vec!["page-c".to_string()],
                 }),
                 &EnvironmentInput {
                     now: CHANNEL_NOW.into(),
@@ -1282,55 +1363,155 @@ fn revoke_after_queue_wait_refuses_before_transport_effect() {
                 },
             )
             .unwrap();
-        assert_eq!(transition.outcome, TransitionOutcome::Committed);
+        assert_eq!(t.outcome, TransitionOutcome::Committed);
+        persist_manifest_selection(&mut runtime, "rw0", &format!("ing0-{i}"), &format!("{action}-block"), &block, &["page-c".to_string()]);
     }
     let config = ChannelConfigBuilder::new("web", "account-a", MODULE_ID, 1)
         .target_pages(&["page-a"])
         .max_pending_per_session(1)
         .build();
-    let clock = SharedClock::at(CHANNEL_NOW);
-    let transport = SharedTransport::new(true);
-    transport.push(TransportSendResult::Timeout); // a1 holds the one slot
-    let mut module_conn = Connection::open(&module_path).unwrap();
-    let mut consumer = OutboundConsumer::new(
-        config,
-        Box::new(clock.clone()),
-        &mut module_conn,
+    // ONE identity-enforced gate shared by both consumers.
+    let gate = std::sync::Arc::new(OutboundQueueGate::new(&account, config.outbound_limits));
+    let transport1 = SharedTransport::new(true);
+    transport1.push(TransportSendResult::Timeout); // a1 holds the slot
+    // Pass 0 dispatches a1 -> Dispatched-pending.
+    {
+        let mut module_conn0 = Connection::open(&module_path).unwrap();
+        let mut c0 = OutboundConsumer::new(
+            channel_config(),
+            Box::new(channel_clock()),
+            &mut module_conn0,
+            &mut runtime,
+            std::sync::Arc::clone(&gate),
+            Box::new(transport1.clone()),
+            &authority,
+            &grant,
+        )
+        .expect("consumer");
+        let outcomes = c0.consume(&far_deadline()).expect("pass0");
+        assert!(
+            outcomes.iter().any(|o| matches!(
+                o,
+                dolly_channel::ConsumerOutcome::Pending { .. }
+            )),
+            "a1 holds the durable slot as dispatched-pending"
+        );
+        drop(c0);
+    }
+    // Commit + manifest-select a2 (same input page page-c).
+    {
+        let block = send_block_for(MODULE_ID, a2, &session, &["m-wait"]);
+        let mut store = SqliteCoreStore::new(&mut runtime).unwrap();
+        let operation_digest = dolly_canonical_json::canonicalize(&block)
+            .unwrap()
+            .1
+            .to_canonical_string();
+        let t = store
+            .transact(
+                &CoreCommand::Ingress(IngressCommand {
+                    command_id: "rw2-ing".to_string(),
+                    runtime_source: MODULE_ID.to_string(),
+                    ingress_key: "ing2".to_string(),
+                    operation_digest,
+                    block_id: format!("{a2}-block"),
+                    block: block.clone(),
+                    pages: vec!["page-c".to_string()],
+                }),
+                &EnvironmentInput {
+                    now: CHANNEL_NOW.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(t.outcome, TransitionOutcome::Committed);
+        persist_manifest_selection(
+            &mut runtime, "rw2", "ing2", &format!("{a2}-block"), &block,
+            &["page-c".to_string()],
+        );
+    }
+    // Pass A: a1 -> Pending (skip); a2 waits at the durable gate (capacity 1,
+    // held by a1's Dispatched row). The hook reports the "after_queue_wait"
+    // effect boundary and blocks; the revoker reconciles a1 (freeing the
+    // slot), waits for the barrier, revokes the grant, and releases the hook
+    // — all driven by channels, no sleeps.
+    let (at_barrier_tx, at_barrier_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Arc::new(std::sync::Mutex::new(
+        std::sync::mpsc::channel::<()>().1,
+    ));
+    let (hook_tx, hook_rx) = std::sync::mpsc::channel::<String>();
+    let hook_release = std::sync::Arc::clone(&release_rx);
+    let barrier = std::sync::Arc::new(move |label: &str| {
+        hook_tx.send(label.to_string()).unwrap();
+        if label == "after_queue_wait" {
+            at_barrier_tx.send(()).unwrap();
+        }
+        hook_release.lock().unwrap().recv().unwrap();
+    });
+    let (release_tx, release_rx_inner) = std::sync::mpsc::channel::<()>();
+    *release_rx.lock().unwrap() = release_rx_inner;
+    let revoker = {
+        let module_path = module_path.clone();
+        let runtime_path = runtime_path.clone();
+        let gate = std::sync::Arc::clone(&gate);
+        let authority = authority.clone();
+        std::thread::spawn(move || {
+            let transport2 = SharedTransport::new(true);
+            transport2.push_status(
+                a1,
+                dolly_channel::transport::TransportStatusResult::Confirmed {
+                    message_ids: vec!["m-hold-confirmed".to_string()],
+                },
+            );
+            let mut revoke_conn = Connection::open(&runtime_path).unwrap();
+            let mut module_conn2 = Connection::open(&module_path).unwrap();
+            let grant2 = {
+                let s = SqliteCoreStore::new(&mut revoke_conn).unwrap();
+                s.current_host_capability_grant(&authority, EXTENSION_ID, MODULE_ID)
+                    .unwrap()
+                    .unwrap()
+            };
+            let mut consumer2 = OutboundConsumer::new(
+                channel_config(),
+                Box::new(channel_clock()),
+                &mut module_conn2,
+                &mut revoke_conn,
+                gate,
+                Box::new(transport2.clone()),
+                &authority,
+                &grant2,
+            )
+            .expect("consumer");
+            let remaining = consumer2.reconcile().expect("reconcile frees a1");
+            assert_eq!(remaining, 0, "a1 settled, occupancy freed");
+            drop(consumer2);
+            // Wait until a2 has been admitted (barrier at after_queue_wait),
+            // then revoke and release the barrier.
+            at_barrier_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("after_queue_wait barrier");
+            let mut store = SqliteCoreStore::new(&mut revoke_conn).unwrap();
+            store
+                .revoke_host_capability_grant(&authority, EXTENSION_ID, MODULE_ID)
+                .unwrap();
+            release_tx.send(()).unwrap();
+        })
+    };
+    let mut module_conn_a = Connection::open(&module_path).unwrap();
+    let mut consumer_a = OutboundConsumer::new(
+        channel_config(),
+        Box::new(channel_clock()),
+        &mut module_conn_a,
         &mut runtime,
-        Box::new(transport.clone()),
+        std::sync::Arc::clone(&gate),
+        Box::new(SharedTransport::new(true)),
         &authority,
         &grant,
     )
     .expect("consumer");
-    // While a2 is blocked waiting for durable capacity, a second connection
-    // revokes the grant (the assert happens through the consumer's own post-
-    // wait revalidation), then wakes the gate.
-    let queue_wake = consumer.gate();
-    let advance_clock = clock.clone();
-    let revoke_conn_path = runtime_path.clone();
-    let authority2 = authority.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(120));
-        {
-            let mut conn = Connection::open(&revoke_conn_path).unwrap();
-            let mut store = SqliteCoreStore::new(&mut conn).unwrap();
-            store
-                .revoke_host_capability_grant(&authority2, dolly_channel::EXTENSION_ID, MODULE_ID)
-                .unwrap();
-        }
-        advance_clock.advance_seconds(6);
-        queue_wake.wake_all();
-    });
-    // The pass must fail closed when a grant is revoked during/after the
-    // queue wait: either the whole consume returns CHANNEL_AUTHENTICATION_FAILED
-    // (the revoke landed before the next revalidation), or the waiting action
-    // is refused at its post-wait revalidation. Either way the waiting action
-    // must never reach the transport after revocation.
-    let results = consumer.consume(&timestamp_plus_seconds(CHANNEL_NOW, 4));
-    match results {
-        Err(error) => {
-            assert_eq!(error.code, codes::AUTHENTICATION_FAILED);
-        }
+    consumer_a.set_effect_barrier(barrier);
+    // The waiting action is refused by the post-wait fresh-authority check.
+    match consumer_a.consume(&far_deadline()) {
+        Err(error) => assert_eq!(error.code, codes::AUTHENTICATION_FAILED),
         Ok(outcomes) => {
             let refused = outcomes
                 .iter()
@@ -1342,20 +1523,11 @@ fn revoke_after_queue_wait_refuses_before_transport_effect() {
                     )
                 })
                 .count();
-            assert!(
-                refused >= 1,
-                "the waiting action must be refused after the grant is revoked"
-            );
+            assert!(refused >= 1, "waiting action must be refused after revocation");
         }
     }
-    // The waiting action (a2) is never transported after the revocation; the
-    // only permissible transport call is a1 racing ahead of the revoke fire,
-    // and even then it must be bounded to that single action.
-    assert!(
-        transport.calls().len() <= 1,
-        "no transport effect after revocation for the waiting action"
-    );
-    drop(consumer);
+    drop(consumer_a);
+    revoker.join().expect("revoker");
     let _ = (module_path, principal);
 }
 
@@ -1375,7 +1547,7 @@ fn dispatch_drains_durable_fifo_order() {
         "ing-a1",
         &format!("{a1}-block"),
         send_block_for(MODULE_ID, a1, &fixture.session, &["first"]),
-        vec!["page-a".to_string()],
+        vec!["page-c".to_string()],
     );
     commit_block(
         &mut fixture.harness.connection,
@@ -1383,7 +1555,7 @@ fn dispatch_drains_durable_fifo_order() {
         "ing-a2",
         &format!("{a2}-block"),
         send_block_for(MODULE_ID, a2, &fixture.session, &["second"]),
-        vec!["page-a".to_string()],
+        vec!["page-c".to_string()],
     );
     let transport = SharedTransport::new(true);
     transport.push(TransportSendResult::AllConfirmed {
@@ -1393,7 +1565,7 @@ fn dispatch_drains_durable_fifo_order() {
         message_ids: vec!["fifo-2".to_string()],
     });
     let mut module_conn = reopen_module_store(&fixture);
-    let mut consumer = OutboundConsumer::new(
+    let mut consumer = OutboundConsumer::new_dev(
         channel_config(),
         Box::new(channel_clock()),
         &mut module_conn,
@@ -1407,15 +1579,16 @@ fn dispatch_drains_durable_fifo_order() {
     assert_eq!(outcomes.len(), 2, "both admitted+dispatched");
     let calls = transport.calls();
     assert_eq!(calls.len(), 2, "two transports");
-    // Transport order must equal the durable queued_seq order.
-    assert_eq!(calls[0].action_id, a2, "first durable FIFO row");
-    assert_eq!(calls[1].action_id, a1, "second durable FIFO row");
+    // Transport order must equal the durable queued_seq order (admission
+    // order follows the manifest's Activation/input ordering, not block ids).
+    assert_eq!(calls[0].action_id, a1, "first durable FIFO row");
+    assert_eq!(calls[1].action_id, a2, "second durable FIFO row");
     // The durable sequences are strict and increasing in admission order.
     drop(consumer);
     let mut reopen_conn = Connection::open(&fixture.module_path).unwrap();
     let mut reopened = SqliteChannelStore::new(&mut reopen_conn, &fixture.principal, 1).unwrap();
-    let seq1 = reopened.find_outbound(a2).unwrap().unwrap().entry.queued_seq;
-    let seq2 = reopened.find_outbound(a1).unwrap().unwrap().entry.queued_seq;
+    let seq1 = reopened.find_outbound(a1).unwrap().unwrap().entry.queued_seq;
+    let seq2 = reopened.find_outbound(a2).unwrap().unwrap().entry.queued_seq;
     assert!(seq1.unwrap() < seq2.unwrap(), "queued_seq strictly increasing");
 }
 
@@ -1432,13 +1605,13 @@ fn malformed_status_with_missing_id_is_rejected_before_settle() {
         "ing-1",
         &format!("{a1}-block"),
         send_block_for(MODULE_ID, a1, &fixture.session, &["hi"]),
-        vec!["page-a".to_string()],
+        vec!["page-c".to_string()],
     );
     let transport = SharedTransport::new(true);
     transport.push(TransportSendResult::Timeout); // -> Dispatched
     let mut module_conn = reopen_module_store(&fixture);
     {
-        let mut consumer = OutboundConsumer::new(
+        let mut consumer = OutboundConsumer::new_dev(
             channel_config(),
             Box::new(channel_clock()),
             &mut module_conn,
@@ -1463,7 +1636,7 @@ fn malformed_status_with_missing_id_is_rejected_before_settle() {
             message_ids: vec![],
         },
     );
-    let mut consumer2 = OutboundConsumer::new(
+    let mut consumer2 = OutboundConsumer::new_dev(
         channel_config(),
         Box::new(channel_clock()),
         &mut module_conn,
@@ -1480,4 +1653,159 @@ fn malformed_status_with_missing_id_is_rejected_before_settle() {
     assert_eq!(entry.state, OutboundState::Dispatched, "no settle on malformed status");
     assert!(entry.pieces.iter().all(|p| p.transport_message_id.is_none()),
         "no fabricated transport ids");
+}
+
+/// Commit 3: the malformed-status matrix. Confirmed/Partial transport
+/// statuses with missing, empty, duplicate, gapped, or out-of-range ids are
+/// rejected BEFORE frozen-envelope settlement — never fabricated — and the
+/// row stays Dispatched for a later status resolution.
+#[test]
+fn malformed_status_matrix_is_rejected_before_settle() {
+    let cases: Vec<dolly_channel::transport::TransportStatusResult> = vec![
+        // missing (empty vector)
+        dolly_channel::transport::TransportStatusResult::Confirmed { message_ids: vec![] },
+        // empty id
+        dolly_channel::transport::TransportStatusResult::Confirmed { message_ids: vec!["".to_string()] },
+        // duplicate id
+        dolly_channel::transport::TransportStatusResult::Confirmed { message_ids: vec!["dup".to_string(), "dup".to_string()] },
+        // out-of-range (one id for two pieces)
+        dolly_channel::transport::TransportStatusResult::Confirmed { message_ids: vec!["only-one".to_string()] },
+        // empty confirmed id
+        dolly_channel::transport::TransportStatusResult::Partial {
+            pieces: vec![
+                dolly_channel::transport::TransportPieceOutcome::Confirmed { ordinal: 0, message_id: "".to_string() },
+                dolly_channel::transport::TransportPieceOutcome::Confirmed { ordinal: 1, message_id: "ok".to_string() },
+            ],
+        },
+        // duplicate confirmed id
+        dolly_channel::transport::TransportStatusResult::Partial {
+            pieces: vec![
+                dolly_channel::transport::TransportPieceOutcome::Confirmed { ordinal: 0, message_id: "same".to_string() },
+                dolly_channel::transport::TransportPieceOutcome::Confirmed { ordinal: 1, message_id: "same".to_string() },
+            ],
+        },
+        // gapped/out-of-range Partial (only one piece outcome for two pieces)
+        dolly_channel::transport::TransportStatusResult::Partial {
+            pieces: vec![
+                dolly_channel::transport::TransportPieceOutcome::Confirmed { ordinal: 0, message_id: "only-0".to_string() },
+            ],
+        },
+    ];
+    for (case_index, status) in cases.into_iter().enumerate() {
+        let mut fixture = setup(&format!("consumer-status-matrix-{case_index}"));
+        let action_id = format!("0198ab31-6c44-7e8a-b2bb-0000{:04x}", 1000 + case_index);
+        commit_block(
+            &mut fixture.harness.connection,
+            &format!("consumer-status-matrix-{case_index}"),
+            "ing-1",
+            &format!("{action_id}-block"),
+            send_block_for(MODULE_ID, &action_id, &fixture.session, &["hi one", "hi two"]),
+            vec!["page-c".to_string()],
+        );
+        // Note: the send has ONE piece; out-of-range/duplicate cases are
+        // exercised by giving the status more ids than the send's pieces.
+        let transport = SharedTransport::new(true);
+        transport.push(TransportSendResult::Timeout);
+        let mut module_conn = reopen_module_store(&fixture);
+        {
+            let mut consumer = OutboundConsumer::new_dev(
+                channel_config(),
+                Box::new(channel_clock()),
+                &mut module_conn,
+                &mut fixture.harness.connection,
+                Box::new(transport.clone()),
+                &fixture.harness.authority,
+                &fixture.harness.grant,
+            )
+            .expect("consumer");
+            let outcomes = consumer.consume(&far_deadline()).unwrap();
+            assert!(
+                matches!(&outcomes[0], dolly_channel::ConsumerOutcome::Pending { .. }),
+                "send stays dispatched-pending"
+            );
+            drop(consumer);
+        }
+        transport.push_status(&action_id, status);
+        let mut consumer2 = OutboundConsumer::new_dev(
+            channel_config(),
+            Box::new(channel_clock()),
+            &mut module_conn,
+            &mut fixture.harness.connection,
+            Box::new(transport.clone()),
+            &fixture.harness.authority,
+            &fixture.harness.grant,
+        )
+        .expect("consumer");
+        let remaining = consumer2.reconcile().unwrap();
+        assert_eq!(
+            remaining, 1,
+            "malformed status {case_index} must not settle the row"
+        );
+        let ledger = consumer2.ledger().unwrap();
+        let entry = ledger.outbound_entry(&action_id).unwrap();
+        assert_eq!(
+            entry.state, OutboundState::Dispatched,
+            "no settle on malformed status {case_index}"
+        );
+        assert!(
+            entry.pieces.iter().all(|p| p.transport_message_id.is_none()),
+            "no fabricated transport ids (case {case_index})"
+        );
+        drop(consumer2);
+    }
+}
+
+/// Commit 1: MANIFEST-only authority — a committed Block that is NEVER
+/// selected into the configured Module's ActivationManifest.input_items
+/// (arbitrary CoreCommand::Ingress, journal, ingress, runtime_events) cannot
+/// mint downstream send authority.
+#[test]
+fn generic_ingress_without_manifest_cannot_mint_send_authority() {
+    let mut fixture = setup("consumer-manifest-only");
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000818";
+    let block = send_block_for(MODULE_ID, action_id, &fixture.session, &["hi"]);
+    let operation_digest = dolly_canonical_json::canonicalize(&block).unwrap().1.to_canonical_string();
+    {
+        let mut store = SqliteCoreStore::new(&mut fixture.harness.connection).unwrap();
+        let transition = store
+            .transact(
+                &CoreCommand::Ingress(IngressCommand {
+                    command_id: "consumer-manifest-only-foreign".to_string(),
+                    runtime_source: "attacker".to_string(),
+                    ingress_key: "foreign-ing".to_string(),
+                    operation_digest,
+                    block_id: format!("{action_id}-block"),
+                    block,
+                    pages: vec!["page-c".to_string()],
+                }),
+                &EnvironmentInput {
+                    now: CHANNEL_NOW.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(transition.outcome, TransitionOutcome::Committed);
+    }
+    let transport = SharedTransport::new(true);
+    transport.push(TransportSendResult::AllConfirmed {
+        message_ids: vec!["m-foreign".to_string()],
+    });
+    let mut module_conn = reopen_module_store(&fixture);
+    let mut consumer = OutboundConsumer::new_dev(
+        channel_config(),
+        Box::new(channel_clock()),
+        &mut module_conn,
+        &mut fixture.harness.connection,
+        Box::new(transport.clone()),
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .expect("consumer");
+    let outcomes = consumer.consume(&far_deadline()).expect("consume");
+    assert_eq!(
+        outcomes.len(), 0,
+        "an Ingress-only Block never becomes an Action without manifest selection"
+    );
+    assert_eq!(transport.calls().len(), 0, "zero transport effect");
+    assert!(consumer.pending_outbound().unwrap().is_empty(), "zero durable outbound rows");
 }
