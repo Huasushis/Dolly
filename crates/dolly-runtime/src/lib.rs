@@ -6,6 +6,7 @@
 //! marker commits. It never invokes Extension code or any external effect.
 
 mod host_routes;
+mod multimodal;
 mod premise;
 mod validation;
 
@@ -24,7 +25,7 @@ pub use dolly_storage::HostConnectionAuthority;
 pub use host_routes::{
     AssetHostRoute, ChannelOutboundRoute, ChannelOutboundRunReport, HostRouteError,
     authenticated_channel_event, install_channel_store_schema, open_channel_inbound_route,
-    reconcile_channel_inbound_route,
+    open_channel_inbound_route_with_assets, reconcile_channel_inbound_route,
 };
 pub use premise::{
     CursorSpan, ExecutionDigests, ExecutionFence, ExecutionIdentity, ExecutionOrder,

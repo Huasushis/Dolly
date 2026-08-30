@@ -315,6 +315,7 @@ dependencies = [
 name = "dolly-runtime"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "dolly-asset",
  "dolly-canonical-json",
  "dolly-channel",

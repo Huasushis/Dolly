@@ -1159,6 +1159,7 @@ fn channel_event(
         received_at: dolly_core_domain::Timestamp::from_str(CHANNEL_NOW).expect("timestamp"),
         event_kind: EventKind::Message,
         references_external_message_id: None,
+        attachments: Vec::new(),
     }
 }
 
@@ -1246,7 +1247,7 @@ fn channel_dispatch(
     let action = parse_send_action(block).expect("block carries a channel send action");
     assert_eq!(action.action_id, action_id, "block action id matches");
     let mut admission = OutboundAdmission::new();
-    dispatch_send(config, &channel_clock(), ledger, transport, &mut admission, &action)
+    dispatch_send(config, &channel_clock(), ledger, transport, &mut admission, &mut dolly_channel::asset::DenyAssetParts, &action)
 }
 
 // ---------------------------------------------------------------------------

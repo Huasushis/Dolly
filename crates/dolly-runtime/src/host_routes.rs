@@ -24,6 +24,7 @@ use dolly_asset::service::AssetCapability;
 use dolly_channel::config::{ChannelConfig, EXTENSION_ID};
 use dolly_channel::receiver::{AuthenticatedChannelEvent, ChannelEventContent, InboundReceiver};
 use dolly_channel::clock::Clock;
+use crate::multimodal::{ChannelAssetSeam, ChannelAttachmentImport};
 use dolly_storage::{
     HostCapabilityGrant, HostConnectionAuthority, SqliteCoreStore, SqliteHostIngressStore,
     StorageError,
@@ -350,11 +351,67 @@ pub fn open_channel_inbound_route<'connection, 'principal>(
         ));
     }
     let host = SqliteHostIngressStore::new(runtime_connection)?;
-    InboundReceiver::new(config, clock, module_store_connection, host, authority, grant)
-        .map_err(|error| HostRouteError::Rejected {
-            code: error.code,
-            message: error.message,
-        })
+    InboundReceiver::with_asset_import(
+        config,
+        clock,
+        module_store_connection,
+        host,
+        Box::new(ChannelAttachmentImport::unbound()),
+        authority,
+        grant,
+    )
+    .map_err(|error| HostRouteError::Rejected {
+        code: error.code,
+        message: error.message,
+    })
+}
+
+/// Open the durable inbound route with one bound Asset store and capability
+/// for the same store/account/config identity (production multimodal
+/// registration): authenticated transport attachments are imported through
+/// the accepted Asset façade under the sealed authority, and name-based
+/// status answers `Absent` only when no durable import record exists. The
+/// default [`open_channel_inbound_route`] keeps the same identity but serves
+/// attachments fail-closed (no bound Asset store).
+pub fn open_channel_inbound_route_with_assets<'connection, 'principal>(
+    runtime_connection: &'connection mut Connection,
+    module_store_connection: &'connection mut Connection,
+    config: ChannelConfig,
+    clock: Box<dyn Clock>,
+    asset_config: ResolvedAssetConfig,
+    account: &str,
+    authority: &'principal HostConnectionAuthority,
+    grant: &'principal HostCapabilityGrant,
+) -> Result<
+    InboundReceiver<'connection, 'principal, SqliteHostIngressStore<'connection>>,
+    HostRouteError,
+> {
+    require_current(authority, grant)?;
+    if !grant.allows("host.ingress.submit") {
+        return Err(capability_denied(
+            "the grant does not authorize host.ingress.submit",
+        ));
+    }
+    if grant.extension_id() != EXTENSION_ID {
+        return Err(capability_denied(
+            "the granted extension is not the built-in Channel extension",
+        ));
+    }
+    let assets = ChannelAttachmentImport::bind(asset_config, authority, grant, account)?;
+    let host = SqliteHostIngressStore::new(runtime_connection)?;
+    InboundReceiver::with_asset_import(
+        config,
+        clock,
+        module_store_connection,
+        host,
+        Box::new(assets),
+        authority,
+        grant,
+    )
+    .map_err(|error| HostRouteError::Rejected {
+        code: error.code,
+        message: error.message,
+    })
 }
 
 /// Run status-first reconciliation on an activated `org.dolly.channel` module
@@ -433,6 +490,10 @@ fn channel_error(code: String, message: String) -> HostRouteError {
 pub struct ChannelOutboundRoute<'principal> {
     config: ChannelConfig,
     gate: std::sync::Arc<OutboundQueueGate>,
+    /// The module's resolved Asset configuration when the runtime owns an
+    /// Asset store for this route (production); `None` keeps the route's
+    /// outbound Asset seam fail-closed on every asset part.
+    asset_config: Option<ResolvedAssetConfig>,
     authority: &'principal HostConnectionAuthority,
     grant: &'principal HostCapabilityGrant,
 }
@@ -459,9 +520,30 @@ impl<'principal> ChannelOutboundRoute<'principal> {
         Ok(Self {
             config,
             gate,
+            asset_config: None,
             authority,
             grant,
         })
+    }
+
+    /// Register with one bound Asset store for the same store/account/config
+    /// identity, so committed asset parts are prepared through the accepted
+    /// `AssetService` under the sealed capability and a finite lease. The
+    /// default [`register`](Self::register) keeps the same identity but
+    /// serves asset parts fail-closed (no bound Asset store).
+    pub fn register_with_assets(
+        config: ChannelConfig,
+        module_connection: &mut Connection,
+        authority: &'principal HostConnectionAuthority,
+        grant: &'principal HostCapabilityGrant,
+        asset_config: ResolvedAssetConfig,
+    ) -> Result<Self, HostRouteError> {
+        let mut route = Self::register(config, module_connection, authority, grant)?;
+        asset_config.validate().map_err(|detail| {
+            capability_denied(format!("asset config invalid: {detail}"))
+        })?;
+        route.asset_config = Some(asset_config);
+        Ok(route)
     }
 
     /// The single shared gate for this store identity (registered above).
@@ -479,13 +561,18 @@ impl<'principal> ChannelOutboundRoute<'principal> {
         clock: Box<dyn Clock>,
         transport: Box<dyn ChannelTransport>,
     ) -> Result<OutboundConsumer<'store, 'core, 'principal>, HostRouteError> {
-        OutboundConsumer::new(
+        let assets = match &self.asset_config {
+            Some(config) => ChannelAssetSeam::bind(config.clone(), self.authority, self.grant)?,
+            None => ChannelAssetSeam::unbound(),
+        };
+        OutboundConsumer::with_asset_preparation(
             self.config.clone(),
             clock,
             module_connection,
             runtime_connection,
             self.gate.clone(),
             transport,
+            Box::new(assets),
             self.authority,
             self.grant,
         )
