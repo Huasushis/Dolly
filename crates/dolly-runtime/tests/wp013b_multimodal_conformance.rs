@@ -1279,19 +1279,71 @@ fn prove_terminal_failed_never_dispatched(
             entry.dispatched_at
         ));
     }
-    let kinds: Vec<&str> = entry.attempts.iter().map(|attempt| attempt.kind.as_str()).collect();
-    if kinds.iter().any(|kind| *kind == "dispatch" || *kind == "dispatched") {
-        return Err(format!("the durable row records a dispatch attempt marker: {kinds:?}"));
+    // Closed attempt-history proof: the EXACT permitted pre-effect history of
+    // a prepared-then-refused terminal Failed row is the admission marker
+    // "prepare" followed by the authoritative "pre-effect-rejection"; every
+    // other kind — including any dispatch/effect/recovery/status marker or
+    // any unrecognized kind — fails closed. This is a closed set, not a
+    // blacklist: an unknown kind can never slip through.
+    const ALLOWED_PRE_EFFECT_KINDS: [&str; 3] = ["prepare", "enqueue", "pre-effect-rejection"];
+    if entry.attempts.is_empty() {
+        return Err("the durable row has no attempt history".to_string());
     }
-    if kinds.iter().any(|kind| *kind == "status" || *kind == "reconcile") {
-        return Err(format!("the durable row records a transport status marker: {kinds:?}"));
-    }
-    if !kinds.contains(&"pre-effect-rejection") {
+    if !entry
+        .attempts
+        .iter()
+        .any(|attempt| attempt.kind == "pre-effect-rejection")
+    {
         return Err(format!(
-            "the durable row lacks the authoritative pre-effect-rejection record: {kinds:?}"
+            "the durable row lacks the authoritative pre-effect-rejection record, attempts {:?}",
+            kinds_of_attempts(&entry.attempts)
+        ));
+    }
+    for attempt in &entry.attempts {
+        if !ALLOWED_PRE_EFFECT_KINDS.contains(&attempt.kind.as_str()) {
+            return Err(format!(
+                "the durable row records an unexpected attempt kind {:?} on a pre-effect terminal Failed row (exact allowed set: {ALLOWED_PRE_EFFECT_KINDS:?}), attempts {:?}",
+                attempt.kind,
+                kinds_of_attempts(&entry.attempts)
+            ));
+        }
+    }
+    // Explicit effect/recovery/provider markers (defense in depth; the closed
+    // allowed set above already rejects every one of them).
+    for marker in [
+        "dispatch",
+        "dispatched",
+        "status",
+        "recover",
+        "settle",
+        "reconcile",
+        "unknown-reconcile",
+        "provider-request",
+        "provider-status",
+    ] {
+        if entry.attempts.iter().any(|attempt| attempt.kind.starts_with(marker)) {
+            return Err(format!(
+                "the durable row records the forbidden effect/recovery marker {marker:?}, attempts {:?}",
+                kinds_of_attempts(&entry.attempts)
+            ));
+        }
+    }
+    if entry
+        .attempts
+        .iter()
+        .all(|attempt| attempt.kind != "prepare")
+    {
+        return Err(format!(
+            "the durable row lacks the admission prepare marker, attempts {:?}",
+            kinds_of_attempts(&entry.attempts)
         ));
     }
     Ok(())
+}
+
+/// The ordered attempt kinds of one durable outbound row (diagnostic only).
+fn kinds_of_attempts(attempts: &[dolly_channel::ledger::AttemptRecord]) -> Vec<&str> {
+    attempts.iter().map(|attempt| attempt.kind.as_str()).collect()
 }
 
 // ---------------------------------------------------------------------------
