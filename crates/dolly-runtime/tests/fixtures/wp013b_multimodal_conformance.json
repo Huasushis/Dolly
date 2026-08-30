@@ -16,7 +16,7 @@
       "G4-WP013A-CONSUMER-001"
     ],
     "handoff": "the frozen WP-010 Asset authority seam (AssetHostRoute/AssetService: canonical AVAILABLE AssetRef, finite lease, fail-closed unavailable/revoked refs) and the frozen WP-013A committed-Action consumer route (ChannelOutboundRoute::consume_once over the sealed OutboundConsumer under ActivationManifest authority) are the accepted base these cases drive",
-    "authority": "Core remains the only authority that turns an asset_input draft into an immutable AssetRef; the Channel send path must consult that authority for every asset part at effect time and never fabricate availability, media type, lease, or domain claims of its own",
+    "authority": "Host Asset import under the sealed grant creates the durable ImportRecord; only a successful AVAILABLE import yields the canonical AssetRef (never from a Core Block draft, a capability, or caller text). A producer may then place that explicit AssetRef in a committed Block/Action; consumer authority only consults and checks that reference at effect time — it never creates, mints, upgrades, or re-labels Asset authority, and there is no reverse or cross-Extension authority",
     "effect_boundary": "after the durable Core ingest commit and the committed targeted Action's ActivationManifest activation, before any outbound Channel transport effect, durable outbound row, or failure envelope"
   },
   "classification": {
