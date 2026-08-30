@@ -1,0 +1,69 @@
+{
+  "schema": "dolly.wp013b-multimodal-conformance/v1",
+  "spec_basis": [
+    "REQ-ASSET-001",
+    "REQ-CHANNEL-001",
+    "dolly-spec/docs/spec/extensions/channel.md::5 committed targeted Action / Core AssetPart authorization, authoritative detected media type, short Asset lease, no recursive re-entry",
+    "dolly-spec/docs/spec/services/assets.md::7 references, leases, pins, and garbage collection",
+    "dolly-spec/docs/spec/roadmap/02-work-packages.md::WP-013B Channel multimodal profile: Asset import/send, MIME, lease, and media abuse round trip",
+    "dolly-spec/docs/spec/core/04-activation-and-module.md::ActivationManifest authority at effect time"
+  ],
+  "source_boundary": {
+    "g4_fixture": "crates/dolly-runtime/tests/fixtures/g4_content_channel_conformance.json",
+    "g4_cases": [
+      "G4-WP010-IMPORT-BOUND-001",
+      "G4-WP010-LEASE-GC-001",
+      "G4-WP013A-CONSUMER-001"
+    ],
+    "handoff": "the frozen WP-010 Asset authority seam (AssetHostRoute/AssetService: canonical AVAILABLE AssetRef, finite lease, fail-closed unavailable/revoked refs) and the frozen WP-013A committed-Action consumer route (ChannelOutboundRoute::consume_once over the sealed OutboundConsumer under ActivationManifest authority) are the accepted base these cases drive",
+    "authority": "Core remains the only authority that turns an asset_input draft into an immutable AssetRef; the Channel send path must consult that authority for every asset part at effect time and never fabricate availability, media type, lease, or domain claims of its own",
+    "effect_boundary": "after the durable Core ingest commit and the committed targeted Action's ActivationManifest activation, before any outbound Channel transport effect, durable outbound row, or failure envelope"
+  },
+  "classification": {
+    "pass": "the accepted base already satisfies the contract through the real public route/surface: the sealed AssetHostRoute imports canonical media to a durable AVAILABLE canonical AssetRef, and the accepted AssetService public seam leases and reads that same asset under the same authority domain with finite unguessable leases, GC blocking while live, and fail-closed tombstone refusal. A regression here is a product violation",
+    "product_red": "the frozen channel-send arguments schema already admits an {\"kind\":\"asset\"} Part, but the v1 authorize_send rejects every asset part with CHANNEL_UNSUPPORTED_MODALITY and CommittedSendAction::from_manifest_input silently drops the committed Action, so no AssetRef authority (current lease, availability, domain) is consulted at effect time, no refusal outcome or durable outbound row exists, and nothing reaches the transport. The probe first proves the whole real causal chain works (route import, tombstone, committed Action, manifest authority, consumer pass for a text twin), so every failure is attributable to the missing asset-authority seam, never to the harness"
+  },
+  "expected_counts": {
+    "pass": 1,
+    "product_red": 1
+  },
+  "evidence": {
+    "wp013b_avail_lease_round_trip": [
+      "WP013B-AVAIL-LEASE-001"
+    ],
+    "wp013b_stale_ref_effect_authority": [
+      "WP013B-STALE-REF-EFFECT-001"
+    ]
+  },
+  "cases": [
+    {
+      "id": "WP013B-AVAIL-LEASE-001",
+      "name": "canonical_available_assetref_with_valid_current_lease_under_route_authority_domain",
+      "kind": "asset_avail_lease_round_trip",
+      "expected": "pass",
+      "pass_basis": "the dolly_runtime AssetHostRoute imports canonical PNG media to a durable AVAILABLE canonical AssetRef (AssetId = ast_b3_ + lowercase unpadded base32 of blake3-256 over the accepted bytes, exact wire shape, content-addressed object present, durable across a route reopen) under the sealed Host authority; the accepted AssetService public seam then leases and reads the SAME asset under the SAME security domain (the authority extension-connection identity) with a finite unguessable lease whose expiry blocks GC while live, and after release + grace the sweep tombstones it and every further lease/read fails closed",
+      "assertion": "import through AssetHostRoute; derive the AssetService capability from the same sealed domain/instance/module facts; require a canonical AssetRef, a valid current lease with bounded read under it, GC blocked while the lease is live, release + clock advance -> tombstone, and NotFound on re-lease/read",
+      "references": [
+        "crates/dolly-runtime/src/host_routes.rs::AssetHostRoute::for_activated_module / import / status",
+        "crates/dolly-asset/src/service.rs::AssetService::lease / read / release_lease / run_gc",
+        "crates/dolly-asset/src/identity.rs::AssetRef canonical wire shape",
+        "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_avail_lease_canonical_assetref_round_trip"
+      ]
+    },
+    {
+      "id": "WP013B-STALE-REF-EFFECT-001",
+      "name": "stale_assetref_is_refused_by_an_asset_authority_at_channel_effect_time",
+      "kind": "channel_multimodal_effect_authority",
+      "expected": "product_red",
+      "seam": "the committed-Action consumer route (ChannelOutboundRoute::consume_once over the sealed OutboundConsumer) must, at effect time under the current ActivationManifest authority, consult the current AssetService authority (lease, ownership, availability, domain) for every asset part of a committed org.dolly.channel.send Action and refuse a stale/revoked/tombstoned AssetRef with a fail-closed asset code before any transport effect, durable outbound row, or success envelope",
+      "causal_red": "the frozen channel-send arguments schema already admits an {\"kind\":\"asset\"} Part (embedded-schema-catalog.json channel-send.schema.json over the common Part def), but dolly-channel outbound.rs authorize_send rejects every asset part with CHANNEL_UNSUPPORTED_MODALITY and outbound_committed.rs CommittedSendAction::from_manifest_input propagates that error into committed_targeted_actions' if-let-Ok silent skip, so a committed Action carrying a tombstoned (stale/revoked) AssetRef is dropped with NO asset-authority refusal outcome, NO durable outbound row, and ZERO transport calls",
+      "references": [
+        "crates/dolly-channel/src/outbound.rs::authorize_send asset-part WP-013B seam",
+        "crates/dolly-channel/src/outbound_committed.rs::CommittedSendAction::from_manifest_input",
+        "crates/dolly-channel/src/outbound_consumer.rs::committed_targeted_actions silent skip",
+        "crates/dolly-runtime/src/host_routes.rs::ChannelOutboundRoute::consume_once",
+        "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_stale_assetref_refused_at_effect_time"
+      ]
+    }
+  ]
+}
