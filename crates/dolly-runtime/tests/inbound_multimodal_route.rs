@@ -529,8 +529,34 @@ fn mismatched_asset_root_refuses_inbound() {
     ];
     let (mut runtime, mut module_store, authority, grant, config) = harness("route-rootm", methods);
     let registered = asset_config_at(scratch_a.path());
-    register_outbound_assets(&mut module_store, &authority, &grant, &config, registered);
-    // A different root for the same identity must fail closed.
+    register_outbound_assets(
+        &mut module_store,
+        &authority,
+        &grant,
+        &config,
+        registered.clone(),
+    );
+    // The same root and Channel config revision cannot hide a different
+    // effective Asset bound.
+    let mut different_bound = registered.clone();
+    different_bound.max_decoded_bytes += 1;
+    let inbound = open_channel_inbound_route_with_assets(
+        &mut runtime,
+        &mut module_store,
+        config.clone(),
+        Box::new(dolly_channel::VirtualClock::at(
+            CHANNEL_NOW.parse().unwrap(),
+        )),
+        different_bound,
+        Box::new(FakeProvider::serving(png_bytes())),
+        &authority,
+        &grant,
+    );
+    assert!(
+        matches!(inbound, Err(HostRouteError::CapabilityDenied { .. })),
+        "same-root resolved-config mismatch must fail closed"
+    );
+    // A different root for the same identity must also fail closed.
     let inbound = open_channel_inbound_route_with_assets(
         &mut runtime,
         &mut module_store,
@@ -608,9 +634,37 @@ fn restart_reconcile_reuses_the_bound_adapter_set_status_first() {
         "one bounded provider read on the first pass"
     );
 
-    // Restart: reconcile reopens the SAME bound provider+Asset adapter set
-    // (never the unbound seam) and settles status-first with no re-read and
-    // no new provider fetch for the already-imported key.
+    // A restart carrying a stale resolved-config digest is refused before
+    // status or provider access; reconcile cannot reuse the old owner.
+    let mut stale_restart_config = asset_config.clone();
+    stale_restart_config.replica_retry.retry_base_ms += 1;
+    let stale_reconcile = reconcile_channel_inbound_route_with_assets(
+        &mut runtime,
+        &mut module_store,
+        config.clone(),
+        Box::new(dolly_channel::VirtualClock::at(
+            CHANNEL_NOW.parse().unwrap(),
+        )),
+        stale_restart_config,
+        Box::new(provider.clone()),
+        &authority,
+        &grant,
+    );
+    assert!(
+        matches!(
+            stale_reconcile,
+            Err(HostRouteError::CapabilityDenied { .. })
+        ),
+        "restart with stale Asset config identity must fail closed"
+    );
+    assert_eq!(
+        provider.reads(),
+        1,
+        "stale restart refusal occurs before provider access"
+    );
+
+    // The exact configuration reopens the SAME bound provider+Asset adapter
+    // set, settles status-first, and performs no new provider fetch.
     let remaining = reconcile_channel_inbound_route_with_assets(
         &mut runtime,
         &mut module_store,

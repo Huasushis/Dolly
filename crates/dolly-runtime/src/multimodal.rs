@@ -80,14 +80,42 @@ struct AssetRouteKey {
     principal_account: String,
 }
 
+/// Canonical configuration identity for one route owner: RFC 8785 JSON
+/// Canonicalization Scheme (JCS) bytes plus the repository SHA-256 digest over
+/// the typed revision and the complete serialized `ResolvedAssetConfig`.
+/// Nesting the config value means every current and future serialized field is
+/// covered without maintaining a second manual field list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssetRouteConfigIdentity {
+    canonical_jcs: dolly_canonical_json::CanonicalBytes,
+    digest: dolly_canonical_json::Sha256Digest,
+}
+
+#[derive(serde::Serialize)]
+struct AssetRouteConfigIdentityInput<'config> {
+    config_revision: i64,
+    resolved_asset_config: &'config ResolvedAssetConfig,
+}
+
+/// A resolved configuration paired with the one canonical identity computed
+/// from that exact value. The owner thread consumes `resolved`; registration
+/// and every later route open compare `identity`.
+#[derive(Clone)]
+struct BoundAssetConfig {
+    resolved: ResolvedAssetConfig,
+    identity: AssetRouteConfigIdentity,
+}
+
 /// The complete recorded identity of one registration. The stable key finds
-/// the registration; generation and canonical content root must also match.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// the registration; generation, root, and full resolved configuration must
+/// also match.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AssetRouteFacts {
     key: AssetRouteKey,
     instance_id: String,
     extension_generation: i64,
     root_key: String,
+    config_identity: AssetRouteConfigIdentity,
 }
 
 /// The registration lifecycle. `Closing` rejects every new handle and
@@ -183,13 +211,23 @@ struct AssetOwnerThread {
     join: parking_lot::Mutex<Option<JoinHandle<()>>>,
     shutdown_sent: AtomicBool,
     metrics: Arc<AssetOwnerMetrics>,
+    config_digest: dolly_canonical_json::Sha256Digest,
 }
 
 impl AssetOwnerThread {
     fn spawn(
-        config: ResolvedAssetConfig,
+        config: BoundAssetConfig,
         facts: &AssetRouteFacts,
     ) -> Result<(Self, Receiver<Result<(), AssetOwnerFailure>>), HostRouteError> {
+        if config.identity != facts.config_identity {
+            return Err(HostRouteError::CapabilityDenied {
+                detail:
+                    "Asset owner configuration does not match the registered canonical identity"
+                        .into(),
+            });
+        }
+        let config_digest = config.identity.digest.clone();
+        let resolved_config = config.resolved;
         let (sender, requests) = mpsc::sync_channel(ASSET_OWNER_QUEUE_CAPACITY);
         let (initialization, initialized) = mpsc::sync_channel(1);
         let (completed, completion) = mpsc::sync_channel(1);
@@ -203,7 +241,7 @@ impl AssetOwnerThread {
             .spawn(move || {
                 LIVE_ASSET_OWNER_THREADS.fetch_add(1, Ordering::SeqCst);
                 owner_metrics.thread_live.store(true, Ordering::SeqCst);
-                let mut service = match AssetService::open(config) {
+                let mut service = match AssetService::open(resolved_config) {
                     Ok(service) => service,
                     Err(error) => {
                         let _ = initialization.send(Err(AssetOwnerFailure {
@@ -315,6 +353,7 @@ impl AssetOwnerThread {
                 join: parking_lot::Mutex::new(Some(join)),
                 shutdown_sent: AtomicBool::new(false),
                 metrics,
+                config_digest,
             },
             initialized,
         ))
@@ -465,7 +504,14 @@ impl AssetRouteRegistration {
         }
     }
 
+    fn owner_config_matches(&self) -> bool {
+        self.owner.config_digest == self.facts.config_identity.digest
+    }
+
     fn activate(self: &Arc<Self>) -> Result<AssetRouteHandle, HostRouteError> {
+        if !self.owner_config_matches() {
+            return Err(owner_route_error("ASSET_OWNER_CONFIG_IDENTITY_MISMATCH"));
+        }
         let mut lifecycle = self.lifecycle.lock();
         if lifecycle.state != AssetOwnerState::Starting {
             return Err(owner_route_error("ASSET_OWNER_CLOSED"));
@@ -479,6 +525,9 @@ impl AssetRouteRegistration {
     }
 
     fn open_handle(self: &Arc<Self>) -> Result<AssetRouteHandle, HostRouteError> {
+        if !self.owner_config_matches() {
+            return Err(owner_route_error("ASSET_OWNER_CONFIG_IDENTITY_MISMATCH"));
+        }
         let mut lifecycle = self.lifecycle.lock();
         if lifecycle.state != AssetOwnerState::Active {
             return Err(owner_route_error("ASSET_OWNER_CLOSED"));
@@ -634,10 +683,6 @@ impl AssetRouteHandle {
         self.registration.open_handle()
     }
 
-    fn identity_root_key(&self) -> &str {
-        &self.registration.facts.root_key
-    }
-
     fn instance_id(&self) -> String {
         self.registration.facts.instance_id.clone()
     }
@@ -654,11 +699,18 @@ impl AssetRouteHandle {
     fn same_registration(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.registration, &other.registration)
     }
+
+    #[cfg(test)]
+    fn config_identity(&self) -> &AssetRouteConfigIdentity {
+        &self.registration.facts.config_identity
+    }
 }
 
 struct AssetRouteRegistry {
     accepting: bool,
     entries: std::collections::HashMap<AssetRouteKey, Arc<AssetRouteRegistration>>,
+    #[cfg(test)]
+    owners_created: usize,
 }
 
 impl Default for AssetRouteRegistry {
@@ -666,6 +718,8 @@ impl Default for AssetRouteRegistry {
         Self {
             accepting: true,
             entries: std::collections::HashMap::new(),
+            #[cfg(test)]
+            owners_created: 0,
         }
     }
 }
@@ -699,12 +753,36 @@ fn asset_root_key(root: &std::path::Path) -> String {
         .unwrap_or_else(|| root.to_string_lossy().into_owned())
 }
 
+fn asset_route_config_identity(
+    config_revision: i64,
+    config: &ResolvedAssetConfig,
+) -> Result<AssetRouteConfigIdentity, HostRouteError> {
+    config
+        .validate()
+        .map_err(|detail| HostRouteError::CapabilityDenied {
+            detail: format!("asset config invalid: {detail}"),
+        })?;
+    let (canonical_jcs, digest) =
+        dolly_canonical_json::canonicalize(&AssetRouteConfigIdentityInput {
+            config_revision,
+            resolved_asset_config: config,
+        })
+        .map_err(|_| HostRouteError::CapabilityDenied {
+            detail: "resolved Asset config cannot form a canonical configuration identity".into(),
+        })?;
+    Ok(AssetRouteConfigIdentity {
+        canonical_jcs,
+        digest,
+    })
+}
+
 fn asset_route_facts(
     principal: &dolly_channel::ChannelPrincipal,
     authority: &HostConnectionAuthority,
     grant: &HostCapabilityGrant,
     config_revision: i64,
     config: &ResolvedAssetConfig,
+    config_identity: AssetRouteConfigIdentity,
 ) -> Result<AssetRouteFacts, HostRouteError> {
     let instance_id = format!("i{}", authority.worker_epoch());
     if instance_id
@@ -727,6 +805,7 @@ fn asset_route_facts(
         instance_id,
         extension_generation: grant.extension_generation(),
         root_key: asset_root_key(&config.local_root),
+        config_identity,
     })
 }
 
@@ -752,13 +831,20 @@ pub(crate) fn asset_route_register(
             detail: "the multimodal Channel route requires host.asset.import and host.asset.status grants under the same authority".into(),
         });
     }
-    config
-        .validate()
-        .map_err(|detail| HostRouteError::CapabilityDenied {
-            detail: format!("asset config invalid: {detail}"),
-        })?;
     let principal = route_principal(authority, grant)?;
-    let facts = asset_route_facts(&principal, authority, grant, config_revision, &config)?;
+    let config_identity = asset_route_config_identity(config_revision, &config)?;
+    let bound_config = BoundAssetConfig {
+        resolved: config,
+        identity: config_identity.clone(),
+    };
+    let facts = asset_route_facts(
+        &principal,
+        authority,
+        grant,
+        config_revision,
+        &bound_config.resolved,
+        config_identity,
+    )?;
     loop {
         let existing = {
             let registry = asset_route_registry().lock();
@@ -788,7 +874,7 @@ pub(crate) fn asset_route_register(
             }
             if existing.facts != facts {
                 return Err(HostRouteError::CapabilityDenied {
-                    detail: "registration identity mismatch (a different Asset content root or extension generation is already registered for this store/account/config identity)".into(),
+                    detail: "registration identity mismatch (a different Asset root, extension generation, or complete resolved configuration is already registered for this store/account/config identity)".into(),
                 });
             }
             return match state {
@@ -811,7 +897,11 @@ pub(crate) fn asset_route_register(
             // Hold the registry lock through thread creation and insertion.
             // The new owner is recorded as Starting before any concurrent
             // registration can decide to create another owner.
-            let (owner, initialized) = AssetOwnerThread::spawn(config.clone(), &facts)?;
+            let (owner, initialized) = AssetOwnerThread::spawn(bound_config.clone(), &facts)?;
+            #[cfg(test)]
+            {
+                registry.owners_created += 1;
+            }
             let registration = Arc::new(AssetRouteRegistration {
                 facts: facts.clone(),
                 owner,
@@ -835,32 +925,36 @@ pub(crate) fn asset_route_register(
     }
 }
 
-/// Open the exact active owner already registered for this sealed identity.
+/// Open the exact active owner already registered for this sealed identity and
+/// complete canonical resolved configuration. A matching revision or root is
+/// insufficient when any serialized configuration field differs.
 pub(crate) fn asset_route_open(
     authority: &HostConnectionAuthority,
     grant: &HostCapabilityGrant,
     config_revision: i64,
+    config: &ResolvedAssetConfig,
 ) -> Result<AssetRouteHandle, HostRouteError> {
     let principal = route_principal(authority, grant)?;
-    let key = AssetRouteKey {
-        extension_connection_id: authority.extension_connection_id().to_owned(),
-        worker_epoch: authority.worker_epoch().to_string(),
-        extension_id: principal.extension_id().to_string(),
-        module_id: principal.module_id().to_string(),
+    let config_identity = asset_route_config_identity(config_revision, config)?;
+    let facts = asset_route_facts(
+        &principal,
+        authority,
+        grant,
         config_revision,
-        principal_account: principal.account().to_string(),
-    };
+        config,
+        config_identity,
+    )?;
     let registration = asset_route_registry()
         .lock()
         .entries
-        .get(&key)
+        .get(&facts.key)
         .cloned()
         .ok_or_else(|| HostRouteError::CapabilityDenied {
             detail: "no Asset route is registered for this store/account/config identity; register the outbound Asset route first".into(),
         })?;
-    if registration.facts.extension_generation != grant.extension_generation() {
+    if registration.facts != facts {
         return Err(HostRouteError::CapabilityDenied {
-            detail: "registered Asset owner generation does not match the current grant".into(),
+            detail: "registered Asset owner does not match the current generation, root, or complete resolved configuration identity".into(),
         });
     }
     registration.open_handle()
@@ -921,12 +1015,22 @@ fn asset_route_registry_len() -> usize {
 }
 
 #[cfg(test)]
+fn asset_route_owners_created() -> usize {
+    asset_route_registry().lock().owners_created
+}
+
+#[cfg(test)]
 fn test_asset_route(
     config: ResolvedAssetConfig,
     domain: &str,
     instance: &str,
     module: &str,
 ) -> Result<AssetRouteHandle, HostRouteError> {
+    let config_identity = asset_route_config_identity(1, &config)?;
+    let bound_config = BoundAssetConfig {
+        resolved: config,
+        identity: config_identity.clone(),
+    };
     let facts = AssetRouteFacts {
         key: AssetRouteKey {
             extension_connection_id: domain.to_string(),
@@ -938,9 +1042,10 @@ fn test_asset_route(
         },
         instance_id: instance.to_string(),
         extension_generation: 1,
-        root_key: asset_root_key(&config.local_root),
+        root_key: asset_root_key(&bound_config.resolved.local_root),
+        config_identity,
     };
-    let (owner, initialized) = AssetOwnerThread::spawn(config, &facts)?;
+    let (owner, initialized) = AssetOwnerThread::spawn(bound_config, &facts)?;
     let registration = Arc::new(AssetRouteRegistration {
         facts,
         owner,
@@ -1231,12 +1336,9 @@ impl ChannelAttachmentImport {
                 detail: "caller account does not match the sealed Channel principal account".into(),
             });
         }
-        let owner = asset_route_open(authority, grant, config_revision)?;
-        if owner.identity_root_key() != asset_root_key(&config.local_root) {
-            return Err(HostRouteError::CapabilityDenied {
-                detail: "inbound Asset content root does not match the registered outbound Asset root for this identity".into(),
-            });
-        }
+        // The open compares generation, canonical root, revision, and the JCS
+        // identity of the complete resolved config before returning a handle.
+        let owner = asset_route_open(authority, grant, config_revision, &config)?;
         Ok(Self {
             owner: Some(owner),
             account: account.to_string(),
@@ -1976,15 +2078,84 @@ mod tests {
         let other_dir = tempfile::tempdir().expect("other tempdir");
         let config = life_config(dir.path());
         let png = png_bytes(4, 2);
+        let owners_before = asset_route_owners_created();
 
         let first = super::asset_route_register(&authority, &grant, 1, config.clone())
             .expect("first registration");
         let second = super::asset_route_register(&authority, &grant, 1, config.clone())
             .expect("second registration");
-        let opened = super::asset_route_open(&authority, &grant, 1).expect("shared open");
+        let opened = super::asset_route_open(&authority, &grant, 1, &config).expect("shared open");
         assert!(first.same_registration(&second));
         assert!(first.same_registration(&opened));
         assert_eq!(asset_route_registry_len(), baseline + 1);
+        assert_eq!(asset_route_owners_created(), owners_before + 1);
+
+        // A typed serde round trip has the same JCS bytes and digest, so it
+        // shares the existing owner rather than creating another service.
+        let semantically_identical: ResolvedAssetConfig = serde_json::from_slice(
+            &serde_json::to_vec(&config).expect("serialize resolved config"),
+        )
+        .expect("deserialize resolved config");
+        let same_config =
+            super::asset_route_register(&authority, &grant, 1, semantically_identical.clone())
+                .expect("semantically identical canonical config shares");
+        let same_config_open =
+            super::asset_route_open(&authority, &grant, 1, &semantically_identical)
+                .expect("same canonical config opens");
+        assert!(first.same_registration(&same_config));
+        assert!(first.same_registration(&same_config_open));
+        assert_eq!(first.config_identity(), same_config.config_identity());
+        first
+            .config_identity()
+            .digest
+            .verify_bytes(first.config_identity().canonical_jcs.as_bytes())
+            .expect("stored digest verifies the stored canonical bytes");
+        assert_ne!(
+            first.config_identity(),
+            &asset_route_config_identity(2, &config).expect("different revision identity"),
+            "the canonical digest also binds the configuration revision"
+        );
+        assert_eq!(
+            asset_route_owners_created(),
+            owners_before + 1,
+            "identical configuration cannot create a second owner"
+        );
+
+        // Same root, key, and revision are insufficient: both a top-level
+        // bound and an independent nested retry field change the full digest.
+        let mut stale_restart_config = config.clone();
+        stale_restart_config.max_decoded_bytes += 1;
+        let stale_identity =
+            asset_route_config_identity(1, &stale_restart_config).expect("stale identity");
+        assert_ne!(first.config_identity(), &stale_identity);
+        assert!(matches!(
+            super::asset_route_register(&authority, &grant, 1, stale_restart_config.clone()),
+            Err(HostRouteError::CapabilityDenied { .. })
+        ));
+        assert!(matches!(
+            super::asset_route_open(&authority, &grant, 1, &stale_restart_config),
+            Err(HostRouteError::CapabilityDenied { .. })
+        ));
+
+        let mut nested_field_mismatch = config.clone();
+        nested_field_mismatch.replica_retry.retry_base_ms += 1;
+        let nested_identity =
+            asset_route_config_identity(1, &nested_field_mismatch).expect("nested identity");
+        assert_ne!(first.config_identity(), &nested_identity);
+        assert!(matches!(
+            super::asset_route_register(&authority, &grant, 1, nested_field_mismatch.clone()),
+            Err(HostRouteError::CapabilityDenied { .. })
+        ));
+        assert!(matches!(
+            super::asset_route_open(&authority, &grant, 1, &nested_field_mismatch),
+            Err(HostRouteError::CapabilityDenied { .. })
+        ));
+        assert_eq!(asset_route_registry_len(), baseline + 1);
+        assert_eq!(
+            asset_route_owners_created(),
+            owners_before + 1,
+            "configuration mismatch must be refused before owner creation"
+        );
 
         let asset_id = import_available(&first, "0198ab31-6c44-7e8a-b2bb-000000000120", &png);
         let prepare_premise = AssetPremise {
@@ -2058,7 +2229,7 @@ mod tests {
             Err(HostRouteError::CapabilityDenied { .. })
         ));
         assert!(matches!(
-            super::asset_route_open(&authority, &grant, 99),
+            super::asset_route_open(&authority, &grant, 99, &config),
             Err(HostRouteError::CapabilityDenied { .. })
         ));
 
@@ -2089,7 +2260,7 @@ mod tests {
             Err(HostRouteError::CapabilityDenied { .. })
         ));
         assert!(matches!(
-            super::asset_route_open(&authority, &generation_two, 1),
+            super::asset_route_open(&authority, &generation_two, 1, &config),
             Err(HostRouteError::CapabilityDenied { .. })
         ));
 
@@ -2119,6 +2290,8 @@ mod tests {
 
         let old_registration = Arc::clone(&first.registration);
         drop(old_seam);
+        drop(same_config_open);
+        drop(same_config);
         drop(opened);
         drop(second);
         drop(first);
@@ -2157,8 +2330,8 @@ mod tests {
             let registered =
                 super::asset_route_register(&authority, &generation_two, 1, config.clone())
                     .expect("cycle register");
-            let opened =
-                super::asset_route_open(&authority, &generation_two, 1).expect("cycle open");
+            let opened = super::asset_route_open(&authority, &generation_two, 1, &config)
+                .expect("cycle open");
             assert!(registered.same_registration(&opened));
             assert!(super::asset_route_unregister(&authority, &generation_two, 1).unwrap());
             assert!(
@@ -2200,7 +2373,10 @@ mod tests {
             baseline + 1,
             "closed entry remains until the live handle drops"
         );
-        assert!(super::asset_route_open(&authority, &generation_two, 1).is_err());
+        assert!(
+            super::asset_route_open(&authority, &generation_two, 1, &life_config(dir.path()))
+                .is_err()
+        );
         drop(shutdown_handle);
         assert_eq!(asset_route_registry_len(), baseline);
     }
