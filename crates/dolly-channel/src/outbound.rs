@@ -24,10 +24,13 @@ use crate::ledger::{
 #[cfg(feature = "test-support")]
 use crate::rate_limit::OutboundAdmission;
 use crate::result_validator::{
-    RESULT_VALIDATOR_ID, RESULT_VALIDATOR_REVISION, SEND_RESULT_SCHEMA_TAG, validate_send_result,
-    result_contract_matches,
+    RESULT_VALIDATOR_ID, RESULT_VALIDATOR_REVISION, SEND_RESULT_SCHEMA_TAG,
+    result_contract_matches, validate_send_result,
 };
-use crate::transport::{ChannelTransport, TransportPiece, TransportPieceOutcome, TransportSendRequest, TransportSendResult};
+use crate::transport::{
+    ChannelTransport, TransportPiece, TransportPieceOutcome, TransportSendRequest,
+    TransportSendResult,
+};
 
 /// The `$id` of the `channel-send` arguments schema.
 pub const SEND_ARGUMENTS_SCHEMA_ID: &str =
@@ -126,14 +129,19 @@ pub fn parse_send_action(block: &Value) -> Result<SendAction, ChannelError> {
             result_validator_revision,
         });
     }
-    Err(rejected("outbound block has no targeted channel send action"))
+    Err(rejected(
+        "outbound block has no targeted channel send action",
+    ))
 }
 /// Parse the frozen action object at `action_index` inside a committed
 /// Block's `body.actions` as a channel send (structural name/arguments/
 /// contract extraction only; see [`parse_send_action`] for the first-action
 /// form). Used by the manifest-selected boundary to honor the Action array
 /// order exactly.
-pub fn parse_send_action_at(block: &Value, action_index: usize) -> Result<SendAction, ChannelError> {
+pub fn parse_send_action_at(
+    block: &Value,
+    action_index: usize,
+) -> Result<SendAction, ChannelError> {
     let rejected = |message: &str| {
         ChannelError::new(
             codes::MALFORMED_EVENT,
@@ -210,7 +218,6 @@ pub fn parse_send_action_at(block: &Value, action_index: usize) -> Result<SendAc
     })
 }
 
-
 /// The outcome of one outbound send attempt.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SendDispatchResult {
@@ -261,9 +268,9 @@ fn validate_arguments(arguments: &CanonicalJsonValue) -> Result<(), ChannelError
 }
 
 /// The validated parts of one authorized channel send: the account-owned
-/// session and the v1 text pieces. Produced ONLY by [`authorize_send`] from a
-/// committed targeted Action; no caller-shaped authority or payload reaches
-/// this type.
+/// session and the ordered text pieces plus prepared asset pieces.
+/// Produced ONLY by [`authorize_send`] from a committed targeted Action; no
+/// caller-shaped authority or payload reaches this type.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AuthorizedSend {
     pub session_id: String,
@@ -272,9 +279,11 @@ pub(crate) struct AuthorizedSend {
 
 /// Shared authority verification for `org.dolly.channel.send`: owner name,
 /// targeted module, frozen result contract, frozen arguments schema, an
-/// account-owned session, and the v1 text-only pieces. Used by
-/// [`dispatch_send`] and the committed targeted-Action verification boundary;
-/// no durable effect and no transport call happens before this succeeds.
+/// account-owned session, and the ordered parts. Asset parts are parsed from
+/// the committed Action only and require the injected [`AssetPreparation`]
+/// seam to mint a short-lease proof before any durable effect or transport
+/// call happens. Used by [`dispatch_send`] and the committed targeted-Action
+/// verification boundary.
 pub(crate) fn authorize_send(
     config: &ChannelConfig,
     ledger: &ChannelLedger,
@@ -300,8 +309,10 @@ pub(crate) fn authorize_send(
             ),
         ));
     }
-    if !result_contract_matches(action.result_validator_id.as_deref(), action.result_validator_revision)
-    {
+    if !result_contract_matches(
+        action.result_validator_id.as_deref(),
+        action.result_validator_revision,
+    ) {
         return Err(ChannelError::new(
             codes::RESULT_CONTRACT_MISMATCH,
             false,
@@ -324,7 +335,7 @@ pub(crate) fn authorize_send(
                 false,
                 ChannelOutcome::NotApplied,
                 "send arguments must be an object",
-            ))
+            ));
         }
     };
     let session_id = match arguments_obj.get("session_id") {
@@ -335,7 +346,7 @@ pub(crate) fn authorize_send(
                 false,
                 ChannelOutcome::NotApplied,
                 "send arguments missing session_id",
-            ))
+            ));
         }
     };
     if !ledger.sessions.values().any(|s| *s == session_id) {
@@ -354,7 +365,7 @@ pub(crate) fn authorize_send(
                 false,
                 ChannelOutcome::NotApplied,
                 "send arguments missing parts array",
-            ))
+            ));
         }
     };
     let mut pieces: Vec<OutboundPiece> = Vec::with_capacity(parts.len());
@@ -367,7 +378,7 @@ pub(crate) fn authorize_send(
                     false,
                     ChannelOutcome::NotApplied,
                     "send part must be an object",
-                ))
+                ));
             }
         };
         let kind = match part_obj.get("kind") {
@@ -384,7 +395,7 @@ pub(crate) fn authorize_send(
                             false,
                             ChannelOutcome::NotApplied,
                             "text part missing text",
-                        ))
+                        ));
                     }
                 };
                 if text.len() > config.max_text_bytes {
@@ -401,20 +412,43 @@ pub(crate) fn authorize_send(
                 pieces.push(OutboundPiece {
                     ordinal: ordinal as u32,
                     text,
+                    asset: None,
                     transport_message_id: None,
                     outcome: None,
                 });
             }
             "asset" => {
-                // WP-013B seam: Asset parts are not deliverable in v1. They are
-                // rejected with a distinct code before any transport call; text
-                // parts alone remain supported.
-                return Err(ChannelError::new(
-                    codes::UNSUPPORTED_MODALITY,
-                    false,
-                    ChannelOutcome::NotApplied,
-                    "asset parts require the WP-013B channel multimodal profile",
-                ));
+                // WP-013B modality policy: asset parts are admitted only
+                // when the configured accepted modalities include "asset";
+                // otherwise they are refused fail-closed before any durable
+                // or transport effect. The premise remains an ordered
+                // multimodal premise of this committed targeted-Action path;
+                // the frozen schema already validated a canonical
+                // `asset_id`/`media_type` and the crop range, and this
+                // boundary additionally enforces the canonical forms and the
+                // crop invariants (`x0 < x1`, `y0 < y1`) the JSON Schema
+                // cannot express. The premise is prepared (lease-proofed)
+                // below by the injected seam before any durable prepared row
+                // or transport effect.
+                if !config.accepted_modalities.contains("asset") {
+                    return Err(ChannelError::new(
+                        codes::UNSUPPORTED_MODALITY,
+                        false,
+                        ChannelOutcome::NotApplied,
+                        "asset parts require the 'asset' accepted modality (WP-013B channel multimodal profile)",
+                    ));
+                }
+                let premise = crate::asset::parse_asset_premise(ordinal as u32, part)?;
+                pieces.push(OutboundPiece {
+                    ordinal: ordinal as u32,
+                    text: String::new(),
+                    asset: Some(crate::asset::OutboundAsset {
+                        premise,
+                        lease_proof: None,
+                    }),
+                    transport_message_id: None,
+                    outcome: None,
+                });
             }
             other => {
                 return Err(ChannelError::new(
@@ -431,7 +465,7 @@ pub(crate) fn authorize_send(
             codes::MALFORMED_EVENT,
             false,
             ChannelOutcome::NotApplied,
-            "send must contain at least one text part",
+            "send must contain at least one part",
         ));
     }
     Ok(AuthorizedSend { session_id, pieces })
@@ -449,11 +483,13 @@ pub fn dispatch_send(
     ledger: &mut ChannelLedger,
     transport: &mut dyn ChannelTransport,
     admission: &mut OutboundAdmission,
+    assets: &mut dyn crate::asset::AssetPreparation,
     action: &SendAction,
 ) -> SendDispatchResult {
-    // 1-2. Committed targeted-Action authority and text-only v1 pieces,
-    // shared with the verification boundary. Nothing durable and no
-    // transport call happens before this succeeds.
+    // 1-2. Committed targeted-Action authority and the ordered parts,
+    // shared with the verification boundary. Asset parts are prepared by
+    // the injected seam here; nothing durable and no transport call happens
+    // before this succeeds.
     let authorized = match authorize_send(config, ledger, action) {
         Ok(authorized) => authorized,
         Err(error) => return SendDispatchResult::Rejected(error),
@@ -529,10 +565,44 @@ pub fn dispatch_send(
         ));
     }
 
-    // 6. Dispatch. When the transport has no idempotency key support the
-    // `dispatched` marker MUST be durable before or atomically with send
-    // initiation.
-    transport_and_settle(config, ledger, transport, &action.action_id, &now, idempotency_supported)
+    // 6. Complete Asset preparation and closed provider-neutral composition
+    // before the in-memory dispatch marker. A failure is a durable zero-effect
+    // terminal rejection; no later step reads Asset bytes.
+    let idempotency_key = ledger
+        .outbound_entry(&action.action_id)
+        .and_then(|entry| entry.idempotency_key.clone());
+    let prepared = match prepare_transport_request(
+        config,
+        assets,
+        &action.action_id,
+        idempotency_key,
+        &session_id,
+        ledger
+            .outbound_entry(&action.action_id)
+            .map(|entry| entry.pieces.as_slice())
+            .unwrap_or_default(),
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return settle_pre_effect_rejection(ledger, &action.action_id, &now, error);
+        }
+    };
+    if let Some(entry) = ledger.outbound.get_mut(&action.action_id) {
+        entry.pieces = prepared.durable_pieces;
+    }
+    let now_ms = (crate::clock::timestamp_total_micros(&now).max(0) as u64) / 1_000;
+    if let Err(error) = validate_prepared_transport_for_send(
+        config,
+        &prepared.request,
+        ledger
+            .outbound_entry(&action.action_id)
+            .map(|entry| entry.pieces.as_slice())
+            .unwrap_or_default(),
+        now_ms,
+    ) {
+        return settle_pre_effect_rejection(ledger, &action.action_id, &now, error);
+    }
+    transport_and_settle(config, ledger, transport, &prepared.request, &now)
 }
 
 /// Crate-internal: build the durable ledger `Prepared` entry for one
@@ -571,66 +641,235 @@ pub(crate) fn build_prepared_entry(
     }
 }
 
-/// Crate-internal: drive one `Prepared` outbound row through the transport
-/// and settle it. Shared by `dispatch_send` (fresh sends) and the
-/// committed-Action consumer (re-admission of a Prepared send that never
-/// reached dispatch). When the transport has no idempotency-key support the
-/// caller MUST persist the durable `dispatched` marker before this call; the
-/// in-memory marker is written here before send initiation.
+/// Fully composed ephemeral transport request plus the durable proof metadata
+/// that must replace the premise-only queued pieces before dispatch.
+pub(crate) struct PreparedTransport {
+    pub request: TransportSendRequest,
+    pub durable_pieces: Vec<OutboundPiece>,
+}
+
+/// Complete all Asset reads and compose every closed transport piece before
+/// the dispatch claim. The Runtime seam returns Asset `PreparedMedia` mirrors
+/// in premise order; Channel validates and materializes each crop here.
+pub(crate) fn prepare_transport_request(
+    config: &ChannelConfig,
+    assets: &mut dyn crate::asset::AssetPreparation,
+    action_id: &str,
+    idempotency_key: Option<String>,
+    session_id: &str,
+    durable_pieces: &[OutboundPiece],
+) -> Result<PreparedTransport, ChannelError> {
+    let premises: Vec<crate::asset::AssetPremise> = durable_pieces
+        .iter()
+        .filter_map(|piece| piece.asset.as_ref().map(|asset| asset.premise.clone()))
+        .collect();
+    let payloads = assets.prepare_assets(&premises)?;
+    if payloads.len() != premises.len() {
+        return Err(ChannelError::new(
+            codes::INTERNAL,
+            false,
+            ChannelOutcome::NotApplied,
+            "Asset preparation returned a mismatched payload count",
+        ));
+    }
+    let mut payloads = payloads.into_iter();
+    let mut transport_pieces = Vec::with_capacity(durable_pieces.len());
+    let mut prepared_pieces = durable_pieces.to_vec();
+    for piece in &mut prepared_pieces {
+        match &mut piece.asset {
+            None => transport_pieces.push(TransportPiece::Text {
+                ordinal: piece.ordinal,
+                text: piece.text.clone(),
+            }),
+            Some(asset) => {
+                let payload = payloads.next().expect("payload count checked");
+                crate::asset::validate_asset_payload(
+                    &asset.premise,
+                    &payload,
+                    config.max_asset_bytes,
+                )
+                .map_err(|message| {
+                    ChannelError::new(
+                        codes::MALFORMED_EVENT,
+                        false,
+                        ChannelOutcome::NotApplied,
+                        format!(
+                            "asset part at ordinal {} is refused: {message}",
+                            piece.ordinal
+                        ),
+                    )
+                })?;
+                let proof = payload.lease_proof();
+                let view =
+                    crate::asset::materialized_view(&asset.premise, &proof).map_err(|message| {
+                        ChannelError::new(
+                            codes::MALFORMED_EVENT,
+                            false,
+                            ChannelOutcome::NotApplied,
+                            format!(
+                                "asset part at ordinal {} is refused: {message}",
+                                piece.ordinal
+                            ),
+                        )
+                    })?;
+                asset.lease_proof = Some(proof);
+                transport_pieces.push(TransportPiece::Asset {
+                    ordinal: piece.ordinal,
+                    payload,
+                    view,
+                });
+            }
+        }
+    }
+    Ok(PreparedTransport {
+        request: TransportSendRequest {
+            action_id: action_id.to_string(),
+            idempotency_key,
+            session_id: session_id.to_string(),
+            pieces: transport_pieces,
+        },
+        durable_pieces: prepared_pieces,
+    })
+}
+
+/// Local-only proof/expiry/config validation immediately before send. This
+/// function cannot call Asset or acquire external authority.
+pub(crate) fn validate_prepared_transport_for_send(
+    config: &ChannelConfig,
+    request: &TransportSendRequest,
+    durable_pieces: &[OutboundPiece],
+    now_ms: u64,
+) -> Result<(), ChannelError> {
+    if request.pieces.len() != durable_pieces.len() {
+        return Err(ChannelError::new(
+            codes::INTERNAL,
+            false,
+            ChannelOutcome::NotApplied,
+            "prepared transport piece count changed before send",
+        ));
+    }
+    for (transport_piece, durable_piece) in request.pieces.iter().zip(durable_pieces) {
+        if transport_piece.ordinal() != durable_piece.ordinal {
+            return Err(ChannelError::new(
+                codes::INTERNAL,
+                false,
+                ChannelOutcome::NotApplied,
+                "prepared transport order changed before send",
+            ));
+        }
+        match (transport_piece, &durable_piece.asset) {
+            (TransportPiece::Text { text, .. }, None) if text.len() <= config.max_text_bytes => {}
+            (TransportPiece::Asset { payload, view, .. }, Some(asset)) => {
+                crate::asset::validate_asset_payload_for_send(
+                    &asset.premise,
+                    &payload,
+                    config.max_asset_bytes,
+                    now_ms,
+                )
+                .map_err(|message| {
+                    ChannelError::new(
+                        codes::AUTHORIZATION_FAILED,
+                        false,
+                        ChannelOutcome::NotApplied,
+                        format!(
+                            "asset part at ordinal {} failed pre-send validation: {message}",
+                            durable_piece.ordinal
+                        ),
+                    )
+                })?;
+                if asset.lease_proof.as_ref() != Some(&payload.lease_proof()) {
+                    return Err(ChannelError::new(
+                        codes::INTERNAL,
+                        false,
+                        ChannelOutcome::NotApplied,
+                        "durable Asset proof changed before send",
+                    ));
+                }
+                let materialized =
+                    crate::asset::materialized_view(&asset.premise, &payload.lease_proof())
+                        .map_err(|message| {
+                            ChannelError::new(
+                                codes::MALFORMED_EVENT,
+                                false,
+                                ChannelOutcome::NotApplied,
+                                message,
+                            )
+                        })?;
+                if &materialized != view {
+                    return Err(ChannelError::new(
+                        codes::INTERNAL,
+                        false,
+                        ChannelOutcome::NotApplied,
+                        "materialized Asset view changed before send",
+                    ));
+                }
+            }
+            _ => {
+                return Err(ChannelError::new(
+                    codes::MALFORMED_EVENT,
+                    false,
+                    ChannelOutcome::NotApplied,
+                    "transport piece modality does not match the committed Action",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Send a fully prepared request and settle its observation. Asset reads and
+/// fallible composition are complete before this function is called.
 pub(crate) fn transport_and_settle(
     config: &ChannelConfig,
     ledger: &mut ChannelLedger,
     transport: &mut dyn ChannelTransport,
+    request: &TransportSendRequest,
+    now: &str,
+) -> SendDispatchResult {
+    if let Some(existing) = ledger.outbound.get_mut(&request.action_id) {
+        existing.state = OutboundState::Dispatched;
+        existing.dispatched_at = Some(now.to_string());
+        existing.attempts.push(AttemptRecord {
+            at: now.to_string(),
+            kind: "dispatch".to_string(),
+            detail_digest: digest_of("prepared-send"),
+        });
+    }
+    let result = transport.send(request);
+    apply_transport_observations(config, ledger, &request.action_id, now, result)
+}
+
+/// Freeze a zero-effect failure as a terminal ActionResult. Used only before
+/// transport send, including Asset payload preparation and local expiry
+/// failures.
+pub(crate) fn settle_pre_effect_rejection(
+    ledger: &mut ChannelLedger,
     action_id: &str,
     now: &str,
-    idempotency_supported: bool,
+    error: ChannelError,
 ) -> SendDispatchResult {
-    if !idempotency_supported {
-        if let Some(existing) = ledger.outbound.get_mut(action_id) {
-            existing.state = OutboundState::Dispatched;
-            existing.dispatched_at = Some(now.to_string());
-            existing.attempts.push(AttemptRecord {
-                at: now.to_string(),
-                kind: "dispatch".to_string(),
-                detail_digest: digest_of("pre-dispatch"),
+    let result = error_to_action_result(action_id, error.clone());
+    let result_jcs = canonicalize(&result)
+        .map(|(bytes, _)| String::from_utf8(bytes.as_bytes().to_vec()).expect("canonical UTF-8"))
+        .unwrap_or_else(|_| "canonicalize-failed".to_string());
+    if let Some(entry) = ledger.outbound.get_mut(action_id) {
+        for piece in &mut entry.pieces {
+            piece.outcome = Some(PieceOutcome::Rejected {
+                code: error.code.clone(),
             });
         }
+        entry.state = OutboundState::Failed;
+        entry.result_jcs = Some(result_jcs);
+        entry.attempts.push(AttemptRecord {
+            at: now.to_string(),
+            kind: "pre-effect-rejection".to_string(),
+            detail_digest: digest_of(&error.code),
+        });
     }
-    let request = TransportSendRequest {
-        action_id: action_id.to_string(),
-        idempotency_key: ledger
-            .outbound_entry(action_id)
-            .and_then(|e| e.idempotency_key.clone()),
-        session_id: ledger
-            .outbound_entry(action_id)
-            .map(|e| e.session_id.clone())
-            .unwrap_or_default(),
-        pieces: ledger
-            .outbound_entry(action_id)
-            .map(|e| {
-                e.pieces
-                    .iter()
-                    .map(|p| TransportPiece {
-                        ordinal: p.ordinal,
-                        text: p.text.clone(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-    };
-    let result = transport.send(&request);
-    if idempotency_supported {
-        if let Some(existing) = ledger.outbound.get_mut(action_id) {
-            existing.state = OutboundState::Dispatched;
-            existing.dispatched_at = Some(now.to_string());
-            existing.attempts.push(AttemptRecord {
-                at: now.to_string(),
-                kind: "dispatch".to_string(),
-                detail_digest: digest_of("post-idempotent-send"),
-            });
-        }
+    SendDispatchResult::Terminal {
+        state: OutboundState::Failed,
+        result,
     }
-    apply_transport_observations(config, ledger, action_id, now, result)
 }
 
 /// Apply one transport call result to a ledger entry and produce the closed
@@ -670,11 +909,7 @@ fn apply_transport_observations(
                     | TransportPieceOutcome::Rejected { ordinal, .. }
                     | TransportPieceOutcome::Unknown { ordinal } => *ordinal,
                 };
-                if let Some(piece) = entry
-                    .pieces
-                    .iter_mut()
-                    .find(|p| p.ordinal == ordinal)
-                {
+                if let Some(piece) = entry.pieces.iter_mut().find(|p| p.ordinal == ordinal) {
                     match observation {
                         TransportPieceOutcome::Confirmed { message_id, .. } => {
                             piece.transport_message_id = Some(message_id.clone());
@@ -704,9 +939,7 @@ fn apply_transport_observations(
         TransportSendResult::Rejected { code } => {
             for piece in entry.pieces.iter_mut() {
                 if piece.outcome.is_none() {
-                    piece.outcome = Some(PieceOutcome::Rejected {
-                        code: code.clone(),
-                    });
+                    piece.outcome = Some(PieceOutcome::Rejected { code: code.clone() });
                 }
             }
         }
@@ -780,7 +1013,7 @@ pub(crate) fn settle_from_outbound_entry(
                     false,
                     ChannelOutcome::Unknown,
                     "confirmed send result is not canonical",
-                ))
+                ));
             }
         };
         if let Err(message) = validate_send_result(&send_result) {
@@ -799,7 +1032,10 @@ pub(crate) fn settle_from_outbound_entry(
             "schema".into(),
             serde_json::Value::String("dolly.action-result/v1".into()),
         );
-        envelope.insert("action_id".into(), serde_json::Value::String(action_id.into()));
+        envelope.insert(
+            "action_id".into(),
+            serde_json::Value::String(action_id.into()),
+        );
         envelope.insert(
             "status".into(),
             serde_json::Value::String("succeeded".into()),
@@ -812,19 +1048,18 @@ pub(crate) fn settle_from_outbound_entry(
         .unwrap_or_default();
         envelope.insert("result".into(), send_result_json);
         envelope.insert("error".into(), serde_json::Value::Null);
-        let canonical: CanonicalJsonValue = match CanonicalJsonValue::try_from(
-            serde_json::Value::Object(envelope),
-        ) {
-            Ok(v) => v,
-            Err(_) => {
-                return SendDispatchResult::Rejected(ChannelError::new(
-                    codes::INTERNAL,
-                    false,
-                    ChannelOutcome::Unknown,
-                    "action result envelope is not canonical",
-                ))
-            }
-        };
+        let canonical: CanonicalJsonValue =
+            match CanonicalJsonValue::try_from(serde_json::Value::Object(envelope)) {
+                Ok(v) => v,
+                Err(_) => {
+                    return SendDispatchResult::Rejected(ChannelError::new(
+                        codes::INTERNAL,
+                        false,
+                        ChannelOutcome::Unknown,
+                        "action result envelope is not canonical",
+                    ));
+                }
+            };
         (OutboundState::Confirmed, canonical)
     } else if !confirmed.is_empty() {
         // At least one piece confirmed and at least one failed or unknown.
@@ -855,7 +1090,10 @@ pub(crate) fn settle_from_outbound_entry(
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         };
-        (OutboundState::Partial, error_to_action_result(action_id, error))
+        (
+            OutboundState::Partial,
+            error_to_action_result(action_id, error),
+        )
     } else {
         // All pieces failed.
         let error = ChannelError::new(
@@ -865,7 +1103,10 @@ pub(crate) fn settle_from_outbound_entry(
             "transport rejected the send",
         )
         .with_delivery(ChannelDeliveryOutcome::NotSent);
-        (OutboundState::Failed, error_to_action_result(action_id, error))
+        (
+            OutboundState::Failed,
+            error_to_action_result(action_id, error),
+        )
     };
 
     // Record echoed transports IDs so inbound echo suppression drops the
@@ -901,15 +1142,15 @@ fn error_to_action_result(action_id: &str, error: ChannelError) -> CanonicalJson
         "schema".into(),
         serde_json::Value::String("dolly.action-result/v1".into()),
     );
-    map.insert("action_id".into(), serde_json::Value::String(action_id.into()));
+    map.insert(
+        "action_id".into(),
+        serde_json::Value::String(action_id.into()),
+    );
     let status = match error.outcome {
         ChannelOutcome::Unknown => "unknown",
         _ => "failed",
     };
-    map.insert(
-        "status".into(),
-        serde_json::Value::String(status.into()),
-    );
+    map.insert("status".into(), serde_json::Value::String(status.into()));
     map.insert("result".into(), serde_json::Value::Null);
     map.insert(
         "error".into(),
@@ -944,11 +1185,10 @@ pub fn recover_outbound(
             {
                 return None;
             }
-            let at = e.dispatched_at.as_deref().or_else(|| {
-                e.attempts
-                    .first()
-                    .map(|a| a.at.as_str())
-            })?;
+            let at = e
+                .dispatched_at
+                .as_deref()
+                .or_else(|| e.attempts.first().map(|a| a.at.as_str()))?;
             let at_micros = crate::clock::timestamp_total_micros(at);
             (now_micros - at_micros >= stale_micros).then(|| id.clone())
         })
@@ -959,8 +1199,7 @@ pub fn recover_outbound(
     ids
 }
 
-#[cfg(feature = "test-support")]
-fn settle_recovered_unknown(
+pub(crate) fn settle_recovered_unknown(
     _config: &ChannelConfig,
     ledger: &mut ChannelLedger,
     action_id: &str,
@@ -1017,7 +1256,10 @@ fn settle_recovered_unknown(
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
             };
-            (OutboundState::Partial, error_to_action_result(action_id, error))
+            (
+                OutboundState::Partial,
+                error_to_action_result(action_id, error),
+            )
         } else {
             let error = ChannelError::new(
                 codes::TRANSPORT_TIMEOUT,
@@ -1026,10 +1268,15 @@ fn settle_recovered_unknown(
                 "send response lost; outcome is unknown, not failed",
             )
             .with_delivery(ChannelDeliveryOutcome::Unknown);
-            (OutboundState::Unknown, error_to_action_result(action_id, error))
+            (
+                OutboundState::Unknown,
+                error_to_action_result(action_id, error),
+            )
         };
         let result_jcs = canonicalize(&outcome.1)
-            .map(|(bytes, _)| String::from_utf8(bytes.as_bytes().to_vec()).expect("canonical UTF-8"))
+            .map(|(bytes, _)| {
+                String::from_utf8(bytes.as_bytes().to_vec()).expect("canonical UTF-8")
+            })
             .unwrap_or_else(|_| "canonicalize-failed".to_string());
         entry.state = outcome.0;
         entry.result_jcs = Some(result_jcs);
@@ -1060,9 +1307,10 @@ fn recover_pending_send(
             "pending outbound row vanished",
         ));
     };
-    let any_unknown = entry.pieces.iter().any(|p| {
-        matches!(p.outcome, Some(PieceOutcome::Unknown) | None)
-    });
+    let any_unknown = entry
+        .pieces
+        .iter()
+        .any(|p| matches!(p.outcome, Some(PieceOutcome::Unknown) | None));
     if any_unknown {
         // Still unresolved; may have reached the transport. Do not guess.
         return SendDispatchResult::DispatchedPending;
@@ -1112,7 +1360,9 @@ pub fn observe_outbound(
             .find(|p| p.ordinal == observation.ordinal)
         {
             match observation.outcome {
-                PieceOutcome::Confirmed { transport_message_id } => {
+                PieceOutcome::Confirmed {
+                    transport_message_id,
+                } => {
                     piece.transport_message_id = Some(transport_message_id.clone());
                     piece.outcome = Some(PieceOutcome::Confirmed {
                         transport_message_id,

@@ -38,12 +38,15 @@ pub struct AttemptRecord {
 // Inbound ledger
 // ---------------------------------------------------------------------------
 
-/// Inbound ledger states (text modality; `assets_pending` is a WP-013B
-/// extension and is not reachable in v1).
+/// Inbound ledger states (`assets_pending` is the WP-013B attachment
+/// extension and requires the injected inbound Asset import seam).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InboundState {
     Received,
+    /// At least one attachment import is in progress; the Block draft is NOT
+    /// submitted until every required asset is AVAILABLE.
+    AssetsPending,
     Submitted,
     Accepted,
     Rejected,
@@ -53,6 +56,7 @@ impl InboundState {
     pub fn as_str(self) -> &'static str {
         match self {
             InboundState::Received => "received",
+            InboundState::AssetsPending => "assets_pending",
             InboundState::Submitted => "submitted",
             InboundState::Accepted => "accepted",
             InboundState::Rejected => "rejected",
@@ -107,6 +111,10 @@ pub struct InboundEntry {
     /// The Core-minted Block ID returned from the durable premise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_id: Option<String>,
+    /// Ordered typed provider attachments and their per-attachment import
+    /// state (empty for v1 text events).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<crate::attachment::AttachmentRecord>,
     pub pages: Vec<String>,
     /// Config revision under which this event was authorized.
     pub config_revision: i64,
@@ -173,12 +181,8 @@ impl OutboundState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum PieceOutcome {
-    Confirmed {
-        transport_message_id: String,
-    },
-    Rejected {
-        code: String,
-    },
+    Confirmed { transport_message_id: String },
+    Rejected { code: String },
     Unknown,
 }
 
@@ -193,11 +197,17 @@ impl PieceOutcome {
 }
 
 /// One piece of an outbound send: its ordinal, text payload (used only for
-/// dispatch), the resulting transport message ID, and its outcome.
+/// dispatch, empty for asset pieces), the prepared asset premise and lease
+/// proof (asset pieces only), the resulting transport message ID, and its
+/// outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboundPiece {
     pub ordinal: u32,
     pub text: String,
+    /// The prepared asset premise and short-lease proof (asset pieces only;
+    /// absent for v1 text pieces so the durable wire shape is unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset: Option<crate::asset::OutboundAsset>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -283,14 +293,19 @@ impl ChannelLedger {
         account: &str,
         external_message_id: &str,
     ) -> Option<&mut InboundEntry> {
-        self.inbound.get_mut(&inbound_key(account, external_message_id))
+        self.inbound
+            .get_mut(&inbound_key(account, external_message_id))
     }
 
     /// Insert an inbound entry under account-scoped deterministic bounds:
     /// terminal entries are evicted oldest-first before accepting an insert;
     /// if nothing can be freed the insert fails closed with
     /// `CHANNEL_LEDGER_FULL`.
-    pub fn insert_inbound(&mut self, entry: InboundEntry, max_entries: usize) -> Result<(), ChannelError> {
+    pub fn insert_inbound(
+        &mut self,
+        entry: InboundEntry,
+        max_entries: usize,
+    ) -> Result<(), ChannelError> {
         let key = inbound_key(&entry.transport_account, &entry.external_message_id);
         if self.inbound.contains_key(&key) {
             self.inbound.insert(key, entry);
@@ -328,7 +343,11 @@ impl ChannelLedger {
         self.outbound.get(action_id)
     }
 
-    pub fn insert_outbound(&mut self, entry: OutboundEntry, max_entries: usize) -> Result<(), ChannelError> {
+    pub fn insert_outbound(
+        &mut self,
+        entry: OutboundEntry,
+        max_entries: usize,
+    ) -> Result<(), ChannelError> {
         let action_id = entry.action_id.clone();
         if self.outbound.contains_key(&action_id) {
             self.outbound.insert(action_id, entry);
@@ -343,11 +362,7 @@ impl ChannelLedger {
             .iter()
             .filter(|(_, e)| e.state.is_terminal())
             .map(|(k, e)| {
-                let at = e
-                    .attempts
-                    .first()
-                    .map(|a| a.at.clone())
-                    .unwrap_or_default();
+                let at = e.attempts.first().map(|a| a.at.clone()).unwrap_or_default();
                 (k.clone(), at)
             })
             .collect();
@@ -373,8 +388,10 @@ impl ChannelLedger {
     }
 
     pub fn insert_session(&mut self, account: &str, conversation_id: &str, session_id: &str) {
-        self.sessions
-            .insert(session_key(account, conversation_id), session_id.to_string());
+        self.sessions.insert(
+            session_key(account, conversation_id),
+            session_id.to_string(),
+        );
     }
 
     // -- echo suppression --------------------------------------------------
@@ -385,7 +402,8 @@ impl ChannelLedger {
     }
 
     pub fn is_echo(&self, account: &str, external_message_id: &str) -> bool {
-        self.echoed_message_ids.contains(&echo_key(account, external_message_id))
+        self.echoed_message_ids
+            .contains(&echo_key(account, external_message_id))
     }
 }
 

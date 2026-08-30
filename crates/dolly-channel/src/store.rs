@@ -309,6 +309,19 @@ pub enum DispatchClaim {
         result_jcs: Option<String>,
     },
 }
+
+/// Result of atomically replacing a still-queued row with prepared Asset
+/// proofs or a zero-effect terminal rejection before the dispatch claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum QueuedRecordUpdate {
+    Updated,
+    LostRace,
+    AlreadyDispatched,
+    AlreadyTerminal {
+        state: OutboundState,
+        result_jcs: Option<String>,
+    },
+}
 /// Result of one durable admission transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OutboundAdmissionOutcome {
@@ -1303,6 +1316,49 @@ impl<'connection> SqliteChannelStore<'connection> {
         transaction.commit().map_err(map_sqlite)
     }
 
+    /// Replace one `prepared` attachment intent with its FINAL Asset-bearing
+    /// form (placeholder draft -> final draft, new digest) as assets become
+    /// AVAILABLE during status-first recovery. Text-only prepared intents and
+    /// terminal rows are immutable; only rows carrying attachment records may
+    /// be upgraded, and only in the `Prepared` state, so the digest-bound
+    /// crash/replay guard is never bypassed for ordinary events.
+    pub fn replace_pending_attachment_intent(
+        &mut self,
+        intent: &ChannelIntent,
+    ) -> Result<(), ChannelError> {
+        self.verify_owner_meta()?;
+        if intent.state != IntentState::Prepared || intent.attachments.is_empty() {
+            return Err(corrupted(
+                "replace_pending_attachment_intent requires a prepared attachment intent",
+            ));
+        }
+        if intent.schema != CHANNEL_INTENT_RECORD_SCHEMA {
+            return Err(corrupted("channel intent record discriminator mismatch"));
+        }
+        let Some(existing) = self.load_intent(&intent.intent_key)? else {
+            return Err(ChannelError::new(
+                codes::OPERATION_CONFLICT,
+                false,
+                ChannelOutcome::NotApplied,
+                "the attachment intent row vanished before finalization",
+            ));
+        };
+        if existing.state != IntentState::Prepared || existing.attachments.is_empty() {
+            return Err(ChannelError::new(
+                codes::OPERATION_CONFLICT,
+                false,
+                ChannelOutcome::NotApplied,
+                "only a prepared attachment intent may be finalized",
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite)?;
+        Self::write_intent_row(&transaction, intent)?;
+        transaction.commit().map_err(map_sqlite)
+    }
+
     /// Atomically commit the terminal outcome in ONE Channel DB transaction.
     /// If this transaction fails, the durable row stays `prepared`
     /// (reconcilable by `status`-first), never `accepted`-without-ledger.
@@ -1608,8 +1664,10 @@ impl<'connection> SqliteChannelStore<'connection> {
             }
             let text = std::str::from_utf8(&jcs)
                 .map_err(|_| corrupted("channel outbound record is not UTF-8"))?;
-            let record: DurableOutboundRecord = serde_json::from_str(text).map_err(|_| {
-                corrupted("channel outbound record is not a strict canonical record")
+            let record: DurableOutboundRecord = serde_json::from_str(text).map_err(|error| {
+                corrupted(&format!(
+                    "channel outbound record is not a strict canonical record: {error}"
+                ))
             })?;
             Self::verify_outbound_record(self.connection, &key, &record, &self.owner)?;
             if !record.entry.state.is_terminal() {
@@ -1975,10 +2033,98 @@ impl<'connection> SqliteChannelStore<'connection> {
         }
         let text = std::str::from_utf8(&jcs)
             .map_err(|_| corrupted("channel outbound record is not UTF-8"))?;
-        let record: DurableOutboundRecord = serde_json::from_str(text)
-            .map_err(|_| corrupted("channel outbound record is not a strict canonical record"))?;
+        let record: DurableOutboundRecord = serde_json::from_str(text).map_err(|error| {
+            corrupted(&format!(
+                "channel outbound record is not a strict canonical record: {error}"
+            ))
+        })?;
         Self::verify_outbound_record(transaction, outbound_key, &record, owner)?;
         Ok(Some(record))
+    }
+
+    /// Atomically replace a verified `Queued` row before dispatch. The new
+    /// record may remain `Queued` with exact prepared Asset proofs or become a
+    /// terminal zero-effect rejection. Ephemeral bytes are never accepted.
+    pub(crate) fn replace_queued_before_dispatch(
+        &mut self,
+        expected: &DurableOutboundRecord,
+        replacement: &DurableOutboundRecord,
+    ) -> Result<QueuedRecordUpdate, ChannelError> {
+        self.verify_owner_meta()?;
+        if replacement.entry.state != OutboundState::Queued
+            && !replacement.entry.state.is_terminal()
+        {
+            return Err(corrupted(
+                "pre-dispatch queued replacement requires queued or terminal state",
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite)?;
+        let current =
+            Self::load_outbound_txn(&transaction, &replacement.outbound_key, &self.owner)?
+                .ok_or_else(|| corrupted("outbound row missing before dispatch"))?;
+        if current.entry.state.is_terminal() {
+            let outcome = QueuedRecordUpdate::AlreadyTerminal {
+                state: current.entry.state,
+                result_jcs: current.entry.result_jcs.clone(),
+            };
+            transaction.commit().map_err(map_sqlite)?;
+            return Ok(outcome);
+        }
+        if current.entry.state == OutboundState::Dispatched {
+            transaction.commit().map_err(map_sqlite)?;
+            return Ok(QueuedRecordUpdate::AlreadyDispatched);
+        }
+        if current.entry.state != OutboundState::Queued {
+            transaction.commit().map_err(map_sqlite)?;
+            return Ok(QueuedRecordUpdate::LostRace);
+        }
+        if current != *expected {
+            transaction.commit().map_err(map_sqlite)?;
+            return Ok(QueuedRecordUpdate::LostRace);
+        }
+        let mut expected_replacement = current.clone();
+        expected_replacement.entry = replacement.entry.clone();
+        if expected_replacement != *replacement {
+            return Err(corrupted(
+                "pre-dispatch queued replacement changed immutable authority fields",
+            ));
+        }
+        let (_, current_digest) = Self::outbound_record_bytes(&current)?;
+        let (bytes, digest) = Self::outbound_record_bytes(replacement)?;
+        let changed = transaction
+            .execute(
+                "UPDATE channel_outbound
+                 SET record_digest = ?2, canonical_jcs = ?3,
+                     state = ?4, session_id = ?5, queued_seq = ?6
+                 WHERE outbound_key = ?1 AND record_digest = ?7 AND state = 'queued'",
+                params![
+                    replacement.outbound_key,
+                    digest,
+                    bytes.as_slice(),
+                    replacement.entry.state.as_str(),
+                    replacement.entry.session_id,
+                    replacement.entry.queued_seq,
+                    current_digest,
+                ],
+            )
+            .map_err(map_sqlite)?;
+        if changed == 1 {
+            Self::verify_outbound_record(
+                &transaction,
+                &replacement.outbound_key,
+                replacement,
+                &self.owner,
+            )?;
+        }
+        transaction.commit().map_err(map_sqlite)?;
+        Ok(if changed == 1 {
+            QueuedRecordUpdate::Updated
+        } else {
+            QueuedRecordUpdate::LostRace
+        })
     }
 
     /// Claim only the minimum durable `queued_seq` for this store/account.
@@ -2379,6 +2525,7 @@ impl<'connection> SqliteChannelStore<'connection> {
                     ingress_key: record.intent_key.clone(),
                     operation_digest: record.digest.clone(),
                     block_id: record.block_id.clone(),
+                    attachments: record.attachments.clone(),
                     pages: record.target_page_ids.clone(),
                     config_revision: record.config_revision,
                     attempts: Vec::new(),
@@ -2600,6 +2747,7 @@ mod tests {
             target_page_ids: vec!["page-a".to_string()],
             payload_digest,
             request_jcs,
+            attachments: Vec::new(),
             block_id: None,
             rejected_code: None,
         }
@@ -3539,6 +3687,7 @@ mod tests {
                 pieces: vec![OutboundPiece {
                     ordinal: 0,
                     text: text.to_string(),
+                    asset: None,
                     transport_message_id: None,
                     outcome: None,
                 }],
@@ -4201,8 +4350,7 @@ mod tests {
         let mut connection = connection();
         let mut store = SqliteChannelStore::new(&mut connection, &principal(), 1).unwrap();
         let clock = SharedClock::at("2026-08-09T15:00:00.000000Z");
-        let deadline =
-            crate::clock::timestamp_total_micros("2026-08-09T15:00:10.000000Z");
+        let deadline = crate::clock::timestamp_total_micros("2026-08-09T15:00:10.000000Z");
         let limits = admission_limits(3, 2, 1);
         let active = "0198ab31-6c44-7e8a-b2bb-000000000413";
         let oldest = "0198ab31-6c44-7e8a-b2bb-000000000414";
@@ -4213,9 +4361,7 @@ mod tests {
             (later, "session-b"),
         ] {
             store
-                .insert_prepared_or_replay(&valid_outbound_record(
-                    id, session, "receiver", id,
-                ))
+                .insert_prepared_or_replay(&valid_outbound_record(id, session, "receiver", id))
                 .unwrap();
         }
         assert_eq!(

@@ -1,22 +1,28 @@
-//! `org.dolly.channel` v1 — text ingress and outbound effect ledger.
+//! `org.dolly.channel` v1 — text ingress and outbound effect ledger, plus the
+//! WP-013B ordered multimodal asset-premise profile.
 //!
 //! This crate is the production module for the built-in Channel package. It
 //! owns the account-scoped inbound ledger (transport event -> Block draft ->
 //! durable Core ingress premise), the outbound effect ledger for
 //! `org.dolly.channel.send` (prepared/dispatched/confirmed/partial/failed/
-//! unknown), and the frozen semantic result validator. The decision pipeline
-//! performs no transport, network, or storage I/O: those enter through the
-//! injected [`CoreIngress`], [`ChannelTransport`], and storage-agnostic
-//! [`ChannelLedger`] boundaries, so every decision is deterministic and
-//! testable offline. The G4-C durable backing ([`InboundReceiver`],
-//! [`SqliteChannelStore`]) is the shipping-runtime layer that binds that
-//! pipeline to the accepted `HostIngress` / storage seams.
+//! unknown), and the frozen semantic result validator. Ordered multimodal
+//! sends parse ordered Core `Part` Asset premises from the committed targeted
+//! Action, complete typed Asset preparation before the dispatch claim, and
+//! send a closed provider-neutral composition without any later Asset read.
+//! The durable state contains only committed premises and exact lease proofs;
+//! prepared bytes exist only in the ephemeral transport request. External
+//! effects enter through the injected [`CoreIngress`], [`ChannelTransport`],
+//! and storage boundaries, keeping the Channel decision flow deterministic.
+//! The durable pipeline binds to the accepted `HostIngress` and storage seams.
 //!
 //! The Channel never appends directly to a Page, never mints a Block or Asset
-//! ID, never exposes management privileges to conversation users, and never
-//! lets a send re-enter Dolly as an inbound user message (echoed outbound IDs
-//! are suppressed by the inbound ledger).
+//! ID, never reimplements Asset authority, never accepts a raw path or byte
+//! buffer as authority, never exposes management privileges to conversation
+//! users, and never lets a send re-enter Dolly as an inbound user message
+//! (echoed outbound IDs are suppressed by the inbound ledger).
 
+pub mod asset;
+pub mod attachment;
 pub mod clock;
 
 pub mod config;
@@ -39,6 +45,10 @@ pub mod result_validator;
 pub(crate) mod store;
 pub mod transport;
 
+pub use attachment::{
+    AttachmentImportRequest, AttachmentImportStatus, AttachmentRecord, AttachmentState,
+    AvailableAttachment, DenyAttachments, InboundAssetImport, InboundAttachment,
+};
 pub use clock::{
     Clock, FixedClock, VirtualClock, timestamp_diff_micros, timestamp_from_total_micros,
     timestamp_plus_seconds, timestamp_total_micros,
