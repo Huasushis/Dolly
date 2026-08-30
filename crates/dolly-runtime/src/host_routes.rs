@@ -528,7 +528,9 @@ pub fn reconcile_channel_inbound_route_with_assets<'connection, 'principal>(
 // consumer/recovery loop over an injected status-capable transport.
 // ---------------------------------------------------------------------------
 
+use dolly_channel::ledger::OutboundState;
 use dolly_channel::outbound_consumer::{ConsumerOutcome, OutboundConsumer};
+use std::collections::HashSet;
 use dolly_channel::outbound_queue::OutboundQueueGate;
 use dolly_channel::transport::ChannelTransport;
 
@@ -549,6 +551,53 @@ pub struct ChannelOutboundRunReport {
     pub remaining: usize,
     /// Terminal outcomes produced this pass (frozen ActionResult envelopes).
     pub terminal: Vec<ConsumerOutcome>,
+}
+
+
+/// Whether a terminal row carries direct transport sent/confirmed evidence:
+/// only `Confirmed` (every piece confirmed) and `Partial` (at least one
+/// piece confirmed) prove a provider effect was actually sent. Pre-effect
+/// refusals (asset/authority failures before transport), full transport
+/// rejections, and settled-unknown rows carry no sent evidence and are never
+/// reported as transported.
+fn has_sent_evidence(state: OutboundState) -> bool {
+    matches!(state, OutboundState::Confirmed | OutboundState::Partial)
+}
+
+/// The closed error code of a terminal failure envelope, when present. The
+/// frozen `dolly.action-result/v1` envelope carries it under `error.code`;
+/// a missing or unparseable envelope yields `None` (the terminal is still
+/// counted as zero-effect, never as transported).
+fn terminal_error_code(result_jcs: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(result_jcs)
+        .ok()
+        .and_then(|envelope| {
+            envelope
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+/// Classify one consumer outcome under the direct-sent-evidence rule.
+/// Returns `(transported, zero_effect_code, pending)`:
+/// - a terminal with sent evidence counts transported;
+/// - a terminal without sent evidence counts rejected with its failure code;
+/// - a deterministic rejection counts rejected with its error code;
+/// - a pending (dispatched, outcome unknown) is never transported and never
+///   a confirmed effect.
+fn classify_outcome(outcome: &ConsumerOutcome) -> (bool, Option<String>, bool) {
+    match outcome {
+        ConsumerOutcome::Terminal { state, .. } if has_sent_evidence(*state) => (true, None, false),
+        ConsumerOutcome::Terminal { result_jcs, .. } => (
+            false,
+            terminal_error_code(result_jcs).or_else(|| Some("CHANNEL_TERMINAL_FAILED".to_string())),
+            false,
+        ),
+        ConsumerOutcome::Rejected { error, .. } => (false, Some(error.code.clone()), false),
+        ConsumerOutcome::Pending { .. } => (false, None, true),
+    }
 }
 
 fn channel_error(code: String, message: String) -> HostRouteError {
@@ -691,31 +740,33 @@ impl<'principal> ChannelOutboundRoute<'principal> {
         let outcomes = consumer
             .consume(caller_deadline)
             .map_err(|error| channel_error(error.code, error.message))?;
-        let terminal: Vec<ConsumerOutcome> = outcomes
-            .iter()
-            .filter(|outcome| matches!(outcome, ConsumerOutcome::Terminal { .. }))
-            .cloned()
-            .collect();
-        let outcomes_other: Vec<ConsumerOutcome> = outcomes
-            .into_iter()
-            .filter(|outcome| !matches!(outcome, ConsumerOutcome::Terminal { .. }))
-            .collect();
-        let transported = terminal.len();
-        let rejected = outcomes_other
-            .iter()
-            .filter(|outcome| matches!(outcome, ConsumerOutcome::Rejected { .. }))
-            .count();
-        let rejected_codes: Vec<String> = outcomes_other
-            .iter()
-            .filter_map(|outcome| match outcome {
-                ConsumerOutcome::Rejected { error, .. } => Some(error.code.clone()),
-                _ => None,
-            })
-            .collect();
-        let pending = outcomes_other
-            .iter()
-            .filter(|outcome| matches!(outcome, ConsumerOutcome::Pending { .. }))
-            .count();
+        // Direct-sent-evidence accounting: a terminal row is transported only
+        // when the closed transport actually confirmed it (Confirmed /
+        // Partial). Pre-effect refusals and full transport rejections are
+        // zero-effect failures and count as rejected, never transported.
+        // Status-first recovery contributes only `remaining` below, so an
+        // effect settled here is never counted a second time.
+        let mut terminal = Vec::new();
+        let mut transported = 0usize;
+        let mut rejected = 0usize;
+        let mut rejected_codes = Vec::new();
+        let mut pending = 0usize;
+        for outcome in &outcomes {
+            if matches!(outcome, ConsumerOutcome::Terminal { .. }) {
+                terminal.push(outcome.clone());
+            }
+            let (was_transported, zero_effect_code, is_pending) = classify_outcome(outcome);
+            if was_transported {
+                transported += 1;
+            }
+            if let Some(code) = zero_effect_code {
+                rejected += 1;
+                rejected_codes.push(code);
+            }
+            if is_pending {
+                pending += 1;
+            }
+        }
         let remaining = consumer
             .reconcile()
             .map_err(|error| channel_error(error.code, error.message))?;
@@ -753,8 +804,13 @@ impl<'principal> ChannelOutboundRoute<'principal> {
         let mut rejected = 0usize;
         let mut pending = 0usize;
         let mut rejected_codes = Vec::new();
-        let mut remaining = 0usize;
+        let mut remaining;
         let mut terminal = Vec::new();
+        // Per-effect idempotency across the drain: a terminal or refused
+        // action is counted at most once even when a later pass re-observes
+        // its durable row; pending actions remain uncounted until they
+        // settle. Same direct-sent-evidence rule as consume_once.
+        let mut counted: HashSet<String> = HashSet::new();
         for _ in 0..max_passes {
             let outcomes = consumer
                 .consume(caller_deadline)
@@ -763,14 +819,27 @@ impl<'principal> ChannelOutboundRoute<'principal> {
                 break;
             }
             for outcome in outcomes {
-                match outcome {
-                    ConsumerOutcome::Terminal { .. } => {
-                        transported += 1;
-                        terminal.push(outcome);
-                    }
-                    ConsumerOutcome::Rejected { error, .. } => {
-                        rejected += 1;
-                        rejected_codes.push(error.code.clone());
+                match &outcome {
+                    ConsumerOutcome::Terminal { .. } | ConsumerOutcome::Rejected { .. } => {
+                        let action_id = match &outcome {
+                            ConsumerOutcome::Terminal { action_id, .. } => action_id.clone(),
+                            ConsumerOutcome::Rejected { action_id, .. } => action_id.clone(),
+                            _ => unreachable!(),
+                        };
+                        if !counted.insert(action_id) {
+                            continue;
+                        }
+                        if matches!(outcome, ConsumerOutcome::Terminal { .. }) {
+                            terminal.push(outcome.clone());
+                        }
+                        let (was_transported, zero_effect_code, _) = classify_outcome(&outcome);
+                        if was_transported {
+                            transported += 1;
+                        }
+                        if let Some(code) = zero_effect_code {
+                            rejected += 1;
+                            rejected_codes.push(code);
+                        }
                     }
                     ConsumerOutcome::Pending { .. } => pending += 1,
                 }
