@@ -1,27 +1,30 @@
 //! WP-013B Asset-side media preparation seam.
 //!
-//! `AssetService::prepare_media` turns a canonical `AssetRef` into a bounded
-//! typed, digest-verified copy of the immutable bytes plus authoritative
-//! metadata, guarded by the caller's exact lease. Acceptance is fail-closed:
+//! `AssetService::prepare_media` turns a committed authoritative `AssetId`
+//! into the canonical `AssetRef` minted from the durable record, plus a
+//! bounded, digest-verified copy of the immutable bytes, guarded by the
+//! caller's exact lease. The caller supplies only the committed `AssetId`,
+//! kind/type claims, and lease proof; the service resolves the authoritative
+//! row itself and mints every reference field. Acceptance is fail-closed:
 //! only an asset whose durable lifecycle row is live and present in the
-//! caller's security domain, whose current generation and recorded identity
-//! exactly match the reference, and whose caller-held lease is unexpired and
-//! bound to this capability's instance, domain, asset, and generation can be
-//! prepared. Pending, failed, deleted, stale, revoked, foreign, and
-//! non-canonical references never release bytes.
+//! caller's security domain, whose current generation and content-identity
+//! exactly match the committed `AssetId`, and whose caller-held lease is
+//! unexpired and bound to this capability's instance, domain, asset, and
+//! generation can be prepared. Pending, failed, deleted, stale, revoked,
+//! foreign, forged, and non-canonical identities never release bytes.
 //!
 //! The caller's media-kind and media-type claims are checks, never
 //! authority: the result carries only the detected media type recorded at
 //! import, and active document content (PDF, HTML, SVG) is refused rather
 //! than relabeled. Bytes are read through the content-addressed
 //! `ObjectReader` (no caller-chosen path or network), verified against the
-//! recorded BLAKE3 digest, and the full lease/asset authority is revalidated
-//! after the blocking read and immediately before the typed result is
-//! released.
+//! recorded BLAKE3 digest (so `AssetId = BLAKE3(content)` is re-proven),
+//! and the full lease/asset authority is revalidated after the blocking
+//! read and immediately before the typed result is released.
 
 use crate::content::ObjectReader;
 use crate::error::{AssetError, AssetErrorCode, ErrorPhase};
-use crate::identity::{AssetRef, ContentHash, MediaType};
+use crate::identity::{AssetId, AssetRef, ContentHash, MediaType};
 use crate::record::{AssetLease, AssetRecord, MediaKind};
 use crate::service::AssetCapability;
 use crate::store::{AssetStore, StoreTransaction};
@@ -29,13 +32,16 @@ use std::path::Path;
 
 /// One media preparation request (the WP-013B Channel seam input).
 ///
-/// The `asset_ref` MUST be the canonical reference minted by an `available`
-/// import (or carried by a committed AssetPart); any non-canonical form is
-/// refused before store access. `lease_id` is the caller-held short Asset
+/// Only the committed content-addressed `asset_id` is trusted input from the
+/// caller, and it is re-proven against the durable record's content digest
+/// before any bytes are read. `lease_id` is the caller-held short Asset
 /// lease that must remain current through the whole preparation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaPrepareRequest {
-    pub asset_ref: AssetRef,
+    /// The committed `AssetId` to prepare (from an AssetPart). Verified to
+    /// equal `BLAKE3(content)` through the durable record inside the store;
+    /// a forged or stale `AssetId` is refused before any byte read.
+    pub asset_id: AssetId,
     /// The media kind the caller claims for this part. It is a check, not a
     /// label: it MUST equal the kind derived from the authoritative detected
     /// media type.
@@ -50,26 +56,30 @@ pub struct MediaPrepareRequest {
 
 /// The bounded typed result of a successful preparation.
 ///
-/// `bytes` is an exact copy of the immutable asset bytes, capped by the
-/// current decoded-byte configuration, with `digest` verified against that
-/// copy before release. No path, URL, capability, or other ambient
-/// authority appears in the result.
+/// `asset_ref` is the canonical reference minted by the service from the
+/// durable row: every field (media type, byte length, orientation, and image
+/// dimensions) is the inspected/stored value, and no caller-supplied
+/// metadata is echoed. `bytes` is an exact copy of the immutable asset
+/// bytes, capped by the current decoded-byte configuration, with `digest`
+/// verified against that copy before release. No path, URL, capability, or
+/// other ambient authority appears in the result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedMedia {
-    /// The canonical reference that was prepared.
+    /// The canonical, fully authoritative reference minted from the durable
+    /// row.
     pub asset_ref: AssetRef,
-    /// The authoritative detected media type recorded at import.
-    pub media_type: MediaType,
     /// The media kind derived from the detected type, never caller-shaped.
     pub media_kind: MediaKind,
-    /// The exact decoded byte count (equals `bytes.len()`).
-    pub byte_length: u64,
     /// The exact current lifecycle generation that held the lease.
     pub generation: u64,
-    /// The canonical BLAKE3 digest verified against `bytes`.
+    /// The canonical BLAKE3 digest verified against `bytes` (so the prepared
+    /// identity is exactly `AssetId = BLAKE3(bytes)`).
     pub digest: ContentHash,
     /// The lease that guarded the read; still live and current on return.
     pub lease_id: String,
+    /// When that lease expires, in milliseconds since the Unix epoch; the
+    /// authority proof a Channel adapter carries for its send window.
+    pub lease_expires_at_ms: u64,
     /// The verified immutable bytes, bounded by configuration.
     pub bytes: Vec<u8>,
 }
@@ -97,6 +107,8 @@ pub(crate) struct PreparedAuthority {
     pub lease: AssetLease,
     pub asset: AssetRecord,
     pub detected_type: MediaType,
+    /// The canonical reference minted from the durable row.
+    pub canonical_ref: AssetRef,
 }
 
 /// Active document content is never transportable media: it keeps its real
@@ -123,8 +135,8 @@ pub(crate) fn media_kind_of_type(media_type: Option<&MediaType>) -> MediaKind {
 /// Fail-closed ordering keeps each rejection distinct and deterministic:
 /// revoked/unknown lease, foreign domain, foreign owner, lease/asset
 /// mismatch, expired lease, absent or byte-missing asset, stale generation,
-/// reference/record mismatch, forged kind or media type, and active document
-/// content.
+/// forged identity or content digest, non-canonical durable record, forged
+/// kind or media type, and active document content.
 pub(crate) fn validate_prepare_authority(
     tx: &StoreTransaction,
     capability: &AssetCapability,
@@ -153,7 +165,7 @@ pub(crate) fn validate_prepare_authority(
             "lease owner does not match the capability instance".to_string(),
         ));
     }
-    if lease.asset_id != request.asset_ref.asset_id.as_str() {
+    if lease.asset_id != request.asset_id.as_str() {
         return Err(AssetError::new(
             AssetErrorCode::Unauthorized,
             ErrorPhase::Acquire,
@@ -169,10 +181,7 @@ pub(crate) fn validate_prepare_authority(
     }
 
     let asset = tx
-        .load_live_asset(
-            request.asset_ref.asset_id.as_str(),
-            capability.domain(),
-        )
+        .load_live_asset(request.asset_id.as_str(), capability.domain())
         .map_err(store_error)?;
     let asset = asset.ok_or_else(|| {
         AssetError::new(
@@ -196,8 +205,30 @@ pub(crate) fn validate_prepare_authority(
         ));
     }
 
-    // The reference must be the exact current durable identity, never a
-    // stale or forged claim.
+    // The committed identity must be exactly the content identity. A row
+    // whose recorded digest does not derive the requested `AssetId` is a
+    // forged or non-canonical identity and is refused before any byte read.
+    if AssetId::from_digest(asset.content_hash.digest) != request.asset_id {
+        return Err(AssetError::new(
+            AssetErrorCode::InvalidRequest,
+            ErrorPhase::Validate,
+            "asset identity does not match its recorded content digest".to_string(),
+        ));
+    }
+
+    // Mint the full canonical reference from the durable row. Every field is
+    // the inspected/stored value; nothing caller-supplied is echoed. A row
+    // that cannot mint a canonical reference is refused.
+    let canonical_ref = asset.asset_ref().ok_or_else(|| {
+        AssetError::new(
+            AssetErrorCode::NotFound,
+            ErrorPhase::Acquire,
+            "durable asset record cannot mint a canonical reference".to_string(),
+        )
+    })?;
+
+    // The authoritative detected type is the recorded value; caller claims
+    // are only checked against it.
     let detected_type = MediaType::parse(
         asset
             .detected_media_type
@@ -211,20 +242,6 @@ pub(crate) fn validate_prepare_authority(
             format!("durable asset record has a non-canonical media type: {reason}"),
         )
     })?;
-    if request.asset_ref.byte_length != asset.byte_length {
-        return Err(AssetError::new(
-            AssetErrorCode::NotFound,
-            ErrorPhase::Acquire,
-            "reference does not match the durable asset record".to_string(),
-        ));
-    }
-    if request.asset_ref.media_type != detected_type {
-        return Err(AssetError::new(
-            AssetErrorCode::NotFound,
-            ErrorPhase::Acquire,
-            "reference media type does not match the durable asset record".to_string(),
-        ));
-    }
     if request.expected_media_kind != media_kind_of_type(Some(&detected_type)) {
         return Err(AssetError::new(
             AssetErrorCode::Unauthorized,
@@ -253,6 +270,7 @@ pub(crate) fn validate_prepare_authority(
         lease,
         asset,
         detected_type,
+        canonical_ref,
     })
 }
 

@@ -219,6 +219,33 @@ pub struct AssetRecord {
     pub updated_at_ms: u64,
 }
 
+impl AssetRecord {
+    /// Build the downstream-safe canonical reference from an asset row.
+    /// Fails closed: any non-canonical recorded value yields `None` rather
+    /// than a reference a consumer could mistake for authority.
+    pub fn asset_ref(&self) -> Option<AssetRef> {
+        let byte_length = self.byte_length;
+        let media_type = MediaType::parse(
+            self.detected_media_type
+                .as_deref()
+                .unwrap_or("application/octet-stream"),
+        )
+        .ok()?;
+        let reference = AssetRef {
+            asset_id: self.asset_id.parse().ok()?,
+            media_type,
+            byte_length,
+            orientation: self.orientation,
+            encoded_width: self.encoded_width,
+            encoded_height: self.encoded_height,
+            display_width: self.display_width,
+            display_height: self.display_height,
+        };
+        reference.validate().ok()?;
+        Some(reference)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Lifecycle {

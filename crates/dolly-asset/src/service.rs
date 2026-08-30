@@ -568,32 +568,24 @@ impl AssetService {
         gc::enumerate_deletion_failures(&mut self.store)
     }
 
-    /// Prepare one available asset for transport (WP-013B seam).
-    ///
-    /// Accepts only a canonical `AssetRef` whose durable lifecycle row is
-    /// live and present in this security domain at the current generation,
-    /// with a caller-held lease that is unexpired and bound to this
-    /// capability's instance, domain, asset, and generation. The caller's
-    /// media-kind and media-type claims are checks; the result carries only
-    /// the authoritative detected type used at import, and active document
-    /// content is refused. Bytes are read through the content-addressed
-    /// `ObjectReader`, verified against the recorded digest, and the full
-    /// authority is revalidated after the blocking read and immediately
-    /// before the typed result is released.
+    /// The caller supplies only the committed `AssetId`, kind/type claims,
+    /// and the exact lease it holds. The service resolves the durable,
+    /// authoritative row itself: only an asset whose lifecycle row is live
+    /// and present in this security domain at the current generation, whose
+    /// content identity re-derives the committed `AssetId`, and whose lease
+    /// is unexpired and bound to this capability's instance, domain, asset,
+    /// and generation is accepted. The canonical `AssetRef` is minted by the
+    /// service from the row (no caller metadata is echoed); bytes are read
+    /// through the content-addressed `ObjectReader`, verified against the
+    /// recorded digest, and the full authority is revalidated after the
+    /// blocking read and immediately before the typed result is released.
     pub fn prepare_media(
         &mut self,
         capability: &AssetCapability,
         request: &MediaPrepareRequest,
     ) -> Result<PreparedMedia, AssetError> {
         self.check_live(capability)?;
-        request.asset_ref.validate().map_err(|reason| {
-            AssetError::new(
-                AssetErrorCode::InvalidRequest,
-                ErrorPhase::Validate,
-                format!("non-canonical asset reference: {reason}"),
-            )
-        })?;
-        let asset_id = request.asset_ref.asset_id.as_str().to_string();
+        let asset_id = request.asset_id.as_str().to_string();
 
         // Phase 1: snapshot and validate the exact lease and durable
         // AVAILABLE authority in one transaction.
@@ -623,6 +615,9 @@ impl AssetService {
         }
 
         // Phase 2: bounded content-addressed read with digest verification.
+        // The read re-proves `AssetId = BLAKE3(content)` because phase 1
+        // bound the committed `AssetId` to the row's recorded digest and the
+        // returned bytes are verified against exactly that digest.
         let bytes = read_and_verify(
             &self.config.local_root,
             &asset_id,
@@ -661,17 +656,15 @@ impl AssetService {
         };
 
         Ok(PreparedMedia {
-            asset_ref: request.asset_ref.clone(),
+            asset_ref: revalidated.canonical_ref,
             media_kind: media_kind_of_type(Some(&revalidated.detected_type)),
-            media_type: revalidated.detected_type,
-            byte_length: revalidated.asset.byte_length,
             generation: revalidated.asset.generation,
             digest: revalidated.asset.content_hash,
             lease_id: revalidated.lease.lease_id,
+            lease_expires_at_ms: revalidated.lease.expires_at_ms,
             bytes,
         })
     }
-
     /// Reconciliation hook: a rejected/cancelled terminal import must keep
     /// its staging bytes deleted and must never expose partial authority.
     fn reconcile_rejected_canceled(
