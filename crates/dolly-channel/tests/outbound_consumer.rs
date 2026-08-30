@@ -19,11 +19,13 @@
 mod common;
 
 use common::g4::*;
+use dolly_channel::asset::{
+    AssetPayload, AssetPremise, AssetPreparation, AssetRef, ContentHash, MediaKind,
+};
 use dolly_channel::error::codes;
 use dolly_channel::transport::{
     ChannelTransport, TransportPieceOutcome, TransportSendRequest, TransportSendResult,
 };
-use dolly_channel::asset::{AssetLeaseProof, AssetPremise, AssetPreparation};
 use dolly_channel::{
     ChannelOutcome, ChannelPrincipal, InboundReceiver, IngressOutcome, OutboundConsumer,
     OutboundQueueGate, OutboundState, SqliteChannelStore, create_channel_store_schema,
@@ -759,12 +761,8 @@ fn committed_send_consumes_durably_with_exact_result_and_echo() {
 #[test]
 fn unchanged_extension_grant_authorizes_distinct_activation_manifest_and_config_revision() {
     let action_id = "0198ab31-6c44-7e8a-b2bb-000000000828";
-    let mut fixture = setup_file_send_with_revisions(
-        "separate-extension-activation-authority",
-        action_id,
-        2,
-        7,
-    );
+    let mut fixture =
+        setup_file_send_with_revisions("separate-extension-activation-authority", action_id, 2, 7);
     assert_eq!(fixture.grant.manifest_revision(), 7);
     assert_eq!(fixture.config.revision, 2);
     let transport = SharedTransport::new(true);
@@ -795,8 +793,7 @@ fn unchanged_extension_grant_authorizes_distinct_activation_manifest_and_config_
         dolly_channel::ConsumerOutcome::Terminal { .. }
     ));
     drop(consumer);
-    let mut store =
-        SqliteChannelStore::new(&mut module_connection, &fixture.principal, 2).unwrap();
+    let mut store = SqliteChannelStore::new(&mut module_connection, &fixture.principal, 2).unwrap();
     let record = store.find_outbound(action_id).unwrap().unwrap();
     assert_eq!(record.config_revision, 2);
     assert_ne!(record.config_revision, fixture.grant.manifest_revision());
@@ -910,8 +907,16 @@ fn stale_active_activation_is_rejected_with_unchanged_extension_grant() {
     )
     .unwrap();
     consumer.set_effect_barrier(barrier);
-    let error = consumer.consume(&far_deadline()).unwrap_err();
-    assert_eq!(error.code, codes::AUTHENTICATION_FAILED);
+    let outcomes = consumer
+        .consume(&far_deadline())
+        .expect("durable authority refusal");
+    assert!(matches!(
+        outcomes.as_slice(),
+        [dolly_channel::ConsumerOutcome::Terminal {
+            state: OutboundState::Failed,
+            ..
+        }]
+    ));
     assert!(transport.calls().is_empty());
     drop(consumer);
     mutator.join().unwrap();
@@ -1048,9 +1053,7 @@ fn wrong_target_foreign_owner_and_unowned_session_are_rejected_with_zero_effect(
         "the hostile targeted send is refused with one Rejected outcome, never a silent drop"
     );
     match outcomes.into_iter().next().unwrap() {
-        dolly_channel::ConsumerOutcome::Rejected {
-            action_id, error,
-        } => {
+        dolly_channel::ConsumerOutcome::Rejected { action_id, error } => {
             assert_eq!(action_id, "0198ab31-6c44-7e8a-b2bb-000000000805");
             assert_eq!(error.code, codes::SESSION_MISSING);
             assert!(!error.retryable);
@@ -1458,10 +1461,9 @@ fn revoked_grant_or_changed_lifecycle_fence_refuses_consume_before_any_effect() 
     assert!(reopened.list_pending_outbound().unwrap().is_empty());
 }
 
-/// Items 2/5/6: status-first recovery settles every validated transport
-/// status through the exact frozen result envelope. A Rejected status settles
-/// a terminal Failed row WITH its frozen result_jcs; Unknown keeps the row
-/// Dispatched (never age-guessed, never false success).
+/// Status-first recovery settles every validated transport status through the
+/// exact frozen envelope. `Unknown` remains Dispatched before the durable
+/// deadline and freezes terminal Unknown after that deadline.
 #[test]
 fn status_first_settles_rejected_and_unknown_exactly() {
     let mut fixture = setup("consumer-status-envelope");
@@ -1559,9 +1561,11 @@ fn status_first_settles_rejected_and_unknown_exactly() {
             dolly_channel::ConsumerOutcome::Pending { action_id, .. } if action_id == a2
         )));
     }
+    let mut late_clock = channel_clock();
+    late_clock.advance_seconds(channel_config().outbound_limits.unknown_after_seconds as i64 + 1);
     let mut consumer = open_consumer(
         channel_config(),
-        Box::new(channel_clock()),
+        Box::new(late_clock),
         &mut module_conn,
         &mut fixture.harness.connection,
         Box::new(transport.clone()),
@@ -1569,15 +1573,14 @@ fn status_first_settles_rejected_and_unknown_exactly() {
         &fixture.harness.grant,
     )
     .expect("consumer");
-    assert_eq!(consumer.reconcile().unwrap(), 1);
+    assert_eq!(consumer.reconcile().unwrap(), 0);
     let ledger = consumer.ledger().unwrap();
     let e2 = ledger.outbound_entry(a2).expect("durable a2");
-    assert_eq!(
-        e2.state,
-        OutboundState::Dispatched,
-        "unknown is never age-guessed"
-    );
-    assert!(e2.result_jcs.is_none(), "no fabricated terminal result");
+    assert_eq!(e2.state, OutboundState::Unknown);
+    let envelope: Value =
+        serde_json::from_str(e2.result_jcs.as_deref().expect("frozen unknown")).unwrap();
+    assert_eq!(envelope["status"], "unknown");
+    assert_eq!(envelope["error"]["outcome"], "unknown");
 }
 
 /// A: exact transition binding. A committed Block carrying a channel send
@@ -1697,8 +1700,19 @@ fn assert_send_revocation_fence(label: &'static str, action_id: &'static str) {
     )
     .unwrap();
     consumer.set_effect_barrier(barrier);
-    let error = consumer.consume(&far_deadline()).unwrap_err();
-    assert_eq!(error.code, codes::AUTHENTICATION_FAILED);
+    let outcome = consumer.consume(&far_deadline());
+    if label == "after_dispatch_cas" {
+        assert!(matches!(
+            outcome.as_deref(),
+            Ok([dolly_channel::ConsumerOutcome::Terminal {
+                state: OutboundState::Failed,
+                ..
+            }])
+        ));
+    } else {
+        let error = outcome.expect_err("authority fence");
+        assert_eq!(error.code, codes::AUTHENTICATION_FAILED);
+    }
     let expected_sends = usize::from(label == "before_terminal_commit");
     assert_eq!(
         transport.calls().len(),
@@ -1798,8 +1812,16 @@ fn extension_grant_switch_after_dispatch_cas_refuses_transport() {
     )
     .unwrap();
     consumer.set_effect_barrier(barrier);
-    let error = consumer.consume(&far_deadline()).unwrap_err();
-    assert_eq!(error.code, codes::AUTHENTICATION_FAILED);
+    let outcomes = consumer
+        .consume(&far_deadline())
+        .expect("durable authority refusal");
+    assert!(matches!(
+        outcomes.as_slice(),
+        [dolly_channel::ConsumerOutcome::Terminal {
+            state: OutboundState::Failed,
+            ..
+        }]
+    ));
     assert!(transport.calls().is_empty());
     drop(consumer);
     switcher.join().unwrap();
@@ -2447,24 +2469,29 @@ fn generic_ingress_without_manifest_cannot_mint_send_authority() {
     );
 }
 
-/// Injected AssetPreparation seam test double for the production consumer.
-/// Shares its recorded premises, revalidation calls, and refusal via an Arc
-/// so the test can observe exactly what the sealed consumer requested
-/// (premise direction) and race lease invalidation at each fence.
-#[derive(Clone, Default)]
+/// Injected Asset preparation seam test double for the production consumer.
+/// It records the exact committed premises and returns field-for-field
+/// PreparedMedia mirrors with bounded bytes.
+#[derive(Clone)]
 struct RefusingAssetPreparation {
     refuse_code: Option<String>,
-    /// Fail lease revalidation (deterministically): after the given call
-    /// number when non-zero, or on every call when zero.
-    fail_revalidate_at_call: usize,
+    lease_expiry_unix_ms: u64,
     inner: std::sync::Arc<std::sync::Mutex<RefusingInner>>,
 }
 
 #[derive(Default)]
 struct RefusingInner {
     prepared: Vec<AssetPremise>,
-    revalidated: Vec<AssetLeaseProof>,
-    revalidate_calls: usize,
+}
+
+impl Default for RefusingAssetPreparation {
+    fn default() -> Self {
+        Self {
+            refuse_code: None,
+            lease_expiry_unix_ms: 2_000_000_000_000,
+            inner: Default::default(),
+        }
+    }
 }
 
 impl RefusingAssetPreparation {
@@ -2474,12 +2501,14 @@ impl RefusingAssetPreparation {
             ..Self::default()
         }
     }
-    fn failing_revalidation(at_call: usize) -> Self {
+
+    fn expired_lease() -> Self {
         Self {
-            fail_revalidate_at_call: at_call,
+            lease_expiry_unix_ms: 1,
             ..Self::default()
         }
     }
+
     fn prepared(&self) -> Vec<AssetPremise> {
         self.inner
             .lock()
@@ -2493,68 +2522,53 @@ impl AssetPreparation for RefusingAssetPreparation {
     fn prepare_assets(
         &mut self,
         premises: &[AssetPremise],
-    ) -> Result<Vec<AssetLeaseProof>, dolly_channel::ChannelError> {
+    ) -> Result<Vec<AssetPayload>, dolly_channel::ChannelError> {
         self.inner
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .prepared
             .extend_from_slice(premises);
-        match &self.refuse_code {
-            Some(code) => Err(dolly_channel::ChannelError::new(
+        if let Some(code) = &self.refuse_code {
+            return Err(dolly_channel::ChannelError::new(
                 code.clone(),
                 false,
                 ChannelOutcome::NotApplied,
-                "asset not prepared under the Channel authority",
-            )),
-            None => Ok(premises
-                .iter()
-                .map(|premise| AssetLeaseProof {
-                    lease_id: format!("lease-{}", premise.ordinal),
-                    lease_expires_at: "2026-08-29T00:00:00.000000Z".to_string(),
-                    lease_generation: 1,
-                    media_type: premise.media_type.clone(),
-                    byte_length: 1000,
-                    encoded_width: 1000,
-                    encoded_height: 500,
-                    orientation: 1,
-                    content_digest: format!("sha256:{:064}", premise.ordinal),
-                })
-                .collect()),
-        }
-    }
-
-    fn asset_payload(
-        &mut self,
-        proof: &AssetLeaseProof,
-    ) -> Result<dolly_channel::asset::AssetPayload, dolly_channel::ChannelError> {
-        Ok(dolly_channel::asset::AssetPayload {
-            bytes: vec![0x55; proof.byte_length as usize],
-        })
-    }
-
-    fn revalidate_leases(
-        &mut self,
-        proofs: &[AssetLeaseProof],
-    ) -> Result<(), dolly_channel::ChannelError> {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        inner.revalidated.extend_from_slice(proofs);
-        inner.revalidate_calls += 1;
-        // 0 = never fail (default accepting seam); a positive value fails
-        // from that call onward, deterministically.
-        if self.fail_revalidate_at_call > 0
-            && inner.revalidate_calls >= self.fail_revalidate_at_call
-        {
-            return Err(dolly_channel::ChannelError::new(
-                codes::AUTHORIZATION_FAILED,
-                false,
-                ChannelOutcome::NotApplied,
-                "asset lease invalidated after blocking work",
+                "Asset payload preparation failed under Channel authority",
             ));
         }
-        Ok(())
+        Ok(premises
+            .iter()
+            .map(|premise| {
+                let digest: [u8; 32] = (&premise.asset_id).into();
+                let media_kind = if premise.media_type.as_str().starts_with("image/") {
+                    MediaKind::Image
+                } else if premise.media_type.as_str().starts_with("audio/") {
+                    MediaKind::Audio
+                } else if premise.media_type.as_str().starts_with("video/") {
+                    MediaKind::Video
+                } else {
+                    MediaKind::File
+                };
+                AssetPayload {
+                    asset_ref: AssetRef {
+                        asset_id: premise.asset_id.clone(),
+                        media_type: premise.media_type.clone(),
+                        byte_length: 1000,
+                        orientation: Some(1),
+                        encoded_width: Some(1000),
+                        encoded_height: Some(500),
+                        display_width: Some(1000),
+                        display_height: Some(500),
+                    },
+                    media_kind,
+                    generation: 1,
+                    digest: ContentHash::from_digest(digest),
+                    lease_id: format!("lease-{}", premise.ordinal),
+                    lease_expiry_unix_ms: self.lease_expiry_unix_ms,
+                    bytes: vec![0x55; 1000],
+                }
+            })
+            .collect())
     }
 }
 
@@ -2628,29 +2642,31 @@ fn targeted_asset_send_refused_by_injected_seam_yields_frozen_rejected_with_zero
     assert_eq!(
         outcomes.len(),
         1,
-        "one frozen Rejected outcome, never a silent drop"
+        "one durable zero-effect terminal, never a silent drop"
     );
     match outcomes.into_iter().next().unwrap() {
-        dolly_channel::ConsumerOutcome::Rejected {
+        dolly_channel::ConsumerOutcome::Terminal {
             action_id: rejected_id,
-            error,
+            state,
+            result_jcs,
         } => {
             assert_eq!(rejected_id, action_id);
-            assert_eq!(error.code, codes::ASSET_IMPORT_FAILED);
-            assert!(!error.retryable);
-            assert_eq!(error.outcome, ChannelOutcome::NotApplied);
+            assert_eq!(state, OutboundState::Failed);
+            assert!(result_jcs.contains(codes::ASSET_IMPORT_FAILED));
         }
-        other => panic!("expected Rejected, got {other:?}"),
+        other => panic!("expected durable terminal rejection, got {other:?}"),
     }
     assert_eq!(transport.calls().len(), 0, "zero transport calls");
     drop(consumer);
 
-    // No Prepared row, no queue occupancy, no echo marker.
+    // The zero-effect failure is durable and terminal; it occupies no queue.
     let mut reopened = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
-    assert!(
-        reopened.find_outbound(action_id).unwrap().is_none(),
-        "no durable Prepared row"
-    );
+    let rejected = reopened
+        .find_outbound(action_id)
+        .unwrap()
+        .expect("durable rejection");
+    assert_eq!(rejected.entry.state, OutboundState::Failed);
+    assert_eq!(rejected.entry.dispatched_at, None, "failure precedes claim");
     assert!(
         reopened.list_pending_outbound().unwrap().is_empty(),
         "no durable queue occupancy"
@@ -2663,8 +2679,8 @@ fn targeted_asset_send_refused_by_injected_seam_yields_frozen_rejected_with_zero
     let prepared = assets.prepared();
     assert_eq!(prepared.len(), 1);
     assert_eq!(prepared[0].ordinal, 1);
-    assert_eq!(prepared[0].asset_id, ASSET_ID);
-    assert_eq!(prepared[0].media_type, "image/png");
+    assert_eq!(prepared[0].asset_id.as_str(), ASSET_ID);
+    assert_eq!(prepared[0].media_type.as_str(), "image/png");
     assert_eq!(prepared[0].view, None);
 }
 
@@ -2761,7 +2777,10 @@ fn multimodal_send_block(
         }
     ]);
     let block = send_block_with_asset_parts(MODULE_ID, action_id, session_id, parts);
-    (block, "ast_b3_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    (
+        block,
+        "ast_b3_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )
 }
 
 #[test]
@@ -2813,16 +2832,32 @@ fn multimodal_dispatched_row_settles_status_first_with_durable_echo() {
     assert_eq!(transport.calls().len(), 1, "one send attempt");
     drop(consumer);
     let mut store = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
-    let record = store.find_outbound(action_id).unwrap().expect("durable row");
+    let record = store
+        .find_outbound(action_id)
+        .unwrap()
+        .expect("durable row");
     assert_eq!(record.entry.state, OutboundState::Dispatched);
     assert_eq!(record.entry.pieces.len(), 2);
     assert_eq!(
-        record.entry.pieces[1].asset.as_ref().unwrap().premise.asset_id,
+        record.entry.pieces[1]
+            .asset
+            .as_ref()
+            .unwrap()
+            .premise
+            .asset_id
+            .as_str(),
         asset_id,
         "ordered asset premise persisted"
     );
     assert_eq!(
-        record.entry.pieces[1].asset.as_ref().unwrap().lease_proof.lease_id,
+        record.entry.pieces[1]
+            .asset
+            .as_ref()
+            .unwrap()
+            .lease_proof
+            .as_ref()
+            .unwrap()
+            .lease_id,
         "lease-1"
     );
     drop(store);
@@ -2855,7 +2890,10 @@ fn multimodal_dispatched_row_settles_status_first_with_durable_echo() {
     assert_eq!(transport.status_calls()[0].action_id, action_id);
     assert_eq!(transport.calls().len(), 1, "never a blind resend");
     let mut settled = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
-    let terminal = settled.find_outbound(action_id).unwrap().expect("settled row");
+    let terminal = settled
+        .find_outbound(action_id)
+        .unwrap()
+        .expect("settled row");
     assert_eq!(terminal.entry.state, OutboundState::Confirmed);
     assert!(terminal.entry.result_jcs.is_some());
     assert!(
@@ -2867,7 +2905,7 @@ fn multimodal_dispatched_row_settles_status_first_with_durable_echo() {
 }
 
 #[test]
-fn multimodal_lease_invalidation_after_queue_wait_fails_closed() {
+fn multimodal_expired_lease_is_durable_zero_effect_terminal() {
     let mut fixture = setup("multimodal-lease-queue");
     let action_id = "0198ab31-6c44-7e8a-b2bb-000000000843";
     let config = multimodal_channel_config();
@@ -2893,8 +2931,8 @@ fn multimodal_lease_invalidation_after_queue_wait_fails_closed() {
         &fixture.harness.grant,
     )
     .unwrap();
-    // Lease revalidation fails at the first fence: immediately after the
-    // queue wait, before any send.
+    // The exact prepared payload carries an expired numeric lease. Channel
+    // claims, detects expiry locally, and durably settles zero effect.
     let mut consumer = OutboundConsumer::with_asset_preparation(
         config.clone(),
         Box::new(channel_clock()),
@@ -2902,30 +2940,34 @@ fn multimodal_lease_invalidation_after_queue_wait_fails_closed() {
         &mut fixture.harness.connection,
         gate,
         Box::new(transport.clone()),
-        Box::new(RefusingAssetPreparation::failing_revalidation(1)),
+        Box::new(RefusingAssetPreparation::expired_lease()),
         &fixture.harness.authority,
         &fixture.harness.grant,
     )
     .expect("consumer");
-    let error = consumer.consume(&far_deadline()).expect_err("lease fence");
-    assert_eq!(error.code, codes::AUTHORIZATION_FAILED);
+    let outcomes = consumer
+        .consume(&far_deadline())
+        .expect("durable lease refusal");
+    assert!(matches!(
+        outcomes.as_slice(),
+        [dolly_channel::ConsumerOutcome::Terminal {
+            state: OutboundState::Failed,
+            ..
+        }]
+    ));
     assert_eq!(transport.calls().len(), 0, "zero transport effect");
     drop(consumer);
     let mut store = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
-    let record = store.find_outbound(action_id).unwrap().expect("durable row");
-    assert_eq!(
-        record.entry.state,
-        OutboundState::Queued,
-        "admitted but never dispatched"
-    );
-    assert!(
-        store.list_pending_outbound().unwrap().len() == 1,
-        "the row stays pending for a later pass with refreshed leases"
-    );
+    let record = store
+        .find_outbound(action_id)
+        .unwrap()
+        .expect("durable row");
+    assert_eq!(record.entry.state, OutboundState::Failed);
+    assert!(store.list_pending_outbound().unwrap().is_empty());
 }
 
 #[test]
-fn multimodal_lease_invalidation_after_dispatch_cas_fails_closed() {
+fn multimodal_expiry_after_dispatch_claim_never_strands_dispatched() {
     let mut fixture = setup("multimodal-lease-cas");
     let action_id = "0198ab31-6c44-7e8a-b2bb-000000000844";
     let config = multimodal_channel_config();
@@ -2951,8 +2993,8 @@ fn multimodal_lease_invalidation_after_dispatch_cas_fails_closed() {
         &fixture.harness.grant,
     )
     .unwrap();
-    // The queue-wait fence passes (call 1); the dispatch-CAS fence (call 2)
-    // fails immediately before the transport send.
+    // Expiry is checked locally after the dispatch compare-and-swap and is
+    // frozen as a terminal zero-effect failure rather than stranded.
     let mut consumer = OutboundConsumer::with_asset_preparation(
         config.clone(),
         Box::new(channel_clock()),
@@ -2960,24 +3002,30 @@ fn multimodal_lease_invalidation_after_dispatch_cas_fails_closed() {
         &mut fixture.harness.connection,
         gate,
         Box::new(transport.clone()),
-        Box::new(RefusingAssetPreparation::failing_revalidation(2)),
+        Box::new(RefusingAssetPreparation::expired_lease()),
         &fixture.harness.authority,
         &fixture.harness.grant,
     )
     .expect("consumer");
-    let error = consumer.consume(&far_deadline()).expect_err("lease fence");
-    assert_eq!(error.code, codes::AUTHORIZATION_FAILED);
+    let outcomes = consumer
+        .consume(&far_deadline())
+        .expect("durable lease refusal");
+    assert!(matches!(
+        outcomes.as_slice(),
+        [dolly_channel::ConsumerOutcome::Terminal {
+            state: OutboundState::Failed,
+            ..
+        }]
+    ));
     assert_eq!(transport.calls().len(), 0, "zero transport effect");
     drop(consumer);
     let mut store = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
-    let record = store.find_outbound(action_id).unwrap().expect("durable row");
-    assert_eq!(
-        record.entry.state,
-        OutboundState::Dispatched,
-        "the dispatch CAS marked the row Dispatched; status-first recovery owns it"
-    );
+    let record = store
+        .find_outbound(action_id)
+        .unwrap()
+        .expect("durable row");
+    assert_eq!(record.entry.state, OutboundState::Failed);
 }
-
 
 #[test]
 fn multimodal_status_recovery_settles_despite_stale_lease() {
@@ -3042,7 +3090,7 @@ fn multimodal_status_recovery_settles_despite_stale_lease() {
         &mut fixture.harness.connection,
         gate,
         Box::new(transport.clone()),
-        Box::new(RefusingAssetPreparation::failing_revalidation(1)),
+        Box::new(RefusingAssetPreparation::expired_lease()),
         &fixture.harness.authority,
         &fixture.harness.grant,
     )
@@ -3050,100 +3098,22 @@ fn multimodal_status_recovery_settles_despite_stale_lease() {
     let remaining = recover.reconcile().expect("reconcile");
     assert_eq!(remaining, 0, "no indefinite Dispatched row");
     drop(recover);
-    assert_eq!(transport.status_calls().len(), 1, "status is always queried");
+    assert_eq!(
+        transport.status_calls().len(),
+        1,
+        "status is always queried"
+    );
     assert_eq!(transport.calls().len(), 1, "no reread and no resend");
     let mut store = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
-    let terminal = store.find_outbound(action_id).unwrap().expect("settled row");
+    let terminal = store
+        .find_outbound(action_id)
+        .unwrap()
+        .expect("settled row");
     assert_eq!(terminal.entry.state, OutboundState::Confirmed);
     assert!(
         store
             .is_echo(&fixture.account, "stale-1")
             .expect("echo check"),
         "terminal+echo resolve regardless of lease validity"
-    );
-}
-
-#[test]
-fn multimodal_confirmed_send_commits_terminal_after_lease_change() {
-    // A confirmed send already had its transport effect; the terminal result
-    // and echo MUST commit from the observed outcome even though the lease
-    // would fail on any later revalidation (no fabricated terminal, no second
-    // dispatcher, no indefinite Dispatched row).
-    let mut fixture = setup("multimodal-terminal-lease");
-    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000848";
-    let config = multimodal_channel_config();
-    let (block, _) = multimodal_send_block(action_id, &fixture.session, &["Look."]);
-    commit_block_with_config(
-        &mut fixture.harness,
-        "multimodal-terminal-lease",
-        "ing-1",
-        &format!("{action_id}-block"),
-        block,
-        vec!["page-c".to_string()],
-        config.clone(),
-    );
-    let transport = SharedTransport::new(true);
-    transport.push(TransportSendResult::AllConfirmed {
-        message_ids: vec!["tl-0".to_string(), "tl-1".to_string()],
-    });
-    let mut module_conn = reopen_module_store(&fixture);
-    let gate = OutboundQueueGate::register(
-        &config,
-        &mut module_conn,
-        &fixture.harness.authority,
-        &fixture.harness.grant,
-    )
-    .unwrap();
-    // The seam fails ALL lease revalidation from its first call: the
-    // queue-wait fence refuses the pass with zero effect, proving the pre-
-    // send gate holds even when the terminal path would no longer consult it.
-    let mut consumer = OutboundConsumer::with_asset_preparation(
-        config.clone(),
-        Box::new(channel_clock()),
-        &mut module_conn,
-        &mut fixture.harness.connection,
-        gate.clone(),
-        Box::new(transport.clone()),
-        Box::new(RefusingAssetPreparation::failing_revalidation(1)),
-        &fixture.harness.authority,
-        &fixture.harness.grant,
-    )
-    .expect("consumer");
-    let error = consumer.consume(&far_deadline()).expect_err("pre-send lease fence");
-    assert_eq!(error.code, codes::AUTHORIZATION_FAILED);
-    assert_eq!(transport.calls().len(), 0, "zero transport effect");
-    drop(consumer);
-
-    // With a healthy lease the send confirms and its terminal+echo commit
-    // atomically; a later pass never leaves the row Dispatched.
-    let mut healthy = OutboundConsumer::with_asset_preparation(
-        config.clone(),
-        Box::new(channel_clock()),
-        &mut module_conn,
-        &mut fixture.harness.connection,
-        gate.clone(),
-        Box::new(transport.clone()),
-        Box::new(RefusingAssetPreparation::default()),
-        &fixture.harness.authority,
-        &fixture.harness.grant,
-    )
-    .expect("healthy consumer");
-    let outcomes = healthy.consume(&far_deadline()).expect("consume");
-    assert!(matches!(
-        outcomes[0],
-        dolly_channel::ConsumerOutcome::Terminal { state: OutboundState::Confirmed, .. }
-    ));
-    assert_eq!(transport.calls().len(), 1, "one send");
-    let remaining = healthy.reconcile().expect("reconcile");
-    assert_eq!(remaining, 0, "no Indefinite Dispatched row");
-    drop(healthy);
-    let mut store = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
-    let terminal = store.find_outbound(action_id).unwrap().expect("settled row");
-    assert_eq!(terminal.entry.state, OutboundState::Confirmed);
-    assert!(
-        store
-            .is_echo(&fixture.account, "tl-1")
-            .expect("echo check"),
-        "terminal+echo atomic from the observed outcome"
     );
 }

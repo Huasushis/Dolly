@@ -12,13 +12,14 @@ mod common;
 use common::*;
 use dolly_channel::ChannelConfigBuilder;
 use dolly_channel::asset::{
-    AssetLeaseProof, AssetPayload, AssetPremise, AssetPreparation, DenyAssetParts, PreparedAsset,
+    AssetId, AssetPayload, AssetPremise, AssetPreparation, AssetRef, ContentHash, DenyAssetParts,
+    MediaKind, MediaType, OutboundAsset,
 };
-use dolly_schema::CropRect;
 use dolly_channel::{
     ChannelConfig, ChannelLedger, OutboundAdmission, OutboundState, ScriptedTransport,
     SendDispatchResult, TransportSendResult, dispatch_send, parse_send_action,
 };
+use dolly_schema::CropRect;
 use serde_json::json;
 
 /// The WP-013B multimodal profile: text + asset accepted (with the default
@@ -45,26 +46,21 @@ fn asset_premise_of(
 ) -> AssetPremise {
     AssetPremise {
         ordinal,
-        asset_id: asset_id.to_string(),
-        media_type: media_type.to_string(),
+        asset_id: AssetId::parse(asset_id).unwrap(),
+        media_type: MediaType::parse(media_type).unwrap(),
         view,
     }
 }
 
-/// Deterministic injected-seam test double: accepts every premise in order
-/// and mints one typed proof per premise (or refuses per the configured
-/// code / forged media type / oversized metadata); controls the ephemeral
-/// payload length; optionally fails post-blocking lease revalidation.
+/// Deterministic injected Asset preparation seam.
 #[derive(Debug, Clone, Default)]
 struct TestAssetPreparation {
     refuse_code: Option<String>,
-    revalidate_fails: bool,
     forge_media_type: Option<String>,
     proof_byte_length: u64,
     proof_orientation: u8,
     payload_byte_length: Option<usize>,
     prepared: Vec<AssetPremise>,
-    revalidated: Vec<AssetLeaseProof>,
 }
 
 impl TestAssetPreparation {
@@ -75,34 +71,50 @@ impl TestAssetPreparation {
             ..Self::default()
         }
     }
+
     fn refusing(code: &str) -> Self {
         Self {
-            proof_byte_length: 1000,
-            proof_orientation: 1,
             refuse_code: Some(code.to_string()),
-            ..Self::default()
+            ..Self::accepting()
         }
     }
-    fn proof(&self, premise: &AssetPremise) -> AssetLeaseProof {
-        AssetLeaseProof {
-            lease_id: format!("lease-{}", premise.ordinal),
-            lease_expires_at: "2026-08-29T00:00:00.000000Z".to_string(),
-            lease_generation: 1,
-            media_type: self
-                .forge_media_type
-                .clone()
-                .unwrap_or_else(|| premise.media_type.clone()),
-            byte_length: self.proof_byte_length,
-            encoded_width: 1000,
-            encoded_height: 500,
-            orientation: self.proof_orientation,
-            content_digest: format!("sha256:{:064}", premise.ordinal),
-        }
-    }
-    fn payload(&self, proof: &AssetLeaseProof) -> AssetPayload {
-        let len = self.payload_byte_length.unwrap_or(proof.byte_length as usize);
+
+    fn payload(&self, premise: &AssetPremise) -> AssetPayload {
+        let media_type = self
+            .forge_media_type
+            .as_deref()
+            .map(MediaType::parse)
+            .transpose()
+            .unwrap()
+            .unwrap_or_else(|| premise.media_type.clone());
+        let media_kind = if media_type.as_str().starts_with("image/") {
+            MediaKind::Image
+        } else if media_type.as_str().starts_with("audio/") {
+            MediaKind::Audio
+        } else if media_type.as_str().starts_with("video/") {
+            MediaKind::Video
+        } else {
+            MediaKind::File
+        };
+        let digest: [u8; 32] = (&premise.asset_id).into();
+        let byte_length = self.proof_byte_length;
         AssetPayload {
-            bytes: vec![0x55; len],
+            asset_ref: AssetRef {
+                asset_id: premise.asset_id.clone(),
+                media_type,
+                byte_length,
+                orientation: Some(self.proof_orientation),
+                encoded_width: Some(1000),
+                encoded_height: Some(500),
+                display_width: Some(1000),
+                display_height: Some(500),
+            },
+            media_kind,
+            generation: 1,
+            digest: ContentHash::from_digest(digest),
+            lease_id: format!("lease-{}", premise.ordinal),
+            lease_expiry_unix_ms: 2_000_000_000_000,
+            bytes: vec![0x55; self.payload_byte_length.unwrap_or(byte_length as usize)],
         }
     }
 }
@@ -111,40 +123,20 @@ impl AssetPreparation for TestAssetPreparation {
     fn prepare_assets(
         &mut self,
         premises: &[AssetPremise],
-    ) -> Result<Vec<AssetLeaseProof>, dolly_channel::ChannelError> {
+    ) -> Result<Vec<AssetPayload>, dolly_channel::ChannelError> {
         self.prepared.extend_from_slice(premises);
         if let Some(code) = &self.refuse_code {
             return Err(dolly_channel::ChannelError::new(
                 code.clone(),
                 false,
                 dolly_channel::ChannelOutcome::NotApplied,
-                "asset not prepared under the Channel authority",
+                "Asset payload preparation failed under Channel authority",
             ));
         }
-        Ok(premises.iter().map(|premise| self.proof(premise)).collect())
-    }
-
-    fn asset_payload(
-        &mut self,
-        proof: &AssetLeaseProof,
-    ) -> Result<AssetPayload, dolly_channel::ChannelError> {
-        Ok(self.payload(proof))
-    }
-
-    fn revalidate_leases(
-        &mut self,
-        proofs: &[AssetLeaseProof],
-    ) -> Result<(), dolly_channel::ChannelError> {
-        self.revalidated.extend_from_slice(proofs);
-        if self.revalidate_fails {
-            return Err(dolly_channel::ChannelError::new(
-                dolly_channel::error::codes::AUTHORIZATION_FAILED,
-                false,
-                dolly_channel::ChannelOutcome::NotApplied,
-                "asset lease invalidated after blocking work",
-            ));
-        }
-        Ok(())
+        Ok(premises
+            .iter()
+            .map(|premise| self.payload(premise))
+            .collect())
     }
 }
 
@@ -159,10 +151,38 @@ fn dispatch(
     let action = parse_send_action(block).expect("block carries a channel send");
     let mut admission = OutboundAdmission::new();
     dispatch_send(
-        config, &clock, ledger, transport, &mut admission, assets, &action,
+        config,
+        &clock,
+        ledger,
+        transport,
+        &mut admission,
+        assets,
+        &action,
     )
 }
 
+fn assert_zero_effect_terminal(
+    outcome: SendDispatchResult,
+    ledger: &ChannelLedger,
+    action_id: &str,
+    code: &str,
+) {
+    match outcome {
+        SendDispatchResult::Terminal { state, .. } => {
+            assert_eq!(state, OutboundState::Failed);
+        }
+        other => panic!("expected durable terminal rejection, got {other:?}"),
+    }
+    let entry = ledger.outbound_entry(action_id).expect("durable rejection");
+    assert_eq!(entry.state, OutboundState::Failed);
+    assert!(entry.pieces.iter().all(|piece| {
+        matches!(
+            piece.outcome.as_ref(),
+            Some(dolly_channel::ledger::PieceOutcome::Rejected { code: actual })
+                if actual == code
+        )
+    }));
+}
 /// A committed send Block whose parts array is exactly the given part list.
 fn send_block_with_parts(
     action_id: &str,
@@ -236,50 +256,72 @@ fn ordered_mixed_text_and_asset_premises_prepare_in_action_order() {
         ]
     );
 
-    // The transport received all four pieces in order; text pieces keep their
-    // text, asset pieces carry premise + typed proof + EPHEMERAL payload and
-    // no fabricated text.
+    // Channel delivers one closed ordered composition. The adapter receives
+    // exact PreparedMedia payloads and exact materialized views, with no
+    // independently optional modality fields.
     let request = &transport.calls()[0];
     assert_eq!(request.pieces.len(), 4);
-    assert_eq!(request.pieces[0].text, "First.");
-    assert_eq!(request.pieces[0].asset, None);
-    assert_eq!(request.pieces[0].asset_payload, None);
-    let prepared_a = request.pieces[1].asset.as_ref().expect("asset piece A");
-    assert_eq!(prepared_a.premise.ordinal, 1);
-    assert_eq!(prepared_a.premise.asset_id, ASSET_ID_A);
-    assert_eq!(prepared_a.premise.media_type, "image/png");
-    assert_eq!(prepared_a.lease_proof.lease_id, "lease-1");
-    assert_eq!(prepared_a.lease_proof.media_type, "image/png");
-    assert_eq!(prepared_a.lease_proof.byte_length, 1000);
-    let payload_a = request.pieces[1].asset_payload.as_ref().expect("payload A");
-    assert_eq!(payload_a.bytes.len(), 1000);
-    assert_eq!(request.pieces[1].text, "", "asset pieces carry no text");
-    assert_eq!(request.pieces[2].text, "Second.");
-    let prepared_b = request.pieces[3].asset.as_ref().expect("asset piece B");
-    assert_eq!(prepared_b.premise.ordinal, 3);
-    assert_eq!(prepared_b.premise.asset_id, asset_b);
-    assert_eq!(request.pieces[3].asset_payload.as_ref().unwrap().bytes.len(), 1000);
+    match &request.pieces[0] {
+        dolly_channel::TransportPiece::Text { ordinal, text } => {
+            assert_eq!((*ordinal, text.as_str()), (0, "First."));
+        }
+        other => panic!("expected closed text variant, got {other:?}"),
+    }
+    match &request.pieces[1] {
+        dolly_channel::TransportPiece::Asset {
+            ordinal,
+            payload,
+            view,
+        } => {
+            assert_eq!(*ordinal, 1);
+            assert_eq!(payload.asset_ref.asset_id.as_str(), ASSET_ID_A);
+            assert_eq!(payload.asset_ref.media_type.as_str(), "image/png");
+            assert_eq!(payload.lease_id, "lease-1");
+            assert_eq!(payload.bytes.len(), 1000);
+            let view = view.as_ref().expect("crop materialized by Channel");
+            assert_eq!(
+                (view.left(), view.top(), view.right(), view.bottom()),
+                (100, 100, 600, 300)
+            );
+        }
+        other => panic!("expected closed asset variant, got {other:?}"),
+    }
+    match &request.pieces[2] {
+        dolly_channel::TransportPiece::Text { ordinal, text } => {
+            assert_eq!((*ordinal, text.as_str()), (2, "Second."));
+        }
+        other => panic!("expected closed text variant, got {other:?}"),
+    }
+    match &request.pieces[3] {
+        dolly_channel::TransportPiece::Asset {
+            ordinal,
+            payload,
+            view,
+        } => {
+            assert_eq!(*ordinal, 3);
+            assert_eq!(payload.asset_ref.asset_id.as_str(), asset_b);
+            assert_eq!(payload.bytes.len(), 1000);
+            assert_eq!(*view, None);
+        }
+        other => panic!("expected closed asset variant, got {other:?}"),
+    }
 
-    // The durable ledger row persists ONLY the canonical premise/proof
-    // metadata, never the ephemeral payload bytes.
+    // The durable ledger row persists only the premise and proof.
     let entry = ledger
         .outbound_entry("0198ab31-6c44-7e8a-b2bb-000000000201")
         .unwrap();
     assert_eq!(entry.pieces.len(), 4);
-    assert_eq!(entry.pieces[1].asset, Some(PreparedAsset {
-        premise: asset_premise_of(1, ASSET_ID_A, "image/png", Some(crop)),
-        lease_proof: AssetLeaseProof {
-            lease_id: "lease-1".to_string(),
-            lease_expires_at: "2026-08-29T00:00:00.000000Z".to_string(),
-            lease_generation: 1,
-            media_type: "image/png".to_string(),
-            byte_length: 1000,
-            encoded_width: 1000,
-            encoded_height: 500,
-            orientation: 1,
-            content_digest: format!("sha256:{:064}", 1),
-        },
-    }));
+    let expected_premise = asset_premise_of(1, ASSET_ID_A, "image/png", Some(crop));
+    let expected_proof = TestAssetPreparation::accepting()
+        .payload(&expected_premise)
+        .lease_proof();
+    assert_eq!(
+        entry.pieces[1].asset,
+        Some(OutboundAsset {
+            premise: expected_premise,
+            lease_proof: Some(expected_proof),
+        })
+    );
     let serialized = dolly_channel::ledger_to_json_string(&ledger).unwrap();
     assert!(
         !serialized.contains("\u{55}") && !serialized.contains("payload"),
@@ -301,16 +343,13 @@ fn default_deny_seam_refuses_asset_parts_with_zero_effect() {
     let mut assets = DenyAssetParts;
 
     let outcome = dispatch(&config, &mut ledger, &mut transport, &block, &mut assets);
-    match outcome {
-        SendDispatchResult::Rejected(error) => {
-            assert_eq!(error.code, "CHANNEL_UNSUPPORTED_MODALITY");
-            assert!(!error.retryable);
-            assert_eq!(error.outcome, dolly_channel::ChannelOutcome::NotApplied);
-        }
-        other => panic!("expected Rejected, got {other:?}"),
-    }
+    assert_zero_effect_terminal(
+        outcome,
+        &ledger,
+        "0198ab31-6c44-7e8a-b2bb-000000000202",
+        "CHANNEL_UNSUPPORTED_MODALITY",
+    );
     assert_eq!(transport.calls().len(), 0, "zero transport effect");
-    assert!(ledger.outbound.is_empty(), "zero durable outbound mutation");
 }
 
 #[test]
@@ -411,16 +450,13 @@ fn unprepared_premise_refused_by_injected_seam_is_a_frozen_rejection_with_zero_e
     let mut assets = TestAssetPreparation::refusing("CHANNEL_ASSET_IMPORT_FAILED");
 
     let outcome = dispatch(&config, &mut ledger, &mut transport, &block, &mut assets);
-    match outcome {
-        SendDispatchResult::Rejected(error) => {
-            assert_eq!(error.code, "CHANNEL_ASSET_IMPORT_FAILED");
-            assert!(!error.retryable);
-            assert_eq!(error.outcome, dolly_channel::ChannelOutcome::NotApplied);
-        }
-        other => panic!("expected Rejected, got {other:?}"),
-    }
+    assert_zero_effect_terminal(
+        outcome,
+        &ledger,
+        "0198ab31-6c44-7e8a-b2bb-000000000204",
+        "CHANNEL_ASSET_IMPORT_FAILED",
+    );
     assert_eq!(transport.calls().len(), 0, "zero transport effect");
-    assert!(ledger.outbound.is_empty(), "zero durable outbound mutation");
     assert_eq!(
         assets.prepared,
         vec![asset_premise_of(1, ASSET_ID_A, "image/png", None)]
@@ -444,16 +480,13 @@ fn prepared_asset_over_size_bound_is_refused_before_any_effect() {
     let mut assets = TestAssetPreparation::accepting();
 
     let outcome = dispatch(&config, &mut ledger, &mut transport, &block, &mut assets);
-    match outcome {
-        SendDispatchResult::Rejected(error) => {
-            assert_eq!(error.code, "CHANNEL_MALFORMED_EVENT");
-            assert!(error.message.contains("byte length"));
-            assert_eq!(error.outcome, dolly_channel::ChannelOutcome::NotApplied);
-        }
-        other => panic!("expected Rejected, got {other:?}"),
-    }
+    assert_zero_effect_terminal(
+        outcome,
+        &ledger,
+        "0198ab31-6c44-7e8a-b2bb-000000000207",
+        "CHANNEL_MALFORMED_EVENT",
+    );
     assert_eq!(transport.calls().len(), 0, "zero transport effect");
-    assert!(ledger.outbound.is_empty(), "zero durable outbound mutation");
 }
 
 #[test]
@@ -471,16 +504,13 @@ fn forged_authoritative_media_type_is_refused_before_any_effect() {
     assets.forge_media_type = Some("image/jpeg".to_string());
 
     let outcome = dispatch(&config, &mut ledger, &mut transport, &block, &mut assets);
-    match outcome {
-        SendDispatchResult::Rejected(error) => {
-            assert_eq!(error.code, "CHANNEL_MALFORMED_EVENT");
-            assert!(error.message.contains("media type"));
-            assert_eq!(error.outcome, dolly_channel::ChannelOutcome::NotApplied);
-        }
-        other => panic!("expected Rejected, got {other:?}"),
-    }
+    assert_zero_effect_terminal(
+        outcome,
+        &ledger,
+        "0198ab31-6c44-7e8a-b2bb-000000000208",
+        "CHANNEL_MALFORMED_EVENT",
+    );
     assert_eq!(transport.calls().len(), 0, "zero transport effect");
-    assert!(ledger.outbound.is_empty(), "zero durable outbound mutation");
 }
 
 #[test]
@@ -504,20 +534,14 @@ fn oversized_ephemeral_payload_is_refused_before_any_effect() {
     assets.payload_byte_length = Some(3000);
 
     let outcome = dispatch(&config, &mut ledger, &mut transport, &block, &mut assets);
-    match outcome {
-        SendDispatchResult::Rejected(error) => {
-            assert_eq!(error.code, "CHANNEL_MALFORMED_EVENT");
-            assert!(error.message.contains("payload"));
-            assert_eq!(error.outcome, dolly_channel::ChannelOutcome::NotApplied);
-        }
-        other => panic!("expected Rejected, got {other:?}"),
-    }
+    assert_zero_effect_terminal(
+        outcome,
+        &ledger,
+        "0198ab31-6c44-7e8a-b2bb-000000000209",
+        "CHANNEL_MALFORMED_EVENT",
+    );
     assert_eq!(transport.calls().len(), 0, "zero transport effect");
-    // The durable row stays Prepared (never dispatched, never terminal); the
-    // refusal occurred at the transport boundary AFTER the durable prepare.
-    let entry = ledger.outbound_entry("0198ab31-6c44-7e8a-b2bb-000000000209").unwrap();
-    assert_eq!(entry.state, OutboundState::Prepared);
-    assert!(entry.pieces.iter().all(|p| p.outcome.is_none()));
+    // The durable row is terminal before any transport effect.
 }
 
 #[test]
@@ -540,15 +564,13 @@ fn unsafe_authoritative_media_is_refused_before_any_effect() {
     assets.proof_orientation = 9;
 
     let outcome = dispatch(&config, &mut ledger, &mut transport, &block, &mut assets);
-    match outcome {
-        SendDispatchResult::Rejected(error) => {
-            assert_eq!(error.code, "CHANNEL_MALFORMED_EVENT");
-            assert_eq!(error.outcome, dolly_channel::ChannelOutcome::NotApplied);
-        }
-        other => panic!("expected Rejected malformed, got {other:?}"),
-    }
+    assert_zero_effect_terminal(
+        outcome,
+        &ledger,
+        "0198ab31-6c44-7e8a-b2bb-000000000210",
+        "CHANNEL_MALFORMED_EVENT",
+    );
     assert_eq!(transport.calls().len(), 0, "zero transport effect");
-    assert!(ledger.outbound.is_empty(), "zero durable outbound mutation");
 }
 
 #[test]
@@ -581,8 +603,13 @@ fn text_only_send_is_unchanged_under_the_injected_seam() {
     );
     let request = &transport.calls()[0];
     assert_eq!(request.pieces.len(), 1);
-    assert_eq!(request.pieces[0].text, "Hello.");
-    assert_eq!(request.pieces[0].asset, None);
+    assert_eq!(
+        request.pieces[0],
+        dolly_channel::TransportPiece::Text {
+            ordinal: 0,
+            text: "Hello.".to_string(),
+        }
+    );
     let entry = ledger
         .outbound_entry("0198ab31-6c44-7e8a-b2bb-000000000205")
         .unwrap();

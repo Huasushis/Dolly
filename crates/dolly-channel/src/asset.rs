@@ -21,118 +21,326 @@
 //! immediately before the first transport effect by the injected adapter and
 //! are never persisted.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
-use dolly_schema::{CropError, CropRect, DisplaySize, ExifOrientation, MaterializedBounds};
+use dolly_schema::{CropError, CropRect, DisplaySize, MaterializedBounds};
 
 use crate::error::{ChannelError, ChannelOutcome, codes};
 
-/// One ordered asset premise of a committed send: identity fixed by the
-/// frozen Action arguments (part order preserved). Produced ONLY by the
-/// committed target-Action boundary; no caller-shaped or reverse-derived
-/// authority reaches this type.
+const BASE32_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+
+/// Canonical content-addressed Asset identity. Its wire form is identical to
+/// Asset's `AssetId`: `ast_b3_` followed by 52 unpadded lowercase RFC 4648
+/// base32 characters.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AssetId(String);
+
+impl AssetId {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        if !is_canonical_asset_id(value) {
+            return Err("AssetId string does not match the canonical pattern".to_string());
+        }
+        Ok(Self(value.to_string()))
+    }
+
+    pub fn from_digest(digest: [u8; 32]) -> Self {
+        let mut encoded = String::with_capacity(59);
+        encoded.push_str("ast_b3_");
+        encode_base32(&digest, &mut encoded);
+        Self(encoded)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl From<&AssetId> for [u8; 32] {
+    fn from(asset_id: &AssetId) -> Self {
+        decode_base32_into(&asset_id.0[7..]).expect("validated AssetId decodes")
+    }
+}
+
+impl fmt::Display for AssetId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Serialize for AssetId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for AssetId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Canonical lowercase media type, matching Asset's `MediaType` wire form.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MediaType(String);
+
+impl MediaType {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        if is_canonical_media_type(value) {
+            Ok(Self(value.to_string()))
+        } else {
+            Err("invalid media type".to_string())
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for MediaType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Serialize for MediaType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for MediaType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Provider-neutral media kind. The variants and wire names exactly match
+/// Asset's closed `MediaKind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaKind {
+    Image,
+    Audio,
+    Video,
+    File,
+}
+
+impl MediaKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Audio => "audio",
+            Self::Video => "video",
+            Self::File => "file",
+        }
+    }
+}
+
+/// BLAKE3-256 content digest with Asset's exact typed representation and wire
+/// encoding: `{"algorithm":"blake3-256","digest":"<64 lowercase hex>"}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ContentHash {
+    pub algorithm: &'static str,
+    pub digest: [u8; 32],
+}
+
+impl ContentHash {
+    pub const ALGORITHM: &'static str = "blake3-256";
+
+    pub fn from_digest(digest: [u8; 32]) -> Self {
+        Self {
+            algorithm: Self::ALGORITHM,
+            digest,
+        }
+    }
+
+    pub fn digest_hex(&self) -> String {
+        encode_hex(&self.digest)
+    }
+}
+
+impl Serialize for ContentHash {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("ContentHash", 2)?;
+        state.serialize_field("algorithm", Self::ALGORITHM)?;
+        state.serialize_field("digest", &self.digest_hex())?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ContentHash {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            algorithm: String,
+            digest: String,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        if wire.algorithm != Self::ALGORITHM {
+            return Err(serde::de::Error::custom("unsupported hash algorithm"));
+        }
+        let digest = decode_hex(&wire.digest).map_err(serde::de::Error::custom)?;
+        Ok(Self::from_digest(digest))
+    }
+}
+
+/// Canonical fully authoritative Asset reference. Every field and optional
+/// geometry value mirrors Asset's accepted `AssetRef`; no caller metadata is
+/// substituted and no absent geometry is fabricated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AssetRef {
+    pub asset_id: AssetId,
+    pub media_type: MediaType,
+    pub byte_length: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orientation: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoded_width: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoded_height: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_width: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_height: Option<u64>,
+}
+
+impl AssetRef {
+    pub const MAX_WIRE_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.byte_length > Self::MAX_WIRE_SAFE_INTEGER {
+            return Err("byte_length exceeds the canonical wire integer range".to_string());
+        }
+        if self
+            .orientation
+            .is_some_and(|value| !(1..=8).contains(&value))
+        {
+            return Err("orientation must be 1..=8 when present".to_string());
+        }
+        for (name, value) in [
+            ("encoded_width", self.encoded_width),
+            ("encoded_height", self.encoded_height),
+            ("display_width", self.display_width),
+            ("display_height", self.display_height),
+        ] {
+            if value.is_some_and(|value| value == 0 || value > Self::MAX_WIRE_SAFE_INTEGER) {
+                return Err(format!("{name} is outside the canonical wire range"));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for AssetRef {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            asset_id: AssetId,
+            media_type: MediaType,
+            byte_length: u64,
+            orientation: Option<u8>,
+            encoded_width: Option<u64>,
+            encoded_height: Option<u64>,
+            display_width: Option<u64>,
+            display_height: Option<u64>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let asset_ref = Self {
+            asset_id: wire.asset_id,
+            media_type: wire.media_type,
+            byte_length: wire.byte_length,
+            orientation: wire.orientation,
+            encoded_width: wire.encoded_width,
+            encoded_height: wire.encoded_height,
+            display_width: wire.display_width,
+            display_height: wire.display_height,
+        };
+        asset_ref.validate().map_err(serde::de::Error::custom)?;
+        Ok(asset_ref)
+    }
+}
+/// One ordered committed Asset premise. The request contains only the exact
+/// `AssetId`, declared media type, and optional shared crop; all authoritative
+/// metadata comes back from the injected Asset preparation seam.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssetPremise {
-    /// The part index inside the frozen `arguments.parts` array.
     pub ordinal: u32,
-    /// Canonical `AssetId` (`ast_b3_` + 52 base32 chars ending in `a`/`q`).
-    pub asset_id: String,
-    /// The lowercase, parameter-free canonical media type declared by the
-    /// committed Action. The Channel does not treat this as authority: the
-    /// injected seam must confirm it against the authoritative Asset record
-    /// (detected media type).
-    pub media_type: String,
-    /// Optional normalized crop; the whole asset when absent. The shared
-    /// [`CropRect`] enforces the fixed-point bounds and order invariants.
+    pub asset_id: AssetId,
+    pub media_type: MediaType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<CropRect>,
 }
 
-/// A closed, fully-typed short-lease proof minted by the injected
-/// [`AssetPreparation`] seam. It carries only canonical metadata the Channel
-/// may enforce — lease identity/expiry/generation, the authoritative detected
-/// media type and byte length, encoded dimensions/orientation (for view
-/// materialization against the authoritative record), and the canonical
-/// content digest. There is no path, capability, raw caller JSON, or opaque
-/// escape: every field has a fixed type and meaning. The Channel persists it
-/// with the durable outbound record and hands it to the injected transport
-/// seam; it never reads asset bytes itself.
+/// Durable proof copied field-for-field from Asset `PreparedMedia`, excluding
+/// only its ephemeral bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AssetLeaseProof {
-    /// Integrator-minted short-lease identifier.
+    pub asset_ref: AssetRef,
+    pub media_kind: MediaKind,
+    pub generation: u64,
+    pub digest: ContentHash,
     pub lease_id: String,
-    /// Durable lease expiry (UTC RFC 3339, the adapter's lease bound).
-    pub lease_expires_at: String,
-    /// Durable lease generation (monotonic per asset record).
-    pub lease_generation: i64,
-    /// The authoritative detected media type from the Asset record. It MUST
-    /// equal the committed Action's declared `media_type`; a mismatch is a
-    /// forged media label and fails the whole send before dispatch.
-    pub media_type: String,
-    /// The authoritative byte length of the asset, enforced against the
-    /// configured outbound media size bound.
-    pub byte_length: u64,
-    /// Authoritative encoded (pre-transform) width.
-    pub encoded_width: u64,
-    /// Authoritative encoded (pre-transform) height.
-    pub encoded_height: u64,
-    /// Authoritative EXIF orientation (`1..=8`); missing means `1`.
-    pub orientation: u8,
-    /// The canonical content digest of the asset record (integrity premise,
-    /// never path or store identity).
-    pub content_digest: String,
+    pub lease_expiry_unix_ms: u64,
 }
 
-/// The asset part of one authorized send: the frozen premise plus the typed
-/// lease proof that this premise is currently prepared under the Channel's
-/// authority. This is the ONLY asset metadata the Channel persists.
+/// Durable asset send metadata. Before preparation it contains only the
+/// committed premise; after preparation the exact lease proof is present.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PreparedAsset {
+pub struct OutboundAsset {
     pub premise: AssetPremise,
-    pub lease_proof: AssetLeaseProof,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_proof: Option<AssetLeaseProof>,
 }
 
-/// Ephemeral, non-durable send payload for one prepared asset. Minted ONLY
-/// by the injected adapter immediately before the first transport effect;
-/// never persisted, never part of a durable record, and carrying no identity
-/// of its own.
+/// Ephemeral field-for-field mirror of Asset `PreparedMedia`. The Runtime
+/// adapter constructs this value directly from Asset's result; Channel
+/// validates its exact identity, metadata, lease, digest, byte length, and
+/// configured bound before dispatch. It is never serializable or durable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssetPayload {
-    /// The exact prepared bytes handed to the transport seam.
+    pub asset_ref: AssetRef,
+    pub media_kind: MediaKind,
+    pub generation: u64,
+    pub digest: ContentHash,
+    pub lease_id: String,
+    pub lease_expiry_unix_ms: u64,
     pub bytes: Vec<u8>,
 }
 
-/// The single injected Asset-authority seam for ordered multimodal sends
-/// (sole integrator: the Host/Runtime). It implements Core AssetPart
-/// authorization, authoritative detected-media-type, safe-view, crop
-/// materialization, and short-lease checks for the exact AssetRef premises of
-/// one committed send; the Channel never reimplements any of that authority.
+impl AssetPayload {
+    pub fn lease_proof(&self) -> AssetLeaseProof {
+        AssetLeaseProof {
+            asset_ref: self.asset_ref.clone(),
+            media_kind: self.media_kind,
+            generation: self.generation,
+            digest: self.digest,
+            lease_id: self.lease_id.clone(),
+            lease_expiry_unix_ms: self.lease_expiry_unix_ms,
+        }
+    }
+}
+
+/// The single injected Asset preparation seam. Each result is the exact
+/// bounded `PreparedMedia` payload for the premise at the same index. There
+/// is no later Asset read or lease service call in the dispatch path.
 pub trait AssetPreparation {
-    /// Prepare the exact ordered asset premises of one committed send and
-    /// mint one typed short-lease proof per premise, in premise order. Any
-    /// noncanonical, foreign, unavailable, stale, or revoked premise refuses
-    /// the whole send (returned [`ChannelError`]) before any durable
-    /// `Prepared` row or transport effect.
     fn prepare_assets(
         &mut self,
         premises: &[AssetPremise],
-    ) -> Result<Vec<AssetLeaseProof>, ChannelError>;
-
-    /// Mint the ephemeral, non-durable payload of one prepared asset
-    /// immediately before the first transport effect. The payload is bounded
-    /// by the Channel's configured media size bound and is never persisted.
-    fn asset_payload(&mut self, proof: &AssetLeaseProof) -> Result<AssetPayload, ChannelError>;
-
-    /// Re-validate, after queue/blocking work, that every lease behind the
-    /// proofs is still live. An invalidated, stale, or revoked lease fails
-    /// closed with no transport effect.
-    fn revalidate_leases(&mut self, proofs: &[AssetLeaseProof]) -> Result<(), ChannelError>;
+    ) -> Result<Vec<AssetPayload>, ChannelError>;
 }
 
-/// Default fail-closed seam: the accepted v1 text-only profile. Any asset
-/// premise is refused with `CHANNEL_UNSUPPORTED_MODALITY` before any durable
-/// or transport effect; only an explicitly injected integrator seam may
-/// enable asset parts.
+/// Default fail-closed seam for the accepted text-only profile.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DenyAssetParts;
 
@@ -140,7 +348,7 @@ impl AssetPreparation for DenyAssetParts {
     fn prepare_assets(
         &mut self,
         premises: &[AssetPremise],
-    ) -> Result<Vec<AssetLeaseProof>, ChannelError> {
+    ) -> Result<Vec<AssetPayload>, ChannelError> {
         let Some(first) = premises.first() else {
             return Ok(Vec::new());
         };
@@ -149,23 +357,10 @@ impl AssetPreparation for DenyAssetParts {
             false,
             ChannelOutcome::NotApplied,
             format!(
-                "asset parts require the WP-013B channel multimodal profile (asset part at ordinal {} is not prepared)",
+                "asset parts require the Channel multimodal profile (asset part at ordinal {} is not prepared)",
                 first.ordinal
             ),
         ))
-    }
-
-    fn asset_payload(&mut self, _proof: &AssetLeaseProof) -> Result<AssetPayload, ChannelError> {
-        Err(ChannelError::new(
-            codes::UNSUPPORTED_MODALITY,
-            false,
-            ChannelOutcome::NotApplied,
-            "asset payloads require the WP-013B channel multimodal profile",
-        ))
-    }
-
-    fn revalidate_leases(&mut self, _proofs: &[AssetLeaseProof]) -> Result<(), ChannelError> {
-        Ok(())
     }
 }
 
@@ -194,19 +389,18 @@ pub(crate) fn parse_asset_premise(
         _ => return Err(malformed("must be an object")),
     };
     let asset_id = match part_obj.get("asset_id") {
-        Some(dolly_canonical_json::CanonicalJsonValue::String(id)) => id.clone(),
+        Some(dolly_canonical_json::CanonicalJsonValue::String(id)) => {
+            AssetId::parse(id).map_err(|_| malformed("asset_id is not a canonical AssetId"))?
+        }
         _ => return Err(malformed("missing asset_id")),
     };
-    if !is_canonical_asset_id(&asset_id) {
-        return Err(malformed("asset_id is not a canonical AssetId"));
-    }
     let media_type = match part_obj.get("media_type") {
-        Some(dolly_canonical_json::CanonicalJsonValue::String(media_type)) => media_type.clone(),
+        Some(dolly_canonical_json::CanonicalJsonValue::String(media_type)) => {
+            MediaType::parse(media_type)
+                .map_err(|_| malformed("media_type is not a canonical lowercase media type"))?
+        }
         _ => return Err(malformed("missing media_type")),
     };
-    if !is_canonical_media_type(&media_type) {
-        return Err(malformed("media_type is not a canonical lowercase media type"));
-    }
     let view = match part_obj.get("view") {
         None => None,
         Some(dolly_canonical_json::CanonicalJsonValue::Object(view)) => {
@@ -243,46 +437,100 @@ pub(crate) fn parse_asset_premise(
     })
 }
 
-/// Verify one injected lease proof against its frozen premise and the
-/// configured outbound media bounds. A mismatched authoritative detected
-/// media type (forged media label), an empty lease identity, an over-bounds
-/// byte length, or a noncanonical orientation/dimension/digest fails the
-/// whole send before any durable or transport effect.
+/// Validate the exact field-for-field Asset preparation result before the
+/// dispatch claim. The payload identity, kind, authoritative reference,
+/// BLAKE3 digest, byte length, and configured byte bound must all agree with
+/// the committed premise. Geometry remains optional unless a crop is present.
+pub(crate) fn validate_asset_payload(
+    premise: &AssetPremise,
+    payload: &AssetPayload,
+    max_asset_bytes: usize,
+) -> Result<(), String> {
+    let proof = payload.lease_proof();
+    validate_prepared_asset(premise, &proof, max_asset_bytes)?;
+    if payload.bytes.len() as u64 != payload.asset_ref.byte_length {
+        return Err(format!(
+            "prepared byte length {} does not match the authoritative byte length {}",
+            payload.bytes.len(),
+            payload.asset_ref.byte_length
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the durable proof copied from one Asset preparation result.
 pub(crate) fn validate_prepared_asset(
     premise: &AssetPremise,
     proof: &AssetLeaseProof,
     max_asset_bytes: usize,
 ) -> Result<(), String> {
-    if premise.media_type != proof.media_type {
+    proof.asset_ref.validate()?;
+    if premise.asset_id != proof.asset_ref.asset_id {
+        return Err(format!(
+            "the authoritative AssetId {} does not match the committed AssetId {}",
+            proof.asset_ref.asset_id, premise.asset_id
+        ));
+    }
+    if premise.media_type != proof.asset_ref.media_type {
         return Err(format!(
             "the authoritative detected media type is {} but the committed Action declares {}",
-            proof.media_type, premise.media_type
+            proof.asset_ref.media_type, premise.media_type
         ));
     }
-    if proof.lease_id.is_empty() || proof.lease_expires_at.is_empty() {
-        return Err("the prepared lease has no identity or expiry".to_string());
-    }
-    if proof.byte_length == 0 || proof.byte_length > max_asset_bytes as u64 {
+    let expected_kind = media_kind_of_type(&proof.asset_ref.media_type);
+    if proof.media_kind != expected_kind {
         return Err(format!(
-            "the authoritative byte length {} is outside the configured maximum {} bytes",
-            proof.byte_length, max_asset_bytes
+            "the prepared media kind {} does not match authoritative type {}",
+            proof.media_kind.as_str(),
+            proof.asset_ref.media_type
         ));
     }
-    ExifOrientation::new(proof.orientation)
-        .map_err(|error| format!("the authoritative orientation is invalid: {error}"))?;
-    DisplaySize::new(proof.encoded_width, proof.encoded_height)
-        .map_err(|error| format!("the authoritative encoded dimensions are invalid: {error}"))?;
-    if proof.content_digest.is_empty() {
-        return Err("the prepared asset has no canonical content digest".to_string());
+    if proof.lease_id.is_empty() || proof.lease_expiry_unix_ms == 0 {
+        return Err("the prepared lease has no identity or numeric expiry".to_string());
+    }
+    if proof.generation > AssetRef::MAX_WIRE_SAFE_INTEGER
+        || proof.lease_expiry_unix_ms > AssetRef::MAX_WIRE_SAFE_INTEGER
+    {
+        return Err(
+            "the prepared generation or lease expiry exceeds the canonical wire integer range"
+                .to_string(),
+        );
+    }
+    if proof.asset_ref.byte_length > max_asset_bytes as u64 {
+        return Err(format!(
+            "the authoritative byte length {} exceeds the configured maximum {} bytes",
+            proof.asset_ref.byte_length, max_asset_bytes
+        ));
+    }
+    if proof.digest.algorithm != ContentHash::ALGORITHM {
+        return Err("the prepared digest is not BLAKE3-256".to_string());
+    }
+    if AssetId::from_digest(proof.digest.digest) != proof.asset_ref.asset_id {
+        return Err("the prepared BLAKE3 digest does not match the canonical AssetId".to_string());
+    }
+    materialized_view(premise, proof)?;
+    Ok(())
+}
+
+/// Non-blocking local revalidation after the durable dispatch claim. This
+/// consults no Asset service: it only rechecks the already-held proof,
+/// configured bound, payload identity/length, crop, and numeric lease expiry.
+pub(crate) fn validate_asset_payload_for_send(
+    premise: &AssetPremise,
+    payload: &AssetPayload,
+    max_asset_bytes: usize,
+    now_ms: u64,
+) -> Result<(), String> {
+    validate_asset_payload(premise, payload, max_asset_bytes)?;
+    if payload.lease_expiry_unix_ms <= now_ms {
+        return Err("the prepared Asset lease expired before transport send".to_string());
     }
     Ok(())
 }
 
-/// Materialize the premised normalized crop onto the authoritative prepared
-/// display (derived from the proof's encoded dimensions and EXIF
-/// orientation) using the shared crop module — never duplicated Channel
-/// logic. An unsafe or out-of-bounds view fails the whole send. `None` when
-/// the premise has no crop (the whole asset).
+/// Materialize an optional committed crop against the authoritative display
+/// dimensions. Geometry is required only for a crop; absent geometry is valid
+/// for whole-asset sends and is never replaced with fake values.
 pub(crate) fn materialized_view(
     premise: &AssetPremise,
     proof: &AssetLeaseProof,
@@ -290,14 +538,31 @@ pub(crate) fn materialized_view(
     let Some(view) = &premise.view else {
         return Ok(None);
     };
-    let orientation = ExifOrientation::new(proof.orientation)
-        .map_err(|error| format!("the authoritative orientation is invalid: {error}"))?;
-    let display = orientation
-        .display_size(proof.encoded_width, proof.encoded_height)
+    let width = proof
+        .asset_ref
+        .display_width
+        .ok_or_else(|| "a crop requires authoritative display_width".to_string())?;
+    let height = proof
+        .asset_ref
+        .display_height
+        .ok_or_else(|| "a crop requires authoritative display_height".to_string())?;
+    let display = DisplaySize::new(width, height)
         .map_err(|error| format!("the authoritative display is invalid: {error}"))?;
-    view.materialize(&display)
-        .map(Some)
-        .map_err(|error| format!("the premised crop is unsafe for the authoritative display: {error}"))
+    view.materialize(&display).map(Some).map_err(|error| {
+        format!("the premised crop is unsafe for the authoritative display: {error}")
+    })
+}
+
+pub(crate) fn media_kind_of_type(media_type: &MediaType) -> MediaKind {
+    if media_type.as_str().starts_with("image/") {
+        MediaKind::Image
+    } else if media_type.as_str().starts_with("audio/") {
+        MediaKind::Audio
+    } else if media_type.as_str().starts_with("video/") {
+        MediaKind::Video
+    } else {
+        MediaKind::File
+    }
 }
 
 /// Canonical `AssetId` check: `ast_b3_` followed by 52 characters from the
@@ -362,135 +627,187 @@ fn is_mime_token_char(byte: u8) -> bool {
     )
 }
 
+fn encode_base32(data: &[u8], out: &mut String) {
+    let mut accumulator: u32 = 0;
+    let mut bits: u32 = 0;
+    for byte in data {
+        accumulator = (accumulator << 8) | u32::from(*byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(BASE32_ALPHABET[((accumulator >> bits) & 0x1f) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        out.push(BASE32_ALPHABET[((accumulator << (5 - bits)) & 0x1f) as usize] as char);
+    }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from_digit((byte >> 4) as u32, 16).expect("nibble"));
+        encoded.push(char::from_digit((byte & 0x0f) as u32, 16).expect("nibble"));
+    }
+    encoded
+}
+
+fn decode_base32_into(value: &str) -> Result<[u8; 32], String> {
+    let mut output = [0u8; 32];
+    let mut accumulator: u32 = 0;
+    let mut bits: u32 = 0;
+    let mut index = 0usize;
+    for byte in value.bytes() {
+        let digit = BASE32_ALPHABET
+            .iter()
+            .position(|candidate| *candidate == byte)
+            .ok_or_else(|| "invalid base32 character".to_string())? as u32;
+        accumulator = (accumulator << 5) | digit;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            if index >= output.len() {
+                return Err("AssetId decoded length is invalid".to_string());
+            }
+            output[index] = (accumulator >> bits) as u8;
+            index += 1;
+        }
+    }
+    if index != output.len() || (bits > 0 && accumulator & ((1 << bits) - 1) != 0) {
+        return Err("AssetId has non-canonical trailing bits".to_string());
+    }
+    Ok(output)
+}
+
+fn decode_hex(value: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || value != value.to_ascii_lowercase()
+    {
+        return Err("digest must be 64 lowercase hexadecimal characters".to_string());
+    }
+    let mut digest = [0u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = (pair[0] as char).to_digit(16).expect("validated hex");
+        let low = (pair[1] as char).to_digit(16).expect("validated hex");
+        digest[index] = ((high << 4) | low) as u8;
+    }
+    Ok(digest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn canonical_asset_id_forms() {
-        assert!(is_canonical_asset_id(
-            "ast_b3_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        ));
-        // A valid digest of `b` characters ending in `q`.
-        let b_valid = format!("ast_b3_{}q", "b".repeat(51));
-        assert!(is_canonical_asset_id(&b_valid));
-        // A valid 52-char digest ending in `q`.
-        let mut id = "ast_b3_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
-        id.replace_range(58..59, "q");
-        assert!(is_canonical_asset_id(&id));
-        // Wrong prefix, length, alphabet, and final character.
-        assert!(!is_canonical_asset_id("ast_b4_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
-        assert!(!is_canonical_asset_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
-        assert!(!is_canonical_asset_id(
-            "ast_b3_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-        ));
-        let mut bad = "ast_b3_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
-        bad.replace_range(58..59, "b");
-        assert!(!is_canonical_asset_id(&bad));
-    }
-
-    #[test]
-    fn canonical_media_type_forms() {
-        assert!(is_canonical_media_type("image/png"));
-        assert!(is_canonical_media_type("application/vnd.example+json"));
-        assert!(is_canonical_media_type("text/plain"));
-        assert!(!is_canonical_media_type("Image/PNG"));
-        assert!(!is_canonical_media_type("image/png;charset=utf-8"));
-        assert!(!is_canonical_media_type("image"));
-        assert!(!is_canonical_media_type(" image/png"));
-    }
-
-    #[test]
-    fn shared_crop_rect_validates_the_full_premise_invariants() {
-        // The clos shared CropRect enforces coordinates and order; an empty
-        // or inverted rectangle is rejected at construction.
-        assert!(CropRect::new(100_000, 200_000, 600_000, 600_000).is_ok());
-        assert!(CropRect::new(600_000, 600_000, 100_000, 100_000).is_err());
-        assert!(CropRect::new(500_000, 0, 500_000, 10).is_err());
-        assert!(CropRect::new(1_000_000, 0, 1_000_000, 1).is_err());
-        assert!(CropRect::new(0, 0, 0, 10).is_err());
-    }
-
-    #[test]
-    fn typed_proof_validation_and_materialization() {
-        let premise = AssetPremise {
-            ordinal: 1,
-            asset_id: "ast_b3_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            media_type: "image/png".to_string(),
-            view: Some(CropRect::new(100_000, 200_000, 600_000, 600_000).unwrap()),
-        };
-        let mut proof = AssetLeaseProof {
+    fn image_payload(with_geometry: bool) -> AssetPayload {
+        let digest = [0u8; 32];
+        AssetPayload {
+            asset_ref: AssetRef {
+                asset_id: AssetId::from_digest(digest),
+                media_type: MediaType::parse("image/png").unwrap(),
+                byte_length: 4,
+                orientation: with_geometry.then_some(1),
+                encoded_width: with_geometry.then_some(1000),
+                encoded_height: with_geometry.then_some(500),
+                display_width: with_geometry.then_some(1000),
+                display_height: with_geometry.then_some(500),
+            },
+            media_kind: MediaKind::Image,
+            generation: 7,
+            digest: ContentHash::from_digest(digest),
             lease_id: "lease-1".to_string(),
-            lease_expires_at: "2026-08-29T00:00:00.000000Z".to_string(),
-            lease_generation: 1,
-            media_type: "image/png".to_string(),
-            byte_length: 1000,
-            encoded_width: 1000,
-            encoded_height: 500,
-            orientation: 1,
-            content_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                .to_string(),
-        };
-        assert!(validate_prepared_asset(&premise, &proof, 4096).is_ok());
-        // Materialization against the authoritative display (no Channel crop
-        // logic) produces the exact clamped pixel bounds.
-        let bounds = materialized_view(&premise, &proof).unwrap().unwrap();
+            lease_expiry_unix_ms: 2_000,
+            bytes: vec![1, 2, 3, 4],
+        }
+    }
+
+    fn premise(view: Option<CropRect>) -> AssetPremise {
+        AssetPremise {
+            ordinal: 1,
+            asset_id: AssetId::from_digest([0u8; 32]),
+            media_type: MediaType::parse("image/png").unwrap(),
+            view,
+        }
+    }
+
+    #[test]
+    fn accepted_asset_wire_types_are_exact_and_closed() {
+        let payload = image_payload(false);
+        let proof = payload.lease_proof();
+        let wire = serde_json::to_value(&proof).unwrap();
+        assert_eq!(wire["generation"], 7);
+        assert_eq!(wire["lease_expiry_unix_ms"], 2_000);
+        assert_eq!(wire["digest"]["algorithm"], "blake3-256");
+        assert_eq!(wire["digest"]["digest"].as_str().unwrap().len(), 64);
+        assert!(wire["asset_ref"]["orientation"].is_null());
+        assert!(
+            serde_json::from_value::<AssetLeaseProof>(serde_json::json!({
+                "asset_ref": wire["asset_ref"],
+                "media_kind": "image",
+                "generation": 7,
+                "digest": {"algorithm":"sha256","digest":"00".repeat(32)},
+                "lease_id":"lease-1",
+                "lease_expiry_unix_ms":2000
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn geometry_is_required_only_for_a_crop() {
+        let whole = image_payload(false);
+        assert!(validate_asset_payload(&premise(None), &whole, 4).is_ok());
+        let crop = premise(Some(
+            CropRect::new(100_000, 200_000, 600_000, 600_000).unwrap(),
+        ));
+        assert!(validate_asset_payload(&crop, &whole, 4).is_err());
+
+        let with_geometry = image_payload(true);
+        let proof = with_geometry.lease_proof();
+        let bounds = materialized_view(&crop, &proof).unwrap().unwrap();
         assert_eq!(
             (bounds.left(), bounds.top(), bounds.right(), bounds.bottom()),
             (100, 100, 600, 300)
         );
-        // A forged detected media type fails closed.
-        proof.media_type = "image/jpeg".to_string();
-        assert!(validate_prepared_asset(&premise, &proof, 4096).is_err());
-        proof.media_type = "image/png".to_string();
-        // Over-bound byte length fails closed.
-        assert!(validate_prepared_asset(&premise, &proof, 100).is_err());
-        // A forged orientation fails closed.
-        proof.byte_length = 1000;
-        proof.orientation = 9;
-        assert!(validate_prepared_asset(&premise, &proof, 4096).is_err());
-        assert!(materialized_view(&premise, &proof).is_err());
-        // An axis-swapped orientation materializes onto the transposed frame.
-        proof.orientation = 6;
-        assert!(validate_prepared_asset(&premise, &proof, 4096).is_ok());
-        let swapped = materialized_view(&premise, &proof).unwrap().unwrap();
-        assert_eq!(
-            (swapped.left(), swapped.top(), swapped.right(), swapped.bottom()),
-            (50, 200, 300, 600)
-        );
-
-        // The whole asset (no crop) has no materialized bounds.
-        let mut whole = premise.clone();
-        whole.view = None;
-        assert!(materialized_view(&whole, &proof).unwrap().is_none());
     }
 
     #[test]
-    fn deny_seam_refuses_any_asset_premise_and_payload() {
+    fn payload_identity_length_bound_and_expiry_fail_closed() {
+        let premise = premise(None);
+        let mut payload = image_payload(false);
+        assert!(validate_asset_payload_for_send(&premise, &payload, 4, 1_999).is_ok());
+        assert!(validate_asset_payload_for_send(&premise, &payload, 4, 2_000).is_err());
+        payload.bytes.push(5);
+        assert!(validate_asset_payload(&premise, &payload, 5).is_err());
+        payload.bytes.pop();
+        payload.digest = ContentHash::from_digest([1u8; 32]);
+        assert!(validate_asset_payload(&premise, &payload, 4).is_err());
+    }
+
+    #[test]
+    fn canonical_identity_and_media_type_forms() {
+        let canonical = AssetId::from_digest([0u8; 32]);
+        assert_eq!(
+            canonical.as_str(),
+            "ast_b3_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert!(AssetId::parse(canonical.as_str()).is_ok());
+        assert!(
+            AssetId::parse("ast_b3_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").is_err()
+        );
+        assert!(MediaType::parse("application/vnd.example+json").is_ok());
+        assert!(MediaType::parse("Image/PNG").is_err());
+    }
+
+    #[test]
+    fn deny_seam_refuses_any_asset_premise() {
         let mut seam = DenyAssetParts;
-        let premise = AssetPremise {
-            ordinal: 1,
-            asset_id: "ast_b3_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            media_type: "image/png".to_string(),
-            view: None,
-        };
-        let error = seam.prepare_assets(&[premise]).expect_err("asset part refused");
+        let error = seam
+            .prepare_assets(&[premise(None)])
+            .expect_err("asset part refused");
         assert_eq!(error.code, codes::UNSUPPORTED_MODALITY);
         assert!(!error.retryable);
         assert_eq!(error.outcome, ChannelOutcome::NotApplied);
         assert!(seam.prepare_assets(&[]).unwrap().is_empty());
-        let proof = AssetLeaseProof {
-            lease_id: "x".to_string(),
-            lease_expires_at: "x".to_string(),
-            lease_generation: 0,
-            media_type: "image/png".to_string(),
-            byte_length: 1,
-            encoded_width: 1,
-            encoded_height: 1,
-            orientation: 1,
-            content_digest: "d".to_string(),
-        };
-        assert!(seam.asset_payload(&proof).is_err());
-        assert!(seam.revalidate_leases(&[]).is_ok());
     }
 }

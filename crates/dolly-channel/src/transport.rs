@@ -6,25 +6,37 @@
 //! the outcome classes the specification requires: confirmed pieces with
 //! transport message IDs, rejected pieces, and `Unknown` for timeouts or
 //! losses after bytes may have reached the transport. The seam is also
-//! **status-capable**: after a send whose response was lost (Dispatched), a
-//! restart calls [`ChannelTransport::status`] with the idempotency key and
-//! receives the exact transport-side outcome (confirmed/partial/unknown),
-//! never a blind resend or an age-to-unknown guess.
+//! **status-capable**: after a send whose response was lost (`Dispatched`), a
+//! restart calls [`ChannelTransport::status`] with the idempotency key, never
+//! blind-resends, and freezes terminal `Unknown` only after the configured
+//! durable status-retry deadline.
 
-/// One outbound piece handed to the transport: text, or a prepared asset
-/// (frozen premise plus the typed short-lease proof minted by the injected
-/// Asset authority and the EPHEMERAL, non-durable payload fetched immediately
-/// before this send). The Channel persists only the premise/proof; the
-/// payload exists solely for this transport call.
+/// One provider-neutral outbound piece composed completely by Channel.
+/// Runtime adapters may only serialize these closed variants to a provider
+/// API; they do not infer modality, crop, media metadata, order, or splitting.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TransportPiece {
-    pub ordinal: u32,
-    pub text: String,
-    /// The prepared asset (asset pieces only). Absent for v1 text pieces.
-    pub asset: Option<crate::asset::PreparedAsset>,
-    /// Ephemeral non-durable payload (asset pieces only), minted by the
-    /// injected adapter immediately before the transport effect.
-    pub asset_payload: Option<crate::asset::AssetPayload>,
+pub enum TransportPiece {
+    Text {
+        ordinal: u32,
+        text: String,
+    },
+    Asset {
+        ordinal: u32,
+        /// Exact typed bounded Asset `PreparedMedia` mirror. Bytes are
+        /// ephemeral and this transport request is never durable.
+        payload: crate::asset::AssetPayload,
+        /// Exact Channel-materialized crop in authoritative display pixels;
+        /// `None` means the whole asset.
+        view: Option<dolly_schema::MaterializedBounds>,
+    },
+}
+
+impl TransportPiece {
+    pub fn ordinal(&self) -> u32 {
+        match self {
+            Self::Text { ordinal, .. } | Self::Asset { ordinal, .. } => *ordinal,
+        }
+    }
 }
 
 /// The transport-facing send request.

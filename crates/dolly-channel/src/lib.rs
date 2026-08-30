@@ -6,16 +6,14 @@
 //! durable Core ingress premise), the outbound effect ledger for
 //! `org.dolly.channel.send` (prepared/dispatched/confirmed/partial/failed/
 //! unknown), and the frozen semantic result validator. Ordered multimodal
-//! sends parse ordered Core `Part` asset premises from the committed targeted
-//! Action, require the injected [`asset::AssetPreparation`] seam to prove
-//! each asset under the Channel authority and mint a typed short-lease proof,
-//! and revalidate those leases at every blocking fence. The decision pipeline
-//! performs no transport, network, or storage I/O: those enter through the
-//! injected [`CoreIngress`], [`ChannelTransport`], and storage-agnostic
-//! [`ChannelLedger`] boundaries, so every decision is deterministic and
-//! testable offline. The G4-C durable backing ([`InboundReceiver`],
-//! [`SqliteChannelStore`]) is the shipping-runtime layer that binds that
-//! pipeline to the accepted `HostIngress` / storage seams.
+//! sends parse ordered Core `Part` Asset premises from the committed targeted
+//! Action, complete typed Asset preparation before the dispatch claim, and
+//! send a closed provider-neutral composition without any later Asset read.
+//! The durable state contains only committed premises and exact lease proofs;
+//! prepared bytes exist only in the ephemeral transport request. External
+//! effects enter through the injected [`CoreIngress`], [`ChannelTransport`],
+//! and storage boundaries, keeping the Channel decision flow deterministic.
+//! The durable pipeline binds to the accepted `HostIngress` and storage seams.
 //!
 //! The Channel never appends directly to a Page, never mints a Block or Asset
 //! ID, never reimplements Asset authority, never accepts a raw path or byte
@@ -47,20 +45,20 @@ pub mod result_validator;
 pub(crate) mod store;
 pub mod transport;
 
+pub use attachment::{
+    AttachmentImportRequest, AttachmentImportStatus, AttachmentRecord, AttachmentState,
+    AvailableAttachment, DenyAttachments, InboundAssetImport, InboundAttachment,
+};
 pub use clock::{
     Clock, FixedClock, VirtualClock, timestamp_diff_micros, timestamp_from_total_micros,
     timestamp_plus_seconds, timestamp_total_micros,
 };
 pub use config::{ChannelConfig, ChannelConfigBuilder, EXTENSION_ID, SEND_ACTION_NAME};
 pub use error::{ChannelDeliveryOutcome, ChannelError, ChannelOutcome};
-pub use attachment::{
-    AttachmentImportRequest, AttachmentImportStatus, AttachmentRecord, AttachmentState,
-    AvailableAttachment, DenyAttachments, InboundAssetImport, InboundAttachment,
-};
 pub use ingress::{
     CoreIngress, CoreIngressError, InboundEvent, IngressCommit, IngressOutcome,
     IngressStatusResult, IngressSubmitReceipt, IngressSubmitRequest, parse_event, process_event,
-    process_event_with_assets, reconcile_assets_pending_with_assets, reconcile_inbound,
+    reconcile_inbound,
 };
 pub use ledger::PieceOutcome;
 pub use ledger::{

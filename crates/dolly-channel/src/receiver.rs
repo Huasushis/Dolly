@@ -23,18 +23,18 @@
 use dolly_core_domain::Timestamp;
 use dolly_storage::{HostCapabilityGrant, HostConnectionAuthority, HostIngress};
 
+use crate::attachment::{
+    AttachmentImportRequest, AttachmentImportStatus, AttachmentRecord, AttachmentState,
+    InboundAssetImport, InboundAttachment,
+};
 use crate::clock::Clock;
 use crate::config::ChannelConfig;
 use crate::error::{ChannelError, ChannelOutcome, codes};
-use crate::attachment::{
-    AttachmentImportRequest, AttachmentImportStatus, AttachmentRecord, AttachmentState,
-    InboundAttachment, InboundAssetImport,
-};
 use crate::host_adapter::{HostIngressCoreAdapter, channel_intent_digest, payload_digest_of};
 use crate::ids;
 use crate::ingress::{
-    CoreIngress, CoreIngressError, IngressOutcome, IngressSubmitReceipt, IngressSubmitRequest,
-    InboundEvent, process_event_with_assets,
+    CoreIngress, CoreIngressError, InboundEvent, IngressOutcome, IngressSubmitReceipt,
+    IngressSubmitRequest, process_event_with_pending_attachments,
 };
 use crate::intent::IntentState;
 use crate::ledger::{ChannelLedger, InboundState};
@@ -86,6 +86,18 @@ pub struct AuthenticatedChannelEvent {
     attachments: Vec<InboundAttachment>,
 }
 
+enum AttachmentProgress {
+    Pending,
+    Committed {
+        block_id: String,
+        idempotent: bool,
+        ingress_id: String,
+    },
+    Rejected {
+        code: String,
+    },
+}
+
 impl AuthenticatedChannelEvent {
     /// Seal one authenticated transport event under the opaque current Host
     /// authority and capability grant plus the current config revision. Every
@@ -111,6 +123,11 @@ impl AuthenticatedChannelEvent {
         content: ChannelEventContent,
         attachments: Vec<InboundAttachment>,
     ) -> Result<Self, ChannelError> {
+        crate::attachment::validate_attachment_sequence(
+            &attachments,
+            usize::MAX,
+            crate::asset::AssetRef::MAX_WIRE_SAFE_INTEGER,
+        )?;
         let principal = ChannelPrincipal::from_authority_grant(authority, grant)?;
         Ok(Self {
             bound_owner: principal.owner().to_string(),
@@ -194,15 +211,34 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
     ) -> Result<Self, ChannelError> {
         let principal = ChannelPrincipal::from_authority_grant(authority, grant)?;
         if config.extension_id != principal.extension_id() {
-            return Err(ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "channel config Extension does not match the granted Channel Extension"));
+            return Err(ChannelError::new(
+                codes::AUTHENTICATION_FAILED,
+                false,
+                ChannelOutcome::NotApplied,
+                "channel config Extension does not match the granted Channel Extension",
+            ));
         }
         if config.module_id != principal.module_id() {
-            return Err(ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "channel config Module does not match the granted Module"));
+            return Err(ChannelError::new(
+                codes::AUTHENTICATION_FAILED,
+                false,
+                ChannelOutcome::NotApplied,
+                "channel config Module does not match the granted Module",
+            ));
         }
         let mut config = config;
         config.transport_account = principal.account().to_string();
         let store = SqliteChannelStore::new(connection, &principal, config.revision)?;
-        Ok(Self { config, clock, store, host, authority, grant, principal, assets: Box::new(crate::attachment::DenyAttachments) })
+        Ok(Self {
+            config,
+            clock,
+            store,
+            host,
+            authority,
+            grant,
+            principal,
+            assets: Box::new(crate::attachment::DenyAttachments),
+        })
     }
 
     /// Bind the receiver with the single injected inbound Asset import seam
@@ -221,15 +257,34 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
     ) -> Result<Self, ChannelError> {
         let principal = ChannelPrincipal::from_authority_grant(authority, grant)?;
         if config.extension_id != principal.extension_id() {
-            return Err(ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "channel config Extension does not match the granted Channel Extension"));
+            return Err(ChannelError::new(
+                codes::AUTHENTICATION_FAILED,
+                false,
+                ChannelOutcome::NotApplied,
+                "channel config Extension does not match the granted Channel Extension",
+            ));
         }
         if config.module_id != principal.module_id() {
-            return Err(ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "channel config Module does not match the granted Module"));
+            return Err(ChannelError::new(
+                codes::AUTHENTICATION_FAILED,
+                false,
+                ChannelOutcome::NotApplied,
+                "channel config Module does not match the granted Module",
+            ));
         }
         let mut config = config;
         config.transport_account = principal.account().to_string();
         let store = SqliteChannelStore::new(connection, &principal, config.revision)?;
-        Ok(Self { config, clock, store, host, authority, grant, principal, assets })
+        Ok(Self {
+            config,
+            clock,
+            store,
+            host,
+            authority,
+            grant,
+            principal,
+            assets,
+        })
     }
 
     /// The current in-memory Channel ledger projection (rebuilt from the
@@ -252,10 +307,20 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
     ) -> Result<Self, ChannelError> {
         let principal = ChannelPrincipal::from_authority_grant(authority, grant)?;
         if config.extension_id != principal.extension_id() {
-            return Err(ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "channel config Extension does not match the granted Channel Extension"));
+            return Err(ChannelError::new(
+                codes::AUTHENTICATION_FAILED,
+                false,
+                ChannelOutcome::NotApplied,
+                "channel config Extension does not match the granted Channel Extension",
+            ));
         }
         if config.module_id != principal.module_id() {
-            return Err(ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "channel config Module does not match the granted Module"));
+            return Err(ChannelError::new(
+                codes::AUTHENTICATION_FAILED,
+                false,
+                ChannelOutcome::NotApplied,
+                "channel config Module does not match the granted Module",
+            ));
         }
         let mut config = config;
         config.transport_account = principal.account().to_string();
@@ -286,10 +351,20 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
     ) -> Result<Self, ChannelError> {
         let principal = ChannelPrincipal::from_authority_grant(authority, grant)?;
         if config.extension_id != principal.extension_id() {
-            return Err(ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "channel config Extension does not match the granted Channel Extension"));
+            return Err(ChannelError::new(
+                codes::AUTHENTICATION_FAILED,
+                false,
+                ChannelOutcome::NotApplied,
+                "channel config Extension does not match the granted Channel Extension",
+            ));
         }
         if config.module_id != principal.module_id() {
-            return Err(ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "channel config Module does not match the granted Module"));
+            return Err(ChannelError::new(
+                codes::AUTHENTICATION_FAILED,
+                false,
+                ChannelOutcome::NotApplied,
+                "channel config Module does not match the granted Module",
+            ));
         }
         let mut config = config;
         config.transport_account = principal.account().to_string();
@@ -316,43 +391,89 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
         };
         if !event.matches_current(&principal, self.config.revision) {
             return IngressOutcome::RejectedBeforeMutation {
-                error: ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "the event is bound to a different authenticated principal, generation, incarnation, graph, or config"),
+                error: ChannelError::new(
+                    codes::AUTHENTICATION_FAILED,
+                    false,
+                    ChannelOutcome::NotApplied,
+                    "the event is bound to a different authenticated principal, generation, incarnation, graph, or config",
+                ),
             };
         }
         // Enforce store/principal equality on every use.
         if principal != self.principal {
             return IngressOutcome::RejectedBeforeMutation {
-                error: ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "the store is bound to a different principal"),
+                error: ChannelError::new(
+                    codes::AUTHENTICATION_FAILED,
+                    false,
+                    ChannelOutcome::NotApplied,
+                    "the store is bound to a different principal",
+                ),
             };
         }
 
-        let inbound = event.clone().into_inbound_event(principal.account().to_string());
-        let intent_key = ids::inbound_ingress_key(principal.account(), &inbound.external_message_id);
+        let inbound = event
+            .clone()
+            .into_inbound_event(principal.account().to_string());
+        if let Err(error) = crate::attachment::validate_attachment_sequence(
+            &inbound.attachments,
+            self.config.max_parts.saturating_sub(1),
+            self.config.max_asset_bytes as u64,
+        ) {
+            return IngressOutcome::RejectedBeforeMutation { error };
+        }
+        let intent_key =
+            ids::inbound_ingress_key(principal.account(), &inbound.external_message_id);
 
         // 2. Pre-replay conflict and prior-rejection binding against the
         //    durable intent: the Channel-local digest includes the ordered
         //    target Pages, so a same-key replay whose targets/order changed
         //    conflicts BEFORE any Core path is reached. The accepted intent
         //    is retained for the full Host-mapping validation on replay.
-        let accepted_pre_intent: Option<crate::intent::ChannelIntent> = match self.store.find_intent(&intent_key) {
+        let accepted_pre_intent: Option<crate::intent::ChannelIntent> = match self
+            .store
+            .find_intent(&intent_key)
+        {
             Ok(Some(intent)) => {
                 if intent.state == IntentState::Rejected {
-                    let code = intent.rejected_code.clone().unwrap_or_else(|| codes::INTERNAL.to_string());
+                    let code = intent
+                        .rejected_code
+                        .clone()
+                        .unwrap_or_else(|| codes::INTERNAL.to_string());
                     return IngressOutcome::RejectedBeforeMutation {
-                        error: ChannelError::new(code, false, ChannelOutcome::NotApplied, "the event key was already durably rejected"),
+                        error: ChannelError::new(
+                            code,
+                            false,
+                            ChannelOutcome::NotApplied,
+                            "the event key was already durably rejected",
+                        ),
                     };
                 }
                 if intent.state == IntentState::Accepted {
                     let current_payload_digest = payload_digest_of(&intent.request_jcs);
                     let current_digest = channel_intent_digest(
-                        principal.account(), principal.extension_id(), principal.module_id(), principal.instance_id(),
-                        principal.generation(), principal.revision(), principal.graph_revision(), principal.graph_digest(),
-                        self.config.revision, &intent.external_event_id, intent.kind,
-                        intent.references_external_event_id.as_deref(), &self.config.target_page_ids,
-                        &current_payload_digest);
+                        principal.account(),
+                        principal.extension_id(),
+                        principal.module_id(),
+                        principal.instance_id(),
+                        principal.generation(),
+                        principal.revision(),
+                        principal.graph_revision(),
+                        principal.graph_digest(),
+                        self.config.revision,
+                        &intent.external_event_id,
+                        intent.kind,
+                        intent.references_external_event_id.as_deref(),
+                        &self.config.target_page_ids,
+                        &current_payload_digest,
+                    );
                     if current_digest != intent.digest {
                         return IngressOutcome::RejectedBeforeMutation {
-                            error: ChannelError::new(codes::OPERATION_CONFLICT, false, ChannelOutcome::NotApplied, "the same event key now carries different pages/content/relation"),
+                            error: ChannelError::new(
+                                codes::OPERATION_CONFLICT,
+                                false,
+                                ChannelOutcome::NotApplied,
+                                "the same event key now carries different pages/content/relation",
+                            ),
                         };
                     }
                     Some(intent)
@@ -363,6 +484,59 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
             Ok(None) => None,
             Err(e) => return IngressOutcome::RejectedBeforeMutation { error: e },
         };
+
+        // An accepted attachment intent already contains the final Asset
+        // draft. Validate the current Host mapping directly instead of
+        // rebuilding the pre-import placeholder and accidentally conflicting
+        // with the final digest or re-importing an accepted attachment.
+        if let Some(accepted_intent) = accepted_pre_intent
+            .as_ref()
+            .filter(|intent| !intent.attachments.is_empty())
+        {
+            let mut adapter = HostIngressCoreAdapter::new(
+                &mut self.host,
+                self.authority,
+                self.grant,
+                &mut self.store,
+                self.config.revision,
+            );
+            return match adapter.status_mapping_for_event(&inbound.external_message_id) {
+                Ok(Some(mapping)) => {
+                    match crate::host_adapter::validate_host_mapping(accepted_intent, &mapping) {
+                        Ok(()) => IngressOutcome::IdempotentReplay {
+                            block_id: mapping.block_id,
+                        },
+                        Err(error) => IngressOutcome::RejectedBeforeMutation { error },
+                    }
+                }
+                Ok(None) => IngressOutcome::RejectedBeforeMutation {
+                    error: ChannelError::new(
+                        codes::LEDGER_CORRUPT,
+                        false,
+                        ChannelOutcome::NotApplied,
+                        "the accepted attachment intent has no durable Host mapping",
+                    ),
+                },
+                Err(CoreIngressError::Rejected { code }) => {
+                    IngressOutcome::RejectedBeforeMutation {
+                        error: ChannelError::new(
+                            code,
+                            false,
+                            ChannelOutcome::NotApplied,
+                            "current authority rejected the attachment replay",
+                        ),
+                    }
+                }
+                Err(_) => IngressOutcome::RejectedBeforeMutation {
+                    error: ChannelError::new(
+                        codes::INTERNAL,
+                        true,
+                        ChannelOutcome::Unknown,
+                        "attachment replay status is unavailable",
+                    ),
+                },
+            };
+        }
 
         // 3. The accepted pipeline runs with a fresh adapter over the owned
         //    store. Suppress a durable sent-transport echo before Host/Core
@@ -384,12 +558,11 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
                 &mut self.store,
                 self.config.revision,
             );
-            let outcome = process_event_with_assets(
+            let outcome = process_event_with_pending_attachments(
                 &self.config,
                 &*self.clock,
                 &mut ledger,
                 &mut adapter,
-                &mut *self.assets,
                 &inbound,
             );
             (outcome, ledger)
@@ -410,45 +583,107 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
                     );
                     match adapter.status_mapping_for_event(&inbound.external_message_id) {
                         Ok(Some(mapping)) => {
-                            match crate::host_adapter::validate_host_mapping(&accepted_intent, &mapping) {
-                                Ok(()) if mapping.block_id == block_id => IngressOutcome::IdempotentReplay { block_id },
+                            match crate::host_adapter::validate_host_mapping(
+                                &accepted_intent,
+                                &mapping,
+                            ) {
+                                Ok(()) if mapping.block_id == block_id => {
+                                    IngressOutcome::IdempotentReplay { block_id }
+                                }
                                 Ok(()) => IngressOutcome::RejectedBeforeMutation {
-                                    error: ChannelError::new(codes::LEDGER_CORRUPT, false, ChannelOutcome::NotApplied, "replayed block identity does not match the durable Host mapping"),
+                                    error: ChannelError::new(
+                                        codes::LEDGER_CORRUPT,
+                                        false,
+                                        ChannelOutcome::NotApplied,
+                                        "replayed block identity does not match the durable Host mapping",
+                                    ),
                                 },
-                                Err(validation_error) => IngressOutcome::RejectedBeforeMutation { error: validation_error },
+                                Err(validation_error) => IngressOutcome::RejectedBeforeMutation {
+                                    error: validation_error,
+                                },
                             }
                         }
                         Ok(None) => IngressOutcome::RejectedBeforeMutation {
-                            error: ChannelError::new(codes::LEDGER_CORRUPT, false, ChannelOutcome::NotApplied, "the accepted Channel row has no durable Host mapping"),
+                            error: ChannelError::new(
+                                codes::LEDGER_CORRUPT,
+                                false,
+                                ChannelOutcome::NotApplied,
+                                "the accepted Channel row has no durable Host mapping",
+                            ),
                         },
-                        Err(CoreIngressError::Rejected { code }) => IngressOutcome::RejectedBeforeMutation {
-                            error: ChannelError::new(code, false, ChannelOutcome::NotApplied, "the current authority/grant revalidation rejected the replay"),
-                        },
+                        Err(CoreIngressError::Rejected { code }) => {
+                            IngressOutcome::RejectedBeforeMutation {
+                                error: ChannelError::new(
+                                    code,
+                                    false,
+                                    ChannelOutcome::NotApplied,
+                                    "the current authority/grant revalidation rejected the replay",
+                                ),
+                            }
+                        }
                         Err(_) => IngressOutcome::RejectedBeforeMutation {
-                            error: ChannelError::new(codes::INTERNAL, false, ChannelOutcome::NotApplied, "the current authority/grant revalidation outcome is unknown"),
+                            error: ChannelError::new(
+                                codes::INTERNAL,
+                                false,
+                                ChannelOutcome::NotApplied,
+                                "the current authority/grant revalidation outcome is unknown",
+                            ),
                         },
                     }
                 }
                 None => IngressOutcome::RejectedBeforeMutation {
-                    error: ChannelError::new(codes::INTERNAL, false, ChannelOutcome::NotApplied, "accepted intent row vanished before replay validation"),
+                    error: ChannelError::new(
+                        codes::INTERNAL,
+                        false,
+                        ChannelOutcome::NotApplied,
+                        "accepted intent row vanished before replay validation",
+                    ),
                 },
             },
             other => other,
         };
-        // WP-013B assets-pending durability: persist the `prepared` intent
-        // with its ordered attachment import records BEFORE returning, so a
-        // restart resumes the imports through status-first recovery (never a
-        // blind re-import and never a fabricated reference).
-        if matches!(outcome, IngressOutcome::SubmissionPending)
+        // Attachment intents are completely persisted before the first real
+        // Asset import. The same durable state-machine method then starts each
+        // ordered import; restart uses that method in status mode.
+        if !inbound.attachments.is_empty()
+            && matches!(outcome, IngressOutcome::SubmissionPending)
             && ledger
                 .inbound_entry(&inbound.account, &inbound.external_message_id)
-                .map(|entry| entry.state == InboundState::AssetsPending)
-                .unwrap_or(false)
+                .is_some_and(|entry| entry.state == InboundState::AssetsPending)
         {
-            if let Err(error) = self.persist_attachment_prepared_intent(&principal, &inbound, &ledger)
+            if let Err(error) =
+                self.persist_attachment_prepared_intent(&principal, &inbound, &ledger)
             {
                 return IngressOutcome::RejectedBeforeMutation { error };
             }
+            let intent = match self.store.find_intent(&intent_key) {
+                Ok(Some(intent)) => intent,
+                Ok(None) => return IngressOutcome::SubmissionPending,
+                Err(error) => return IngressOutcome::RejectedBeforeMutation { error },
+            };
+            return match self.resume_attachment_intent(intent, true) {
+                Ok(AttachmentProgress::Pending) => IngressOutcome::SubmissionPending,
+                Ok(AttachmentProgress::Committed {
+                    block_id,
+                    idempotent,
+                    ingress_id,
+                }) => IngressOutcome::Committed {
+                    block_id,
+                    idempotent,
+                    ingress_id,
+                },
+                Ok(AttachmentProgress::Rejected { code }) => {
+                    IngressOutcome::RejectedBeforeMutation {
+                        error: ChannelError::new(
+                            code,
+                            false,
+                            ChannelOutcome::NotApplied,
+                            "the attachment intent was durably refused",
+                        ),
+                    }
+                }
+                Err(error) => IngressOutcome::RejectedBeforeMutation { error },
+            };
         }
         outcome
     }
@@ -506,36 +741,33 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
                 self.config.operation_deadline_seconds as i64,
             ),
         };
-        let facts = crate::host_adapter::channel_facts_from_draft(&request.draft).map_err(|error| {
-            ChannelError::new(
-                codes::INTERNAL,
-                false,
-                ChannelOutcome::NotApplied,
-                format!("attachment intent facts unavailable: {error:?}"),
-            )
-        })?;
-        let mut intent = crate::host_adapter::prepare_intent(
-            principal,
-            self.config.revision,
-            &request,
-            &facts,
-        )?;
+        let facts =
+            crate::host_adapter::channel_facts_from_draft(&request.draft).map_err(|error| {
+                ChannelError::new(
+                    codes::INTERNAL,
+                    false,
+                    ChannelOutcome::NotApplied,
+                    format!("attachment intent facts unavailable: {error:?}"),
+                )
+            })?;
+        let mut intent =
+            crate::host_adapter::prepare_intent(principal, self.config.revision, &request, &facts)?;
         intent.attachments = entry.attachments.clone();
         intent.request_jcs = entry.request_jcs.clone();
         intent.payload_digest = crate::host_adapter::payload_digest_of(&intent.request_jcs);
         self.store.write_prepared(&intent)
     }
 
-    /// Reconcile every durable `prepared` intent through `status` first, with
-    /// NO event redelivery. Restores the terminal ledger/state exactly once.
-    /// Returns the number of intents left unresolved.
-    /// Reconcile every durable `prepared` intent through `status` first, with
-    /// NO event redelivery. Restores the terminal ledger/state exactly once
-    /// (attachment intents resume status-first through the injected Asset
-    /// import seam, never a blind re-import). Returns the number of intents
-    /// left unresolved.
+    /// Reconcile every durable `prepared` intent through status first with no
+    /// event redelivery. Attachment intents use the same state machine as
+    /// initial import, switched to Asset status calls only.
     pub fn reconcile(&mut self) -> Result<usize, ChannelError> {
-        let pending_keys: Vec<String> = self.store.list_pending()?.into_iter().map(|i| i.intent_key).collect();
+        let pending_keys: Vec<String> = self
+            .store
+            .list_pending()?
+            .into_iter()
+            .map(|i| i.intent_key)
+            .collect();
         let mut remaining = 0;
         for intent_key in pending_keys {
             let intent = match self.store.find_intent(&intent_key)? {
@@ -548,8 +780,10 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
             // explicit; when every required asset is AVAILABLE the final
             // Asset-bearing draft is submitted and committed exactly once.
             if !intent.attachments.is_empty() {
-                let resolved = self.resume_attachment_intent(intent)?;
-                if !resolved {
+                if matches!(
+                    self.resume_attachment_intent(intent, false)?,
+                    AttachmentProgress::Pending
+                ) {
                     remaining += 1;
                 }
                 continue;
@@ -570,9 +804,17 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
                         // must never be adopted as success (the row stays
                         // Prepared and reconcile fails closed).
                         if crate::host_adapter::validate_host_mapping(&intent, &mapping).is_err() {
-                            return Err(ChannelError::new(codes::OPERATION_CONFLICT, false, ChannelOutcome::NotApplied, "host mapping conflicts with the prepared intent"));
+                            return Err(ChannelError::new(
+                                codes::OPERATION_CONFLICT,
+                                false,
+                                ChannelOutcome::NotApplied,
+                                "host mapping conflicts with the prepared intent",
+                            ));
                         }
-                        matches!(adapter.commit_outcome(&intent_key, Some(&mapping.block_id), None), Ok(()))
+                        matches!(
+                            adapter.commit_outcome(&intent_key, Some(&mapping.block_id), None),
+                            Ok(())
+                        )
                     }
                     Ok(None) => {
                         let request = rebuild_request(&intent, &self.config, &*self.clock)?;
@@ -591,63 +833,124 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
         Ok(remaining)
     }
 
-    /// Resume one `prepared` intent carrying attachment import records:
-    /// status-first through the injected seam per attachment, then commit the
-    /// final Asset-bearing draft when every required asset is AVAILABLE. A
-    /// refused attachment durably rejects the event (never a fabricated
-    /// reference); a still-pending import keeps the row `prepared`. Returns
-    /// whether the intent reached a terminal state.
-    fn resume_attachment_intent(&mut self, mut intent: crate::intent::ChannelIntent) -> Result<bool, ChannelError> {
-        let records = intent.attachments.clone();
-        let mut refused: Option<String> = None;
-        let mut resolved_records: Vec<AttachmentRecord> = Vec::new();
-        let mut all_available = true;
-        for record in &records {
-            if record.state == AttachmentState::Pending {
-                let request = AttachmentImportRequest::new(
-                    &intent.account,
-                    &intent.external_event_id,
-                    &record.attachment,
-                );
-                match self.assets.status(&request) {
-                    Ok(AttachmentImportStatus::Available(available)) => {
-                        if available.media_type != record.attachment.declared_media_type {
-                            // A forged declared media type is an explicit
-                            // refusal, never a relabel of active content.
-                            refused = Some(codes::MALFORMED_EVENT.to_string());
-                            break;
-                        }
+    /// Drive the sole durable attachment state machine. `start_imports`
+    /// selects idempotent Asset import for the first pass; recovery selects
+    /// status. Every ordered record is processed even after a refusal or seam
+    /// error, then the complete upgraded sequence is persisted exactly once.
+    fn resume_attachment_intent(
+        &mut self,
+        mut intent: crate::intent::ChannelIntent,
+        start_imports: bool,
+    ) -> Result<AttachmentProgress, ChannelError> {
+        crate::attachment::validate_attachment_sequence(
+            &intent
+                .attachments
+                .iter()
+                .map(|record| record.attachment.clone())
+                .collect::<Vec<_>>(),
+            self.config.max_parts.saturating_sub(1),
+            self.config.max_asset_bytes as u64,
+        )?;
+
+        let mut resolved_records = Vec::with_capacity(intent.attachments.len());
+        let mut first_refusal = None;
+        for record in &intent.attachments {
+            match record.state {
+                AttachmentState::Available => {
+                    let valid = record.available.as_ref().is_some_and(|available| {
+                        crate::attachment::validate_available_attachment(
+                            &record.attachment,
+                            available,
+                            self.config.max_asset_bytes as u64,
+                        )
+                        .is_ok()
+                    });
+                    if valid {
+                        resolved_records.push(record.clone());
+                    } else {
+                        let code = codes::MALFORMED_EVENT.to_string();
+                        first_refusal.get_or_insert_with(|| code.clone());
                         resolved_records.push(AttachmentRecord {
                             attachment: record.attachment.clone(),
-                            state: AttachmentState::Available,
-                            available: Some(available),
-                            refused_code: None,
+                            state: AttachmentState::Refused,
+                            available: None,
+                            refused_code: Some(code),
                         });
                     }
-                    Ok(AttachmentImportStatus::Pending) => {
-                        resolved_records.push(record.clone());
-                        all_available = false;
-                    }
-                    Ok(AttachmentImportStatus::Refused { code }) => {
-                        refused = Some(code);
-                        break;
-                    }
-                    Err(error) => {
-                        all_available = false;
-                        resolved_records.push(record.clone());
-                        let _ = error;
-                        break;
+                }
+                AttachmentState::Refused => {
+                    let code = record
+                        .refused_code
+                        .clone()
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| codes::INTERNAL.to_string());
+                    first_refusal.get_or_insert_with(|| code.clone());
+                    let mut refused = record.clone();
+                    refused.available = None;
+                    refused.refused_code = Some(code);
+                    resolved_records.push(refused);
+                }
+                AttachmentState::Pending => {
+                    let request = AttachmentImportRequest::new(
+                        &intent.account,
+                        &intent.external_event_id,
+                        &record.attachment,
+                    );
+                    let status = if start_imports {
+                        self.assets.import(&request)
+                    } else {
+                        self.assets.status(&request)
+                    };
+                    match status {
+                        Ok(AttachmentImportStatus::Available(available)) => {
+                            match crate::attachment::validate_available_attachment(
+                                &record.attachment,
+                                &available,
+                                self.config.max_asset_bytes as u64,
+                            ) {
+                                Ok(()) => resolved_records.push(AttachmentRecord {
+                                    attachment: record.attachment.clone(),
+                                    state: AttachmentState::Available,
+                                    available: Some(available),
+                                    refused_code: None,
+                                }),
+                                Err(_) => {
+                                    let code = codes::MALFORMED_EVENT.to_string();
+                                    first_refusal.get_or_insert_with(|| code.clone());
+                                    resolved_records.push(AttachmentRecord {
+                                        attachment: record.attachment.clone(),
+                                        state: AttachmentState::Refused,
+                                        available: None,
+                                        refused_code: Some(code),
+                                    });
+                                }
+                            }
+                        }
+                        Ok(AttachmentImportStatus::Pending) | Err(_) => {
+                            resolved_records.push(record.clone());
+                        }
+                        Ok(AttachmentImportStatus::Refused { code }) => {
+                            let code = if code.is_empty() {
+                                codes::INTERNAL.to_string()
+                            } else {
+                                code
+                            };
+                            first_refusal.get_or_insert_with(|| code.clone());
+                            resolved_records.push(AttachmentRecord {
+                                attachment: record.attachment.clone(),
+                                state: AttachmentState::Refused,
+                                available: None,
+                                refused_code: Some(code),
+                            });
+                        }
                     }
                 }
-            } else if record.state == AttachmentState::Available {
-                resolved_records.push(record.clone());
-            } else {
-                refused = Some(record.refused_code.clone().unwrap_or_else(|| codes::INTERNAL.to_string()));
-                break;
             }
         }
-        if let Some(code) = refused {
-            // Durable explicit rejection; nothing resubmits.
+
+        intent.attachments = resolved_records;
+        self.store.write_prepared(&intent)?;
+        if let Some(code) = first_refusal {
             let mut adapter = HostIngressCoreAdapter::new(
                 &mut self.host,
                 self.authority,
@@ -665,77 +968,130 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
                         format!("attachment refusal durability failed: {error:?}"),
                     )
                 })?;
-            return Ok(true);
+            return Ok(AttachmentProgress::Rejected { code });
         }
-        if !all_available {
-            intent.attachments = resolved_records;
-            self.store.write_prepared(&intent)?;
-            return Ok(false);
-        }
-        // Every required asset is AVAILABLE: append the ordered Asset parts to
-        // the placeholder draft and submit exactly once, then commit terminal.
-        let parsed = serde_json::from_str::<serde_json::Value>(&intent.request_jcs).map_err(
-            |_| ChannelError::new(codes::INTERNAL, false, ChannelOutcome::NotApplied, "attachment intent placeholder draft is not JSON"),
-        )?;
-        let mut draft_value = parsed;
-        let mut parts = draft_value
-            .get("parts")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        for record in resolved_records
+        if intent
+            .attachments
             .iter()
-            .filter(|record| record.state == AttachmentState::Available)
+            .any(|record| record.state != AttachmentState::Available)
         {
-            if let Some(available) = &record.available {
+            return Ok(AttachmentProgress::Pending);
+        }
+
+        let mut draft_value = serde_json::from_str::<serde_json::Value>(&intent.request_jcs)
+            .map_err(|_| {
+                ChannelError::new(
+                    codes::INTERNAL,
+                    false,
+                    ChannelOutcome::NotApplied,
+                    "attachment intent draft is not JSON",
+                )
+            })?;
+        let parts = draft_value
+            .get_mut("parts")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or_else(|| {
+                ChannelError::new(
+                    codes::INTERNAL,
+                    false,
+                    ChannelOutcome::NotApplied,
+                    "attachment intent draft has no parts array",
+                )
+            })?;
+        let existing_assets = parts
+            .iter()
+            .filter(|part| part.get("kind").and_then(serde_json::Value::as_str) == Some("asset"))
+            .count();
+        if existing_assets == 0 {
+            for record in &intent.attachments {
+                let available = record.available.as_ref().expect("all available checked");
                 let mut part = serde_json::json!({
                     "kind": "asset",
-                    "asset_id": available.asset_id,
-                    "media_type": available.media_type,
+                    "asset_id": available.asset_ref.asset_id,
+                    "media_type": available.asset_ref.media_type,
                 });
                 if let Some(view) = &available.view {
                     part["view"] = serde_json::to_value(view).expect("canonical crop serializes");
                 }
                 parts.push(part);
             }
+        } else {
+            let expected: Vec<serde_json::Value> = intent
+                .attachments
+                .iter()
+                .map(|record| {
+                    let available = record.available.as_ref().expect("all available checked");
+                    let mut part = serde_json::json!({
+                        "kind": "asset",
+                        "asset_id": available.asset_ref.asset_id,
+                        "media_type": available.asset_ref.media_type,
+                    });
+                    if let Some(view) = &available.view {
+                        part["view"] =
+                            serde_json::to_value(view).expect("canonical crop serializes");
+                    }
+                    part
+                })
+                .collect();
+            let actual: Vec<serde_json::Value> = parts
+                .iter()
+                .filter(|part| {
+                    part.get("kind").and_then(serde_json::Value::as_str) == Some("asset")
+                })
+                .cloned()
+                .collect();
+            if actual != expected {
+                return Err(ChannelError::new(
+                    codes::OPERATION_CONFLICT,
+                    false,
+                    ChannelOutcome::NotApplied,
+                    "durable attachment draft conflicts with available Asset results",
+                ));
+            }
         }
-        draft_value["parts"] = serde_json::Value::Array(parts);
-        let draft = dolly_canonical_json::CanonicalJsonValue::try_from(draft_value).map_err(|_| {
-            ChannelError::new(codes::INTERNAL, false, ChannelOutcome::NotApplied, "final attachment draft is not canonical JSON")
-        })?;
+
+        let draft =
+            dolly_canonical_json::CanonicalJsonValue::try_from(draft_value).map_err(|_| {
+                ChannelError::new(
+                    codes::INTERNAL,
+                    false,
+                    ChannelOutcome::NotApplied,
+                    "final attachment draft is not canonical JSON",
+                )
+            })?;
         let request = IngressSubmitRequest {
             operation_id: ids::operation_id(&intent.account, &intent.external_event_id, 2),
             module_id: intent.module_id.clone(),
             idempotency_key: intent.intent_key.clone(),
-            draft: draft.clone(),
+            draft,
             target_page_ids: intent.target_page_ids.clone(),
             deadline: crate::clock::timestamp_plus_seconds(
                 self.clock.now().as_str(),
                 self.config.operation_deadline_seconds as i64,
             ),
         };
-        // Re-derive the FINAL intent (digest bound to the Asset-bearing draft)
-        // and persist it BEFORE the Host submit, so the seam's submit
-        // idempotency comparison sees the byte-identical request and never a
-        // digest conflict against the placeholder draft. A lost response then
-        // leaves the final prepared intent for the next status-first pass
-        // (no duplicate effect, no fabricated reference).
-        let facts = crate::host_adapter::channel_facts_from_draft(&request.draft).map_err(|error| {
-            ChannelError::new(
-                codes::INTERNAL,
-                false,
-                ChannelOutcome::NotApplied,
-                format!("final attachment draft facts unavailable: {error:?}"),
-            )
-        })?;
+        let facts =
+            crate::host_adapter::channel_facts_from_draft(&request.draft).map_err(|error| {
+                ChannelError::new(
+                    codes::INTERNAL,
+                    false,
+                    ChannelOutcome::NotApplied,
+                    format!("final attachment draft facts unavailable: {error:?}"),
+                )
+            })?;
         let mut final_intent = crate::host_adapter::prepare_intent(
             &self.principal,
             self.config.revision,
             &request,
             &facts,
         )?;
-        final_intent.attachments = resolved_records;
-        self.store.replace_pending_attachment_intent(&final_intent)?;
+        final_intent.attachments = intent.attachments.clone();
+        if final_intent.digest != intent.digest || final_intent.request_jcs != intent.request_jcs {
+            self.store
+                .replace_pending_attachment_intent(&final_intent)?;
+        } else {
+            final_intent = intent;
+        }
         let submitted = {
             let mut adapter = HostIngressCoreAdapter::new(
                 &mut self.host,
@@ -747,7 +1103,7 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
             adapter.submit(&request)
         };
         match submitted {
-            Ok(IngressSubmitReceipt::Committed { commit, .. }) => {
+            Ok(IngressSubmitReceipt::Committed { idempotent, commit }) => {
                 let mut adapter = HostIngressCoreAdapter::new(
                     &mut self.host,
                     self.authority,
@@ -765,34 +1121,47 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
                             format!("attachment intent terminal commit failed: {error:?}"),
                         )
                     })?;
-                Ok(true)
+                Ok(AttachmentProgress::Committed {
+                    block_id: commit.block_id,
+                    idempotent,
+                    ingress_id: commit.ingress_id,
+                })
             }
-            _ => {
-                // Unknown/lost: the FINAL prepared intent stays (never a
-                // duplicate effect) for the next status-first pass.
-                Ok(false)
-            }
+            _ => Ok(AttachmentProgress::Pending),
         }
     }
 }
-
-
 
 fn rebuild_request(
     intent: &crate::intent::ChannelIntent,
     config: &ChannelConfig,
     clock: &dyn Clock,
 ) -> Result<IngressSubmitRequest, ChannelError> {
-    let parsed = serde_json::from_str::<serde_json::Value>(&intent.request_jcs)
-        .map_err(|_| ChannelError::new(codes::INTERNAL, false, ChannelOutcome::NotApplied, "prepared intent draft is not JSON"))?;
-    let draft = dolly_canonical_json::CanonicalJsonValue::try_from(parsed)
-        .map_err(|_| ChannelError::new(codes::INTERNAL, false, ChannelOutcome::NotApplied, "prepared intent draft is not canonical JSON"))?;
+    let parsed = serde_json::from_str::<serde_json::Value>(&intent.request_jcs).map_err(|_| {
+        ChannelError::new(
+            codes::INTERNAL,
+            false,
+            ChannelOutcome::NotApplied,
+            "prepared intent draft is not JSON",
+        )
+    })?;
+    let draft = dolly_canonical_json::CanonicalJsonValue::try_from(parsed).map_err(|_| {
+        ChannelError::new(
+            codes::INTERNAL,
+            false,
+            ChannelOutcome::NotApplied,
+            "prepared intent draft is not canonical JSON",
+        )
+    })?;
     Ok(IngressSubmitRequest {
         operation_id: ids::operation_id(&intent.account, &intent.external_event_id, 2),
         module_id: intent.module_id.clone(),
         idempotency_key: intent.intent_key.clone(),
         draft,
         target_page_ids: intent.target_page_ids.clone(),
-        deadline: crate::clock::timestamp_plus_seconds(clock.now().as_str(), config.operation_deadline_seconds as i64),
+        deadline: crate::clock::timestamp_plus_seconds(
+            clock.now().as_str(),
+            config.operation_deadline_seconds as i64,
+        ),
     })
 }

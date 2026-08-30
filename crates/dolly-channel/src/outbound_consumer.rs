@@ -25,12 +25,16 @@ use crate::clock::Clock;
 use crate::config::ChannelConfig;
 use crate::error::{ChannelError, ChannelOutcome, codes};
 use crate::ledger::{ChannelLedger, OutboundEntry, OutboundState};
-use crate::outbound::{SendDispatchResult, build_prepared_entry, transport_and_settle};
+use crate::outbound::{
+    SendDispatchResult, build_prepared_entry, prepare_transport_request,
+    settle_pre_effect_rejection, transport_and_settle, validate_prepared_transport_for_send,
+};
 use crate::outbound_committed::CommittedSendAction;
 use crate::outbound_queue::OutboundQueueGate;
 use crate::principal::ChannelPrincipal;
 use crate::store::{
-    DispatchClaim, DurableOutboundRecord, OutboundPreparedOutcome, SqliteChannelStore,
+    DispatchClaim, DurableOutboundRecord, OutboundPreparedOutcome, QueuedRecordUpdate,
+    SqliteChannelStore,
 };
 /// The one currently executing activation and its frozen manifest.
 struct AuthoritativeManifest {
@@ -505,7 +509,9 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 || manifest.get("config_revision").and_then(Value::as_i64)
                     != Some(self.config.revision)
                 || manifest.get("descriptor_revision").and_then(Value::as_i64)
-                    != descriptor.get("descriptor_revision").and_then(Value::as_i64)
+                    != descriptor
+                        .get("descriptor_revision")
+                        .and_then(Value::as_i64)
                 || manifest.get("effective_config") != Some(&frozen_config)
                 || manifest
                     .get("effective_config_digest")
@@ -582,23 +588,6 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 ChannelOutcome::NotApplied,
                 "the manifest that authorized this send is no longer current",
             ));
-        }
-        Ok(())
-    }
-    /// Re-validate, after queue/blocking work, that every asset lease behind
-    /// the committed Action's prepared pieces is still live. An invalidated,
-    /// stale, or revoked lease fails closed before the transport is reached.
-    fn revalidate_asset_leases(
-        &mut self,
-        committed: &CommittedSendAction,
-    ) -> Result<(), ChannelError> {
-        let proofs: Vec<crate::asset::AssetLeaseProof> = committed
-            .pieces
-            .iter()
-            .filter_map(|piece| piece.asset.as_ref().map(|asset| asset.lease_proof.clone()))
-            .collect();
-        if !proofs.is_empty() {
-            self.asset_preparation.revalidate_leases(&proofs)?;
         }
         Ok(())
     }
@@ -883,7 +872,6 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                     &self.principal,
                     &self.config,
                     &ledger,
-                    &mut *self.asset_preparation,
                 ) {
                     Ok(committed) => actions.push(committed),
                     Err(error) => {
@@ -904,12 +892,12 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
 
     /// Status-first restart/lost-response recovery of the durable outbound
     /// ledger: never re-dispatches a row that may have reached the
-    /// transport, never reports false success, never age-guesses to
-    /// `unknown`. Every `Dispatched` row is settled by calling
-    /// [`ChannelTransport::status`] with the original idempotency key: the
-    /// exact transport-side outcome (confirmed/partial/rejected/unknown)
-    /// settles the terminal state. `TransportStatusResult::Unknown` leaves
-    /// the row `Dispatched` for the next reconcile (never age-promoted).
+    /// transport and never reports false success. Every `Dispatched` row is
+    /// settled by calling
+    /// [`ChannelTransport::status`] with the original idempotency key. A
+    /// provider `Unknown` is retried status-first until the configured durable
+    /// unknown deadline, then freezes the accepted terminal unknown result;
+    /// it is never lease-gated or blind-resent.
     /// Returns the number of durable rows still unresolved.
     pub fn reconcile(&mut self) -> Result<usize, ChannelError> {
         let pending = self.store.list_pending_outbound()?;
@@ -933,7 +921,29 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
             let status = self.transport.status(&request);
             self.effect_ts("after_status");
             self.revalidate_durable_record(&record)?;
-            let Some(entry) = self.settle_status(&record, status)? else {
+            let stale_unknown = matches!(status, crate::transport::TransportStatusResult::Unknown)
+                && record
+                    .entry
+                    .dispatched_at
+                    .as_deref()
+                    .is_some_and(|dispatched_at| {
+                        crate::clock::timestamp_total_micros(self.clock.now().as_str())
+                            - crate::clock::timestamp_total_micros(dispatched_at)
+                            >= self.config.outbound_limits.unknown_after_seconds as i64 * 1_000_000
+                    });
+            let entry = if stale_unknown {
+                let mut ledger = self.store.project_ledger()?;
+                crate::outbound::settle_recovered_unknown(
+                    &self.config,
+                    &mut ledger,
+                    &record.outbound_key,
+                    self.clock.now().as_str(),
+                );
+                ledger.outbound_entry(&record.outbound_key).cloned()
+            } else {
+                self.settle_status(&record, status)?
+            };
+            let Some(entry) = entry else {
                 remaining += 1;
                 continue;
             };
@@ -995,18 +1005,6 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
             account: self.principal.account().to_string(),
             entry,
         }
-    }
-
-    /// The durable record for the settled terminal entry (same authority and
-    /// committed Action bytes as the original).
-    fn build_terminal_record(
-        &self,
-        committed: &CommittedSendAction,
-        entry: &OutboundEntry,
-    ) -> DurableOutboundRecord {
-        let mut record = self.build_prepared_record(committed);
-        record.entry = entry.clone();
-        record
     }
 
     /// Phase 1: durable admission for one committed Action (insert/prepare +
@@ -1074,12 +1072,12 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 }));
             }
         }
-        // Fresh execution authority after the queue wait, then re-validate
-        // every prepared asset lease: lease invalidation after queue/blocking
-        // work fails closed with no transport effect.
+        // Fresh execution authority after the queue wait. Asset payload
+        // preparation happens only after durable admission and before the
+        // dispatch claim, so any preparation failure can be frozen durably as
+        // a zero-effect terminal rejection.
         self.effect_ts("after_queue_wait");
         self.revalidate_committed_action(committed)?;
-        self.revalidate_asset_leases(committed)?;
         if crate::clock::timestamp_total_micros(self.clock.now().as_str())
             >= crate::clock::timestamp_total_micros(caller_deadline)
         {
@@ -1096,68 +1094,182 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
         Ok(AdmitResult::Admitted(committed.clone()))
     }
 
-    /// Phase 2: claim the dispatch CAS for one durably-Queued row and drive
-    /// transport + settle. Exactly one concurrent claimant wins; the winner
-    /// is the only caller of the transport. Terminal commit releases durable
-    /// occupancy and wakes every waiting admission (C).
+    /// Phase 2: complete Asset payload preparation, persist its proof, then
+    /// claim dispatch and send the already-composed request. No Asset service
+    /// or read call exists after the claim.
     fn dispatch_admitted(
         &mut self,
         ledger: &mut ChannelLedger,
         committed: &CommittedSendAction,
-        _durable: &DurableOutboundRecord,
+        durable: &DurableOutboundRecord,
     ) -> Result<ConsumerOutcome, ChannelError> {
         self.revalidate_committed_action(committed)?;
-        let now = self.clock.now().as_str().to_string();
-        let dispatch_claim = self.store.claim_dispatch(&committed.action.action_id, &now);
-        match dispatch_claim {
-            Ok(DispatchClaim::Won(_won_record)) => {
-                // SQLite lock acquisition and the dispatch compare-and-swap
-                // are blocking. Recheck the same current manifest after the
-                // claim and immediately before the transport send.
+        self.effect_ts("before_asset_prepare");
+        let prepared = match prepare_transport_request(
+            &self.config,
+            &mut *self.asset_preparation,
+            &committed.action.action_id,
+            durable.entry.idempotency_key.clone(),
+            &committed.session_id,
+            &durable.entry.pieces,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                ledger
+                    .outbound
+                    .entry(committed.action.action_id.clone())
+                    .or_insert_with(|| durable.entry.clone());
+                let _ = settle_pre_effect_rejection(
+                    ledger,
+                    &committed.action.action_id,
+                    self.clock.now().as_str(),
+                    error,
+                );
+                let entry = ledger
+                    .outbound_entry(&committed.action.action_id)
+                    .cloned()
+                    .expect("pre-effect rejection entry");
+                let mut rejection = durable.clone();
+                rejection.entry = entry.clone();
+                return match self
+                    .store
+                    .replace_queued_before_dispatch(durable, &rejection)?
+                {
+                    QueuedRecordUpdate::Updated => {
+                        self.gate.wake_all();
+                        Ok(ConsumerOutcome::Terminal {
+                            action_id: committed.action.action_id.clone(),
+                            state: entry.state,
+                            result_jcs: entry.result_jcs.unwrap_or_default(),
+                        })
+                    }
+                    QueuedRecordUpdate::AlreadyTerminal { state, result_jcs } => {
+                        Ok(ConsumerOutcome::Terminal {
+                            action_id: committed.action.action_id.clone(),
+                            state,
+                            result_jcs: result_jcs.unwrap_or_default(),
+                        })
+                    }
+                    QueuedRecordUpdate::AlreadyDispatched | QueuedRecordUpdate::LostRace => {
+                        Ok(ConsumerOutcome::Pending {
+                            action_id: committed.action.action_id.clone(),
+                        })
+                    }
+                };
+            }
+        };
+        self.effect_ts("after_asset_prepare");
+        self.revalidate_committed_action(committed)?;
+
+        // Persist only the exact proof/status identity; `prepared.request`
+        // retains the ephemeral bytes in memory.
+        let mut prepared_record = durable.clone();
+        prepared_record.entry.pieces = prepared.durable_pieces.clone();
+        match self
+            .store
+            .replace_queued_before_dispatch(durable, &prepared_record)?
+        {
+            QueuedRecordUpdate::Updated => {}
+            QueuedRecordUpdate::AlreadyTerminal { state, result_jcs } => {
+                return Ok(ConsumerOutcome::Terminal {
+                    action_id: committed.action.action_id.clone(),
+                    state,
+                    result_jcs: result_jcs.unwrap_or_default(),
+                });
+            }
+            QueuedRecordUpdate::AlreadyDispatched | QueuedRecordUpdate::LostRace => {
+                return Ok(ConsumerOutcome::Pending {
+                    action_id: committed.action.action_id.clone(),
+                });
+            }
+        }
+        ledger.outbound.insert(
+            committed.action.action_id.clone(),
+            prepared_record.entry.clone(),
+        );
+
+        let claim_time = self.clock.now().as_str().to_string();
+        match self
+            .store
+            .claim_dispatch(&committed.action.action_id, &claim_time)
+        {
+            Ok(DispatchClaim::Won(won_record)) => {
+                ledger
+                    .outbound
+                    .insert(committed.action.action_id.clone(), won_record.entry.clone());
+                // Asset payload acquisition is complete. The accepted
+                // authority fence runs once after the claim; any refusal is
+                // frozen as zero-effect terminal. No later step reads Asset.
                 self.effect_ts("after_dispatch_cas");
-                self.revalidate_committed_action(committed)?;
-                // The dispatch compare-and-swap is blocking; re-validate every
-                // prepared asset lease immediately before the transport send.
-                self.revalidate_asset_leases(committed)?;
-                // This caller won the CAS: drive the transport + settle.
-                if ledger.outbound_entry(&committed.action.action_id).is_none() {
-                    let entry = build_prepared_entry(
-                        &self.config,
-                        &*self.clock,
-                        &committed.action,
-                        &committed.session_id,
-                        committed.pieces.clone(),
-                        true,
+                if let Err(error) = self.revalidate_committed_action(committed) {
+                    let _ = settle_pre_effect_rejection(
+                        ledger,
+                        &committed.action.action_id,
+                        self.clock.now().as_str(),
+                        error,
                     );
-                    let _ = ledger
-                        .insert_outbound(entry, self.config.ledger_bounds.outbound_max_entries);
+                    let entry = ledger
+                        .outbound_entry(&committed.action.action_id)
+                        .cloned()
+                        .expect("claimed authority rejection entry");
+                    let mut terminal_record = won_record.clone();
+                    terminal_record.entry = entry.clone();
+                    self.store.commit_outbound_terminal(&terminal_record)?;
+                    self.gate.wake_all();
+                    return Ok(ConsumerOutcome::Terminal {
+                        action_id: committed.action.action_id.clone(),
+                        state: entry.state,
+                        result_jcs: entry.result_jcs.unwrap_or_default(),
+                    });
                 }
+                let now_ms = (crate::clock::timestamp_total_micros(self.clock.now().as_str()).max(0)
+                    as u64)
+                    / 1_000;
+                if let Err(error) = validate_prepared_transport_for_send(
+                    &self.config,
+                    &prepared.request,
+                    &won_record.entry.pieces,
+                    now_ms,
+                ) {
+                    let _ = settle_pre_effect_rejection(
+                        ledger,
+                        &committed.action.action_id,
+                        self.clock.now().as_str(),
+                        error,
+                    );
+                    let entry = ledger
+                        .outbound_entry(&committed.action.action_id)
+                        .cloned()
+                        .expect("claimed pre-effect rejection entry");
+                    let mut terminal_record = won_record;
+                    terminal_record.entry = entry.clone();
+                    self.store.commit_outbound_terminal(&terminal_record)?;
+                    self.gate.wake_all();
+                    return Ok(ConsumerOutcome::Terminal {
+                        action_id: committed.action.action_id.clone(),
+                        state: entry.state,
+                        result_jcs: entry.result_jcs.unwrap_or_default(),
+                    });
+                }
+
                 let result = transport_and_settle(
                     &self.config,
                     ledger,
                     &mut *self.transport,
-                    &mut *self.asset_preparation,
-                    &committed.action.action_id,
-                    &now,
-                    true,
+                    &prepared.request,
+                    &claim_time,
                 );
                 match result {
-                    // A confirmed send has already had a transport effect; the
-                    // terminal result MUST resolve from the observed outcome.
-                    // Lease validity is NOT consulted here: status-first
-                    // recovery settles the row regardless, so no row ever
-                    // remains Dispatched indefinitely over a lease.
                     SendDispatchResult::Terminal { state, result } => {
                         let entry = ledger
                             .outbound_entry(&committed.action.action_id)
                             .cloned()
                             .expect("settled outbound row");
-                        let record = self.build_terminal_record(committed, &entry);
+                        let mut record = won_record;
+                        record.entry = entry;
                         self.effect_ts("before_terminal_commit");
                         self.revalidate_committed_action(committed)?;
                         self.store.commit_outbound_terminal(&record)?;
-                        // Terminal release frees durable occupancy; wake every
-                        // waiting admission.
                         self.gate.wake_all();
                         let result_jcs = dolly_canonical_json::canonicalize(&result)
                             .map(|(bytes, _)| String::from_utf8(bytes.as_bytes().to_vec()))
@@ -1169,14 +1281,9 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                             result_jcs,
                         })
                     }
-                    SendDispatchResult::DispatchedPending => {
-                        // Transport response lost; the durable row stays
-                        // Dispatched (occupancy held) until status-first
-                        // recovery settles it.
-                        Ok(ConsumerOutcome::Pending {
-                            action_id: committed.action.action_id.clone(),
-                        })
-                    }
+                    SendDispatchResult::DispatchedPending => Ok(ConsumerOutcome::Pending {
+                        action_id: committed.action.action_id.clone(),
+                    }),
                     SendDispatchResult::Rejected(error) => Err(ChannelError::new(
                         error.code,
                         error.retryable,
@@ -1186,8 +1293,6 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 }
             }
             Ok(DispatchClaim::AlreadyDispatched) | Ok(DispatchClaim::LostRace) => {
-                // Another claimant won or the row was already dispatched: zero
-                // transport, Pending for status-first recovery.
                 Ok(ConsumerOutcome::Pending {
                     action_id: committed.action.action_id.clone(),
                 })

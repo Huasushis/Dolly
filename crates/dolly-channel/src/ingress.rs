@@ -17,14 +17,11 @@ use dolly_canonical_json::{CanonicalJsonValue, canonicalize};
 use dolly_core_domain::Timestamp;
 use serde_json::Value;
 
+use crate::attachment::{AttachmentRecord, AttachmentState, InboundAttachment};
 use crate::clock::{Clock, timestamp_plus_seconds};
 use crate::config::ChannelConfig;
 use crate::error::{ChannelError, ChannelOutcome, codes};
 use crate::ids;
-use crate::attachment::{
-    AttachmentImportRequest, AttachmentImportStatus, AttachmentRecord, AttachmentState,
-    InboundAttachment, InboundAssetImport,
-};
 use crate::ledger::{AttemptRecord, ChannelLedger, EventKind, InboundEntry, InboundState};
 
 /// The metadata namespace every Channel draft carries.
@@ -120,7 +117,11 @@ pub fn parse_event(raw: &Value) -> Result<InboundEvent, ChannelError> {
         Some("message") => EventKind::Message,
         Some("edit") => EventKind::Edit,
         Some("delete") => EventKind::Delete,
-        _ => return Err(malformed("inbound event event_kind must be message|edit|delete")),
+        _ => {
+            return Err(malformed(
+                "inbound event event_kind must be message|edit|delete",
+            ));
+        }
     };
     let references_external_message_id = match obj.get("references_external_message_id") {
         None | Some(Value::Null) => None,
@@ -131,7 +132,7 @@ pub fn parse_event(raw: &Value) -> Result<InboundEvent, ChannelError> {
         Some(_) => {
             return Err(malformed(
                 "inbound event references_external_message_id must be a string or null",
-            ))
+            ));
         }
     };
     if matches!(event_kind, EventKind::Edit | EventKind::Delete)
@@ -171,7 +172,7 @@ fn parse_attachments(
         Some(_) => {
             return Err(malformed(
                 "inbound event attachments must be an array or absent",
-            ))
+            ));
         }
     };
     let mut attachments = Vec::with_capacity(items.len());
@@ -202,13 +203,18 @@ fn parse_attachments(
         let declared_media_type = obj
             .get("declared_media_type")
             .and_then(Value::as_str)
-            .ok_or_else(|| malformed("attachment missing declared_media_type"))?
-            .to_string();
-        if !crate::attachment::is_canonical_media_type(&declared_media_type) {
-            return Err(malformed(
-                "attachment declared_media_type is not a canonical media type",
-            ));
-        }
+            .ok_or_else(|| malformed("attachment missing declared_media_type"))
+            .and_then(|value| {
+                crate::asset::MediaType::parse(value)
+                    .map_err(|_| malformed("attachment declared_media_type is not canonical"))
+            })?;
+        let media_kind = match obj.get("media_kind").and_then(Value::as_str) {
+            Some("image") => crate::asset::MediaKind::Image,
+            Some("audio") => crate::asset::MediaKind::Audio,
+            Some("video") => crate::asset::MediaKind::Video,
+            Some("file") => crate::asset::MediaKind::File,
+            _ => return Err(malformed("attachment media_kind is not closed")),
+        };
         let byte_length_hint = obj
             .get("byte_length_hint")
             .and_then(Value::as_u64)
@@ -217,10 +223,16 @@ fn parse_attachments(
         attachments.push(InboundAttachment {
             ordinal,
             provider_key,
+            media_kind,
             declared_media_type,
             byte_length_hint,
         });
     }
+    crate::attachment::validate_attachment_sequence(
+        &attachments,
+        usize::MAX,
+        crate::asset::AssetRef::MAX_WIRE_SAFE_INTEGER,
+    )?;
     Ok(attachments)
 }
 
@@ -245,7 +257,7 @@ pub fn normalize_text(text: &str) -> Result<String, ChannelError> {
                     false,
                     ChannelOutcome::NotApplied,
                     "inbound text contains a control character",
-                ))
+                ));
             }
             c if is_noncharacter(c) => {
                 return Err(ChannelError::new(
@@ -253,7 +265,7 @@ pub fn normalize_text(text: &str) -> Result<String, ChannelError> {
                     false,
                     ChannelOutcome::NotApplied,
                     "inbound text contains a Unicode noncharacter",
-                ))
+                ));
             }
             c => out.push(c),
         }
@@ -332,7 +344,9 @@ pub enum IngressStatusResult {
     /// Authoritative absent: only this permits replay of a byte-identical
     /// request.
     Absent,
-    Committed { commit: IngressCommit },
+    Committed {
+        commit: IngressCommit,
+    },
 }
 
 /// A failure from the Core ingress seam.
@@ -502,8 +516,8 @@ pub(crate) fn build_draft_with_attachments(
     for attachment in available {
         let mut part = serde_json::json!({
             "kind": "asset",
-            "asset_id": attachment.asset_id,
-            "media_type": attachment.media_type,
+            "asset_id": attachment.asset_ref.asset_id,
+            "media_type": attachment.asset_ref.media_type,
         });
         if let Some(view) = &attachment.view {
             part["view"] = serde_json::to_value(view).expect("canonical crop serializes");
@@ -581,8 +595,7 @@ pub(crate) fn draft_canonical_string(draft: &CanonicalJsonValue) -> Result<Strin
 }
 
 /// Process one authenticated external event end to end. The accepted
-/// text-only default: attachment events are refused by the fail-closed
-/// [`crate::attachment::DenyAttachments`] seam.
+/// text-only default refuses attachment events before mutation.
 pub fn process_event<E: CoreIngress>(
     config: &ChannelConfig,
     clock: &dyn Clock,
@@ -590,30 +603,33 @@ pub fn process_event<E: CoreIngress>(
     core: &mut E,
     event: &InboundEvent,
 ) -> IngressOutcome {
-    process_event_with_assets(
-        config,
-        clock,
-        ledger,
-        core,
-        &mut crate::attachment::DenyAttachments,
-        event,
-    )
+    process_event_inner(config, clock, ledger, core, false, event)
 }
 
-/// Process one authenticated external event end to end under the injected
-/// inbound Asset import seam (WP-013B attachments; [`DenyAttachments`]
-/// preserves the accepted text-only default).
-pub fn process_event_with_assets<E: CoreIngress>(
+/// Build and retain a complete ordered `assets_pending` intent without
+/// calling Asset. [`crate::receiver::InboundReceiver`] persists that intent
+/// and then uses its sole attachment state machine for initial import and
+/// recovery.
+pub(crate) fn process_event_with_pending_attachments<E: CoreIngress>(
     config: &ChannelConfig,
     clock: &dyn Clock,
     ledger: &mut ChannelLedger,
     core: &mut E,
-    assets: &mut dyn InboundAssetImport,
     event: &InboundEvent,
 ) -> IngressOutcome {
-    let reject_before_mutation = |error: ChannelError| IngressOutcome::RejectedBeforeMutation {
-        error,
-    };
+    process_event_inner(config, clock, ledger, core, true, event)
+}
+
+fn process_event_inner<E: CoreIngress>(
+    config: &ChannelConfig,
+    clock: &dyn Clock,
+    ledger: &mut ChannelLedger,
+    core: &mut E,
+    allow_pending_attachments: bool,
+    event: &InboundEvent,
+) -> IngressOutcome {
+    let reject_before_mutation =
+        |error: ChannelError| IngressOutcome::RejectedBeforeMutation { error };
 
     if !config.ingress_enabled {
         return reject_before_mutation(ChannelError::new(
@@ -634,7 +650,8 @@ pub fn process_event_with_assets<E: CoreIngress>(
             ),
         ));
     }
-    if matches!(event.event_kind, EventKind::Edit | EventKind::Delete) && !config.edit_delete.enabled
+    if matches!(event.event_kind, EventKind::Edit | EventKind::Delete)
+        && !config.edit_delete.enabled
     {
         return reject_before_mutation(ChannelError::new(
             codes::STALE_EVENT,
@@ -694,7 +711,7 @@ pub fn process_event_with_assets<E: CoreIngress>(
                         "no session mapped for conversation {} under require_known",
                         event.external_conversation_id
                     ),
-                ))
+                ));
             }
             crate::config::SessionMappingPolicy::CreateOnFirstMessage => {
                 let session =
@@ -735,170 +752,87 @@ pub fn process_event_with_assets<E: CoreIngress>(
         }
     }
 
-    // WP-013B attachments: every provider attachment becomes an EXPLICIT
-    // Asset import through the injected seam. The Block draft is built and
-    // submitted ONLY when every required asset is AVAILABLE under the correct
-    // owner/domain; pending imports leave the ledger row `assets_pending`
-    // (durable and resumable through status-first recovery), and any refusal
-    // rejects the event explicitly before any draft or mutation. No raw
-    // path/bytes/store authority ever enters the draft.
+    // Attachment intents are closed-validated and represented in full as
+    // Pending before any real Asset import. The durable receiver persists
+    // this complete ordered state, then starts imports through its one
+    // start/recovery state machine.
     let mut attachment_records: Vec<AttachmentRecord> = Vec::new();
-    let mut available_attachments: Vec<crate::attachment::AvailableAttachment> = Vec::new();
     if !event.attachments.is_empty() {
-        if !config.accepted_modalities.contains("asset") {
+        if !allow_pending_attachments || !config.accepted_modalities.contains("asset") {
             return reject_before_mutation(ChannelError::new(
                 codes::UNSUPPORTED_MODALITY,
                 false,
                 ChannelOutcome::NotApplied,
-                "attachment events require the 'asset' accepted modality (WP-013B channel multimodal profile)",
+                "attachment events require the accepted Channel asset modality",
             ));
         }
-        if 1 + event.attachments.len() > config.max_parts {
+        if let Err(error) = crate::attachment::validate_attachment_sequence(
+            &event.attachments,
+            config.max_parts.saturating_sub(1),
+            config.max_asset_bytes as u64,
+        ) {
+            return reject_before_mutation(error);
+        }
+        attachment_records.extend(event.attachments.iter().cloned().map(|attachment| {
+            AttachmentRecord {
+                attachment,
+                state: AttachmentState::Pending,
+                available: None,
+                refused_code: None,
+            }
+        }));
+        let now = clock.now().as_str().to_string();
+        let ingress_key = ids::inbound_ingress_key(&event.account, &event.external_message_id);
+        let placeholder = match build_draft_with_attachments(event, &session_id, &normalized, &[]) {
+            Ok(draft) => draft,
+            Err(error) => return reject_before_mutation(error),
+        };
+        let request_jcs = match draft_canonical_string(&placeholder) {
+            Ok(bytes) => bytes,
+            Err(error) => return reject_before_mutation(error),
+        };
+        let operation_digest = ids::operation_digest(request_jcs.as_bytes());
+        let entry = InboundEntry {
+            transport_account: event.account.clone(),
+            external_message_id: event.external_message_id.clone(),
+            references_external_message_id: event.references_external_message_id.clone(),
+            state: InboundState::AssetsPending,
+            event_kind: event.event_kind,
+            session_id: session_id.clone(),
+            external_conversation_id: event.external_conversation_id.clone(),
+            channel_id: event.channel_id.clone(),
+            sender_class: event.sender_class.clone(),
+            received_at: now.clone(),
+            ingress_key: ingress_key.clone(),
+            operation_digest,
+            block_id: None,
+            attachments: attachment_records,
+            pages: config.target_page_ids.clone(),
+            config_revision: config.revision,
+            attempts: vec![AttemptRecord {
+                at: now,
+                kind: "assets-pending".to_string(),
+                detail_digest: crate::ingress::digest_of(&ingress_key),
+            }],
+            request_jcs,
+            rejected_code: None,
+        };
+        if ledger
+            .insert_inbound(entry, config.ledger_bounds.inbound_max_entries)
+            .is_err()
+        {
             return reject_before_mutation(ChannelError::new(
-                codes::MALFORMED_EVENT,
+                codes::LEDGER_FULL,
                 false,
                 ChannelOutcome::NotApplied,
-                format!(
-                    "event text plus attachments exceed the configured maximum {} parts",
-                    config.max_parts
-                ),
+                "inbound ledger is at capacity",
             ));
         }
-        for attachment in &event.attachments {
-            if attachment.provider_key.is_empty()
-                || attachment.provider_key.len() > MAX_EXTERNAL_ID_BYTES
-            {
-                return reject_before_mutation(ChannelError::new(
-                    codes::MALFORMED_EVENT,
-                    false,
-                    ChannelOutcome::NotApplied,
-                    "attachment provider identity is out of bounds",
-                ));
-            }
-            if attachment.byte_length_hint == 0
-                || attachment.byte_length_hint > config.max_asset_bytes as u64
-            {
-                return reject_before_mutation(ChannelError::new(
-                    codes::MALFORMED_EVENT,
-                    false,
-                    ChannelOutcome::NotApplied,
-                    format!(
-                        "attachment byte hint {} exceeds the configured maximum {} bytes",
-                        attachment.byte_length_hint, config.max_asset_bytes
-                    ),
-                ));
-            }
-            let request =
-                AttachmentImportRequest::new(&event.account, &event.external_message_id, attachment);
-            let status = match assets.import(&request) {
-                Ok(status) => status,
-                Err(error) => return reject_before_mutation(error),
-            };
-            match status {
-                AttachmentImportStatus::Available(available) => {
-                    // The authoritative detected type may not be relabelled by
-                    // transport-declared metadata.
-                    if available.media_type != attachment.declared_media_type {
-                        return reject_before_mutation(ChannelError::new(
-                            codes::MALFORMED_EVENT,
-                            false,
-                            ChannelOutcome::NotApplied,
-                            format!(
-                                "attachment {} imported as {} but declared {}",
-                                attachment.provider_key,
-                                available.media_type,
-                                attachment.declared_media_type
-                            ),
-                        ));
-                    }
-                    attachment_records.push(AttachmentRecord {
-                        attachment: attachment.clone(),
-                        state: AttachmentState::Available,
-                        available: Some(available.clone()),
-                        refused_code: None,
-                    });
-                    available_attachments.push(available);
-                }
-                AttachmentImportStatus::Pending => {
-                    attachment_records.push(AttachmentRecord {
-                        attachment: attachment.clone(),
-                        state: AttachmentState::Pending,
-                        available: None,
-                        refused_code: None,
-                    });
-                }
-                AttachmentImportStatus::Refused { code } => {
-                    return reject_before_mutation(ChannelError::new(
-                        code,
-                        false,
-                        ChannelOutcome::NotApplied,
-                        format!(
-                            "attachment {} import was refused before any draft submission",
-                            attachment.provider_key
-                        ),
-                    ));
-                }
-            }
-        }
-        // Not every required asset is AVAILABLE yet: durable `assets_pending`
-        // row, NO Block draft and NO Core submission. A refusal has already
-        // returned above and is represented explicitly, never fabricated.
-        if !attachment_records
-            .iter()
-            .all(|record| record.state == AttachmentState::Available)
-        {
-            let now = clock.now().as_str().to_string();
-            let ingress_key =
-                ids::inbound_ingress_key(&event.account, &event.external_message_id);
-            let entry = InboundEntry {
-                transport_account: event.account.clone(),
-                external_message_id: event.external_message_id.clone(),
-                references_external_message_id: event.references_external_message_id.clone(),
-                state: InboundState::AssetsPending,
-                event_kind: event.event_kind,
-                session_id: session_id.clone(),
-                external_conversation_id: event.external_conversation_id.clone(),
-                channel_id: event.channel_id.clone(),
-                sender_class: event.sender_class.clone(),
-                received_at: now.clone(),
-                ingress_key: ingress_key.clone(),
-                operation_digest: crate::ingress::digest_of("assets-pending-inbound"),
-                block_id: None,
-                attachments: attachment_records,
-                pages: config.target_page_ids.clone(),
-                config_revision: config.revision,
-                attempts: vec![AttemptRecord {
-                    at: now.clone(),
-                    kind: "assets_pending".to_string(),
-                    detail_digest: crate::ingress::digest_of(&event.external_message_id),
-                }],
-                // The durable placeholder draft carries the exact event
-                // content (metadata/text) so status-first recovery rebuilds
-                // the final Asset-bearing draft deterministically.
-                request_jcs: build_draft_with_attachments(
-                    event,
-                    &session_id,
-                    &normalized,
-                    &[],
-                )
-                .and_then(|draft| draft_canonical_string(&draft))
-                .unwrap_or_default(),
-                rejected_code: None,
-            };
-            let _ = ledger.insert_inbound(entry, config.ledger_bounds.inbound_max_entries);
-            return IngressOutcome::SubmissionPending;
-        }
-        // Every required asset is AVAILABLE: the draft may reference the
-        // ordered Asset parts (attachment order preserved).
+        return IngressOutcome::SubmissionPending;
     }
 
     // Build the draft and the account-scoped idempotency identity.
-    let draft = match build_draft_with_attachments(
-        event,
-        &session_id,
-        &normalized,
-        &available_attachments,
-    ) {
+    let draft = match build_draft_with_attachments(event, &session_id, &normalized, &[]) {
         Ok(draft) => draft,
         Err(error) => return reject_before_mutation(error),
     };
@@ -908,7 +842,10 @@ pub fn process_event_with_assets<E: CoreIngress>(
     };
     let ingress_key = ids::inbound_ingress_key(&event.account, &event.external_message_id);
     let operation_digest = ids::operation_digest(request_jcs.as_bytes());
-    let deadline = timestamp_plus_seconds(clock.now().as_str(), config.operation_deadline_seconds as i64);
+    let deadline = timestamp_plus_seconds(
+        clock.now().as_str(),
+        config.operation_deadline_seconds as i64,
+    );
     let request = IngressSubmitRequest {
         operation_id: ids::operation_id(&event.account, &event.external_message_id, 1),
         module_id: config.module_id.clone(),
@@ -950,9 +887,7 @@ pub fn process_event_with_assets<E: CoreIngress>(
                     "external message ID was already rejected",
                 ));
             }
-            InboundState::Received
-            | InboundState::Submitted
-            | InboundState::AssetsPending => {
+            InboundState::Received | InboundState::Submitted | InboundState::AssetsPending => {
                 // Crash recovery: proceed to Core below (a pending
                 // attachment row re-imports/re-validates through the seam).
             }
@@ -1043,7 +978,9 @@ pub fn process_event_with_assets<E: CoreIngress>(
             IngressOutcome::SubmissionPending
         }
         Err(CoreIngressError::Rejected { code }) => {
-            if let Some(existing) = ledger.inbound_get_mut(&event.account, &event.external_message_id) {
+            if let Some(existing) =
+                ledger.inbound_get_mut(&event.account, &event.external_message_id)
+            {
                 existing.state = InboundState::Rejected;
                 existing.rejected_code = Some(code.clone());
                 existing.attempts.push(AttemptRecord {
@@ -1105,8 +1042,10 @@ pub fn reconcile_inbound<E: CoreIngress>(
         .filter(|e| e.state == InboundState::Submitted)
         .map(|e| (e.transport_account.clone(), e.external_message_id.clone()))
         .collect();
-    let deadline =
-        timestamp_plus_seconds(clock.now().as_str(), config.operation_deadline_seconds as i64);
+    let deadline = timestamp_plus_seconds(
+        clock.now().as_str(),
+        config.operation_deadline_seconds as i64,
+    );
     for (account, external_message_id) in keys {
         let Some(entry) = ledger.inbound_entry(&account, &external_message_id) else {
             continue;
@@ -1173,147 +1112,5 @@ pub fn reconcile_inbound<E: CoreIngress>(
         .inbound
         .values()
         .filter(|e| e.state == InboundState::Submitted)
-        .count()
-}
-
-/// Reconcile every `assets_pending` inbound row through the injected Asset
-/// import seam (status first, never a blind re-import): a pending attachment
-/// stays pending; a refusal rejects the row explicitly (never a fabricated
-/// reference); when every required asset is AVAILABLE the draft — the
-/// placeholder draft with the ordered Asset parts appended in attachment
-/// order — is submitted and settled exactly once. Returns the number of
-/// `assets_pending` rows still unresolved.
-pub fn reconcile_assets_pending_with_assets<E: CoreIngress>(
-    config: &ChannelConfig,
-    clock: &dyn Clock,
-    ledger: &mut ChannelLedger,
-    core: &mut E,
-    assets: &mut dyn InboundAssetImport,
-) -> usize {
-    let keys: Vec<(String, String)> = ledger
-        .inbound
-        .values()
-        .filter(|e| e.state == InboundState::AssetsPending)
-        .map(|e| (e.transport_account.clone(), e.external_message_id.clone()))
-        .collect();
-    let deadline =
-        timestamp_plus_seconds(clock.now().as_str(), config.operation_deadline_seconds as i64);
-    for (account, external_message_id) in keys {
-        let Some(entry) = ledger.inbound_entry(&account, &external_message_id) else {
-            continue;
-        };
-        let records = entry.attachments.clone();
-        // Status-first per-attachment resume; a refusal is explicit and final.
-        let mut refused: Option<String> = None;
-        let mut all_available = true;
-        for record in &records {
-            if record.state == AttachmentState::Pending {
-                let request = AttachmentImportRequest::new(
-                    &account,
-                    &external_message_id,
-                    &record.attachment,
-                );
-                match assets.status(&request) {
-                    Ok(AttachmentImportStatus::Available(available)) => {
-                        let _ = available;
-                    }
-                    Ok(AttachmentImportStatus::Pending) => {
-                        all_available = false;
-                    }
-                    Ok(AttachmentImportStatus::Refused { code }) => {
-                        all_available = false;
-                        refused = Some(code);
-                        break;
-                    }
-                    Err(_) => {
-                        all_available = false;
-                    }
-                }
-            } else if record.state != AttachmentState::Available {
-                all_available = false;
-            }
-        }
-        if let Some(code) = refused {
-            // Explicit durable rejection with zero submission.
-            let now = clock.now().as_str().to_string();
-            if let Some(existing) = ledger.inbound_get_mut(&account, &external_message_id) {
-                existing.state = InboundState::Rejected;
-                existing.rejected_code = Some(code.clone());
-                existing.attempts.push(AttemptRecord {
-                    at: now.clone(),
-                    kind: "attachment-refused".to_string(),
-                    detail_digest: digest_of(&code),
-                });
-            }
-            continue;
-        }
-        if !all_available {
-            // Still pending; resolved on a later pass.
-            continue;
-        }
-        // Every required asset is AVAILABLE: append the ordered Asset parts
-        // to the placeholder draft and submit exactly once.
-        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&entry.request_jcs) else {
-            continue;
-        };
-        let mut draft_value = parsed;
-        let mut parts = draft_value
-            .get("parts")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        for record in records.iter().filter(|r| r.state == AttachmentState::Available) {
-            if let Some(available) = &record.available {
-                let mut part = serde_json::json!({
-                    "kind": "asset",
-                    "asset_id": available.asset_id,
-                    "media_type": available.media_type,
-                });
-                if let Some(view) = &available.view {
-                    part["view"] = serde_json::to_value(view).expect("canonical crop serializes");
-                }
-                parts.push(part);
-            }
-        }
-        draft_value["parts"] = Value::Array(parts);
-        let Ok(draft) = CanonicalJsonValue::try_from(draft_value) else {
-            continue;
-        };
-        let Ok(bytes) = draft_canonical_string(&draft) else {
-            continue;
-        };
-        let idempotency_key = ids::inbound_ingress_key(&account, &external_message_id);
-        let request = IngressSubmitRequest {
-            operation_id: ids::operation_id(&account, &external_message_id, 1),
-            module_id: config.module_id.clone(),
-            idempotency_key: idempotency_key.clone(),
-            draft,
-            target_page_ids: entry.pages.clone(),
-            deadline: deadline.clone(),
-        };
-        match core.submit(&request) {
-            Ok(IngressSubmitReceipt::Committed { idempotent, commit }) => {
-                let now = clock.now().as_str().to_string();
-                if let Some(existing) = ledger.inbound_get_mut(&account, &external_message_id) {
-                    existing.state = InboundState::Accepted;
-                    existing.block_id = Some(commit.block_id.clone());
-                    existing.request_jcs = bytes.clone();
-                    existing.attempts.push(AttemptRecord {
-                        at: now.clone(),
-                        kind: if idempotent { "attachment-replay" } else { "attachment-submit" }
-                            .to_string(),
-                        detail_digest: digest_of(&commit.block_id),
-                    });
-                }
-            }
-            _ => {
-                // Unknown/lost: remain assets_pending for the next pass.
-            }
-        }
-    }
-    ledger
-        .inbound
-        .values()
-        .filter(|e| e.state == InboundState::AssetsPending)
         .count()
 }

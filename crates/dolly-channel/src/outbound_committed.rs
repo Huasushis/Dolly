@@ -55,7 +55,6 @@ impl CommittedSendAction {
         principal: &ChannelPrincipal,
         config: &ChannelConfig,
         ledger: &ChannelLedger,
-        assets: &mut dyn crate::asset::AssetPreparation,
     ) -> Result<Self, ChannelError> {
         let rejected = |message: &str| {
             ChannelError::new(
@@ -96,7 +95,7 @@ impl CommittedSendAction {
             .ok_or_else(|| rejected("frozen block has no id"))?
             .to_string();
         let action = parse_send_action_at(block, action_index)?;
-        let authorized = authorize_send(config, ledger, &action, assets)?;
+        let authorized = authorize_send(config, ledger, &action)?;
         let action_obj = block
             .get("body")
             .and_then(Value::as_object)
