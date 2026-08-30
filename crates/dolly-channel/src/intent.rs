@@ -87,6 +87,10 @@ pub struct ChannelIntent {
     pub payload_digest: String,
     /// The canonical draft (the byte-identical replay unit).
     pub request_jcs: String,
+    /// Ordered typed attachment import records (empty for v1 text events;
+    /// durable `assets_pending` premise for WP-013B multimodal ingress).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<crate::attachment::AttachmentRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

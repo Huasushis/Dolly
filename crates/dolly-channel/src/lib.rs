@@ -23,8 +23,9 @@
 //! users, and never lets a send re-enter Dolly as an inbound user message
 //! (echoed outbound IDs are suppressed by the inbound ledger).
 
-pub mod clock;
 pub mod asset;
+pub mod attachment;
+pub mod clock;
 
 pub mod config;
 pub mod error;
@@ -52,10 +53,14 @@ pub use clock::{
 };
 pub use config::{ChannelConfig, ChannelConfigBuilder, EXTENSION_ID, SEND_ACTION_NAME};
 pub use error::{ChannelDeliveryOutcome, ChannelError, ChannelOutcome};
+pub use attachment::{
+    AttachmentImportRequest, AttachmentImportStatus, AttachmentRecord, AttachmentState,
+    AvailableAttachment, DenyAttachments, InboundAssetImport, InboundAttachment,
+};
 pub use ingress::{
     CoreIngress, CoreIngressError, InboundEvent, IngressCommit, IngressOutcome,
     IngressStatusResult, IngressSubmitReceipt, IngressSubmitRequest, parse_event, process_event,
-    reconcile_inbound,
+    process_event_with_assets, reconcile_assets_pending_with_assets, reconcile_inbound,
 };
 pub use ledger::PieceOutcome;
 pub use ledger::{

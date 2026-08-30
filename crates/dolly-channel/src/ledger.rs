@@ -38,12 +38,15 @@ pub struct AttemptRecord {
 // Inbound ledger
 // ---------------------------------------------------------------------------
 
-/// Inbound ledger states (text modality; `assets_pending` is a WP-013B
-/// extension and is not reachable in v1).
+/// Inbound ledger states (`assets_pending` is the WP-013B attachment
+/// extension and requires the injected inbound Asset import seam).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InboundState {
     Received,
+    /// At least one attachment import is in progress; the Block draft is NOT
+    /// submitted until every required asset is AVAILABLE.
+    AssetsPending,
     Submitted,
     Accepted,
     Rejected,
@@ -53,6 +56,7 @@ impl InboundState {
     pub fn as_str(self) -> &'static str {
         match self {
             InboundState::Received => "received",
+            InboundState::AssetsPending => "assets_pending",
             InboundState::Submitted => "submitted",
             InboundState::Accepted => "accepted",
             InboundState::Rejected => "rejected",
@@ -107,6 +111,10 @@ pub struct InboundEntry {
     /// The Core-minted Block ID returned from the durable premise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_id: Option<String>,
+    /// Ordered typed provider attachments and their per-attachment import
+    /// state (empty for v1 text events).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<crate::attachment::AttachmentRecord>,
     pub pages: Vec<String>,
     /// Config revision under which this event was authorized.
     pub config_revision: i64,

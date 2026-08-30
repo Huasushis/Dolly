@@ -172,6 +172,7 @@ pub fn message_event(
         received_at: dolly_core_domain::Timestamp::from_str(NOW).unwrap(),
         event_kind: dolly_channel::EventKind::Message,
         references_external_message_id: None,
+        attachments: Vec::new(),
     }
 }
 

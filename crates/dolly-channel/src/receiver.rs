@@ -26,13 +26,18 @@ use dolly_storage::{HostCapabilityGrant, HostConnectionAuthority, HostIngress};
 use crate::clock::Clock;
 use crate::config::ChannelConfig;
 use crate::error::{ChannelError, ChannelOutcome, codes};
+use crate::attachment::{
+    AttachmentImportRequest, AttachmentImportStatus, AttachmentRecord, AttachmentState,
+    InboundAttachment, InboundAssetImport,
+};
 use crate::host_adapter::{HostIngressCoreAdapter, channel_intent_digest, payload_digest_of};
 use crate::ids;
 use crate::ingress::{
-    CoreIngress, CoreIngressError, IngressOutcome, IngressSubmitReceipt,
-    IngressSubmitRequest, InboundEvent, process_event,
+    CoreIngress, CoreIngressError, IngressOutcome, IngressSubmitReceipt, IngressSubmitRequest,
+    InboundEvent, process_event_with_assets,
 };
 use crate::intent::IntentState;
+use crate::ledger::{ChannelLedger, InboundState};
 use crate::principal::ChannelPrincipal;
 use crate::store::SqliteChannelStore;
 
@@ -77,6 +82,8 @@ pub struct AuthenticatedChannelEvent {
     bound_config_revision: i64,
     bound_account: String,
     content: ChannelEventContent,
+    /// Ordered typed provider attachments (empty for v1 text events).
+    attachments: Vec<InboundAttachment>,
 }
 
 impl AuthenticatedChannelEvent {
@@ -89,6 +96,20 @@ impl AuthenticatedChannelEvent {
         grant: &HostCapabilityGrant,
         config_revision: i64,
         content: ChannelEventContent,
+    ) -> Result<Self, ChannelError> {
+        Self::new_with_attachments(authority, grant, config_revision, content, Vec::new())
+    }
+
+    /// Seal one authenticated multimodal transport event with its ordered
+    /// typed provider attachments. Attachments are explicit premises only:
+    /// the Channel never treats them as Asset authority and never reads a
+    /// path or bytes.
+    pub fn new_with_attachments(
+        authority: &HostConnectionAuthority,
+        grant: &HostCapabilityGrant,
+        config_revision: i64,
+        content: ChannelEventContent,
+        attachments: Vec<InboundAttachment>,
     ) -> Result<Self, ChannelError> {
         let principal = ChannelPrincipal::from_authority_grant(authority, grant)?;
         Ok(Self {
@@ -103,6 +124,7 @@ impl AuthenticatedChannelEvent {
             bound_config_revision: config_revision,
             bound_account: principal.account().to_string(),
             content,
+            attachments,
         })
     }
 
@@ -134,6 +156,7 @@ impl AuthenticatedChannelEvent {
             received_at: self.content.received_at,
             event_kind: self.content.event_kind,
             references_external_message_id: self.content.references_external_message_id,
+            attachments: self.attachments,
         }
     }
 }
@@ -148,6 +171,10 @@ pub struct InboundReceiver<'conn, 'principal, H: HostIngress> {
     authority: &'principal HostConnectionAuthority,
     grant: &'principal HostCapabilityGrant,
     principal: ChannelPrincipal,
+    /// The single injected inbound Asset import seam (sole integrator); the
+    /// default [`crate::attachment::DenyAttachments`] keeps the accepted
+    /// text-only profile fail-closed.
+    assets: Box<dyn InboundAssetImport>,
 }
 
 impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
@@ -175,7 +202,34 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
         let mut config = config;
         config.transport_account = principal.account().to_string();
         let store = SqliteChannelStore::new(connection, &principal, config.revision)?;
-        Ok(Self { config, clock, store, host, authority, grant, principal })
+        Ok(Self { config, clock, store, host, authority, grant, principal, assets: Box::new(crate::attachment::DenyAttachments) })
+    }
+
+    /// Bind the receiver with the single injected inbound Asset import seam
+    /// (sole integrator: the Host/Runtime). The default [`InboundReceiver::new`]
+    /// constructor stays the accepted text-only path and refuses attachments
+    /// fail-closed; this explicit constructor is the only production seam that
+    /// enables ordered multimodal attachments.
+    pub fn with_asset_import(
+        config: ChannelConfig,
+        clock: Box<dyn Clock>,
+        connection: &'conn mut rusqlite::Connection,
+        host: H,
+        assets: Box<dyn InboundAssetImport>,
+        authority: &'principal HostConnectionAuthority,
+        grant: &'principal HostCapabilityGrant,
+    ) -> Result<Self, ChannelError> {
+        let principal = ChannelPrincipal::from_authority_grant(authority, grant)?;
+        if config.extension_id != principal.extension_id() {
+            return Err(ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "channel config Extension does not match the granted Channel Extension"));
+        }
+        if config.module_id != principal.module_id() {
+            return Err(ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "channel config Module does not match the granted Module"));
+        }
+        let mut config = config;
+        config.transport_account = principal.account().to_string();
+        let store = SqliteChannelStore::new(connection, &principal, config.revision)?;
+        Ok(Self { config, clock, store, host, authority, grant, principal, assets })
     }
 
     /// The current in-memory Channel ledger projection (rebuilt from the
@@ -206,7 +260,50 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
         let mut config = config;
         config.transport_account = principal.account().to_string();
         store.verify_owner_against(&principal, config.revision)?;
-        Ok(Self { config, clock, store, host, authority, grant, principal })
+        Ok(Self {
+            config,
+            clock,
+            store,
+            host,
+            authority,
+            grant,
+            principal,
+            assets: Box::new(crate::attachment::DenyAttachments),
+        })
+    }
+
+    /// Test-support only: multimodal variant with the injected inbound Asset
+    /// import seam over a pre-opened store.
+    #[cfg(feature = "test-support")]
+    pub fn with_asset_import_on_store(
+        config: ChannelConfig,
+        clock: Box<dyn Clock>,
+        store: SqliteChannelStore<'conn>,
+        host: H,
+        assets: Box<dyn InboundAssetImport>,
+        authority: &'principal HostConnectionAuthority,
+        grant: &'principal HostCapabilityGrant,
+    ) -> Result<Self, ChannelError> {
+        let principal = ChannelPrincipal::from_authority_grant(authority, grant)?;
+        if config.extension_id != principal.extension_id() {
+            return Err(ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "channel config Extension does not match the granted Channel Extension"));
+        }
+        if config.module_id != principal.module_id() {
+            return Err(ChannelError::new(codes::AUTHENTICATION_FAILED, false, ChannelOutcome::NotApplied, "channel config Module does not match the granted Module"));
+        }
+        let mut config = config;
+        config.transport_account = principal.account().to_string();
+        store.verify_owner_against(&principal, config.revision)?;
+        Ok(Self {
+            config,
+            clock,
+            store,
+            host,
+            authority,
+            grant,
+            principal,
+            assets,
+        })
     }
 
     /// Process one sealed, already-authenticated event.
@@ -270,7 +367,7 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
         // 3. The accepted pipeline runs with a fresh adapter over the owned
         //    store. Suppress a durable sent-transport echo before Host/Core
         //    via the projection seeded with echo markers.
-        let outcome = {
+        let (outcome, ledger) = {
             let ledger = match self.store.project_ledger() {
                 Ok(projected) => projected,
                 Err(_) => {
@@ -287,13 +384,21 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
                 &mut self.store,
                 self.config.revision,
             );
-            process_event(&self.config, &*self.clock, &mut ledger, &mut adapter, &inbound)
+            let outcome = process_event_with_assets(
+                &self.config,
+                &*self.clock,
+                &mut ledger,
+                &mut adapter,
+                &mut *self.assets,
+                &inbound,
+            );
+            (outcome, ledger)
         };
 
         // 4. A replay must still revalidate the CURRENT authority/grant and
         //    status, and the returned Host mapping goes through the FULL
         //    validate_host_mapping before the cached success is acknowledged.
-        match outcome {
+        let outcome = match outcome {
             IngressOutcome::IdempotentReplay { block_id } => match accepted_pre_intent {
                 Some(accepted_intent) => {
                     let mut adapter = HostIngressCoreAdapter::new(
@@ -329,12 +434,106 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
                 },
             },
             other => other,
+        };
+        // WP-013B assets-pending durability: persist the `prepared` intent
+        // with its ordered attachment import records BEFORE returning, so a
+        // restart resumes the imports through status-first recovery (never a
+        // blind re-import and never a fabricated reference).
+        if matches!(outcome, IngressOutcome::SubmissionPending)
+            && ledger
+                .inbound_entry(&inbound.account, &inbound.external_message_id)
+                .map(|entry| entry.state == InboundState::AssetsPending)
+                .unwrap_or(false)
+        {
+            if let Err(error) = self.persist_attachment_prepared_intent(&principal, &inbound, &ledger)
+            {
+                return IngressOutcome::RejectedBeforeMutation { error };
+            }
         }
+        outcome
+    }
+
+    /// Durably persist one `assets_pending` event as a `prepared` intent
+    /// carrying its attachment import records, so recovery (never a blind
+    /// re-import) can resume through the injected seam's status.
+    fn persist_attachment_prepared_intent(
+        &mut self,
+        principal: &ChannelPrincipal,
+        inbound: &InboundEvent,
+        ledger: &ChannelLedger,
+    ) -> Result<(), ChannelError> {
+        let entry = ledger
+            .inbound_entry(&inbound.account, &inbound.external_message_id)
+            .ok_or_else(|| {
+                ChannelError::new(
+                    codes::INTERNAL,
+                    false,
+                    ChannelOutcome::NotApplied,
+                    "assets_pending ledger row vanished before durable persist",
+                )
+            })?;
+        let session_id = ledger
+            .session(&inbound.account, &inbound.external_conversation_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                ids::dolly_session_id(&inbound.account, &inbound.external_conversation_id)
+            });
+        let normalized = crate::ingress::normalize_text(&inbound.text).map_err(|error| {
+            ChannelError::new(
+                error.code,
+                false,
+                ChannelOutcome::NotApplied,
+                format!("durable persist normalization failed: {}", error.message),
+            )
+        })?;
+        let draft = crate::ingress::build_draft(&inbound, &session_id, &normalized)?;
+        if entry.request_jcs.is_empty() {
+            return Err(ChannelError::new(
+                codes::INTERNAL,
+                false,
+                ChannelOutcome::NotApplied,
+                "assets_pending row has no placeholder draft",
+            ));
+        }
+        let request = IngressSubmitRequest {
+            operation_id: ids::operation_id(&inbound.account, &inbound.external_message_id, 1),
+            module_id: self.config.module_id.clone(),
+            idempotency_key: entry.ingress_key.clone(),
+            draft: draft.clone(),
+            target_page_ids: self.config.target_page_ids.clone(),
+            deadline: crate::clock::timestamp_plus_seconds(
+                self.clock.now().as_str(),
+                self.config.operation_deadline_seconds as i64,
+            ),
+        };
+        let facts = crate::host_adapter::channel_facts_from_draft(&request.draft).map_err(|error| {
+            ChannelError::new(
+                codes::INTERNAL,
+                false,
+                ChannelOutcome::NotApplied,
+                format!("attachment intent facts unavailable: {error:?}"),
+            )
+        })?;
+        let mut intent = crate::host_adapter::prepare_intent(
+            principal,
+            self.config.revision,
+            &request,
+            &facts,
+        )?;
+        intent.attachments = entry.attachments.clone();
+        intent.request_jcs = entry.request_jcs.clone();
+        intent.payload_digest = crate::host_adapter::payload_digest_of(&intent.request_jcs);
+        self.store.write_prepared(&intent)
     }
 
     /// Reconcile every durable `prepared` intent through `status` first, with
     /// NO event redelivery. Restores the terminal ledger/state exactly once.
     /// Returns the number of intents left unresolved.
+    /// Reconcile every durable `prepared` intent through `status` first, with
+    /// NO event redelivery. Restores the terminal ledger/state exactly once
+    /// (attachment intents resume status-first through the injected Asset
+    /// import seam, never a blind re-import). Returns the number of intents
+    /// left unresolved.
     pub fn reconcile(&mut self) -> Result<usize, ChannelError> {
         let pending_keys: Vec<String> = self.store.list_pending()?.into_iter().map(|i| i.intent_key).collect();
         let mut remaining = 0;
@@ -343,6 +542,18 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
                 Some(intent) => intent,
                 None => continue,
             };
+            // WP-013B attachment recovery: a `prepared` intent carrying
+            // attachment import records resumes through the injected seam's
+            // STATUS (never a blind re-import). A refusal is durable and
+            // explicit; when every required asset is AVAILABLE the final
+            // Asset-bearing draft is submitted and committed exactly once.
+            if !intent.attachments.is_empty() {
+                let resolved = self.resume_attachment_intent(intent)?;
+                if !resolved {
+                    remaining += 1;
+                }
+                continue;
+            }
             let terminal = {
                 let mut adapter = HostIngressCoreAdapter::new(
                     &mut self.host,
@@ -359,9 +570,6 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
                         // must never be adopted as success (the row stays
                         // Prepared and reconcile fails closed).
                         if crate::host_adapter::validate_host_mapping(&intent, &mapping).is_err() {
-                            // Same external key but a different Host effect:
-                            // conflict/corrupt pending — never adopted as
-                            // success. The durable row stays Prepared.
                             return Err(ChannelError::new(codes::OPERATION_CONFLICT, false, ChannelOutcome::NotApplied, "host mapping conflicts with the prepared intent"));
                         }
                         matches!(adapter.commit_outcome(&intent_key, Some(&mapping.block_id), None), Ok(()))
@@ -382,7 +590,193 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
         }
         Ok(remaining)
     }
+
+    /// Resume one `prepared` intent carrying attachment import records:
+    /// status-first through the injected seam per attachment, then commit the
+    /// final Asset-bearing draft when every required asset is AVAILABLE. A
+    /// refused attachment durably rejects the event (never a fabricated
+    /// reference); a still-pending import keeps the row `prepared`. Returns
+    /// whether the intent reached a terminal state.
+    fn resume_attachment_intent(&mut self, mut intent: crate::intent::ChannelIntent) -> Result<bool, ChannelError> {
+        let records = intent.attachments.clone();
+        let mut refused: Option<String> = None;
+        let mut resolved_records: Vec<AttachmentRecord> = Vec::new();
+        let mut all_available = true;
+        for record in &records {
+            if record.state == AttachmentState::Pending {
+                let request = AttachmentImportRequest::new(
+                    &intent.account,
+                    &intent.external_event_id,
+                    &record.attachment,
+                );
+                match self.assets.status(&request) {
+                    Ok(AttachmentImportStatus::Available(available)) => {
+                        if available.media_type != record.attachment.declared_media_type {
+                            // A forged declared media type is an explicit
+                            // refusal, never a relabel of active content.
+                            refused = Some(codes::MALFORMED_EVENT.to_string());
+                            break;
+                        }
+                        resolved_records.push(AttachmentRecord {
+                            attachment: record.attachment.clone(),
+                            state: AttachmentState::Available,
+                            available: Some(available),
+                            refused_code: None,
+                        });
+                    }
+                    Ok(AttachmentImportStatus::Pending) => {
+                        resolved_records.push(record.clone());
+                        all_available = false;
+                    }
+                    Ok(AttachmentImportStatus::Refused { code }) => {
+                        refused = Some(code);
+                        break;
+                    }
+                    Err(error) => {
+                        all_available = false;
+                        resolved_records.push(record.clone());
+                        let _ = error;
+                        break;
+                    }
+                }
+            } else if record.state == AttachmentState::Available {
+                resolved_records.push(record.clone());
+            } else {
+                refused = Some(record.refused_code.clone().unwrap_or_else(|| codes::INTERNAL.to_string()));
+                break;
+            }
+        }
+        if let Some(code) = refused {
+            // Durable explicit rejection; nothing resubmits.
+            let mut adapter = HostIngressCoreAdapter::new(
+                &mut self.host,
+                self.authority,
+                self.grant,
+                &mut self.store,
+                self.config.revision,
+            );
+            adapter
+                .commit_outcome(&intent.intent_key, None, Some(&code))
+                .map_err(|error| {
+                    ChannelError::new(
+                        codes::INTERNAL,
+                        false,
+                        ChannelOutcome::NotApplied,
+                        format!("attachment refusal durability failed: {error:?}"),
+                    )
+                })?;
+            return Ok(true);
+        }
+        if !all_available {
+            intent.attachments = resolved_records;
+            self.store.write_prepared(&intent)?;
+            return Ok(false);
+        }
+        // Every required asset is AVAILABLE: append the ordered Asset parts to
+        // the placeholder draft and submit exactly once, then commit terminal.
+        let parsed = serde_json::from_str::<serde_json::Value>(&intent.request_jcs).map_err(
+            |_| ChannelError::new(codes::INTERNAL, false, ChannelOutcome::NotApplied, "attachment intent placeholder draft is not JSON"),
+        )?;
+        let mut draft_value = parsed;
+        let mut parts = draft_value
+            .get("parts")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for record in resolved_records
+            .iter()
+            .filter(|record| record.state == AttachmentState::Available)
+        {
+            if let Some(available) = &record.available {
+                let mut part = serde_json::json!({
+                    "kind": "asset",
+                    "asset_id": available.asset_id,
+                    "media_type": available.media_type,
+                });
+                if let Some(view) = &available.view {
+                    part["view"] = serde_json::to_value(view).expect("canonical crop serializes");
+                }
+                parts.push(part);
+            }
+        }
+        draft_value["parts"] = serde_json::Value::Array(parts);
+        let draft = dolly_canonical_json::CanonicalJsonValue::try_from(draft_value).map_err(|_| {
+            ChannelError::new(codes::INTERNAL, false, ChannelOutcome::NotApplied, "final attachment draft is not canonical JSON")
+        })?;
+        let request = IngressSubmitRequest {
+            operation_id: ids::operation_id(&intent.account, &intent.external_event_id, 2),
+            module_id: intent.module_id.clone(),
+            idempotency_key: intent.intent_key.clone(),
+            draft: draft.clone(),
+            target_page_ids: intent.target_page_ids.clone(),
+            deadline: crate::clock::timestamp_plus_seconds(
+                self.clock.now().as_str(),
+                self.config.operation_deadline_seconds as i64,
+            ),
+        };
+        // Re-derive the FINAL intent (digest bound to the Asset-bearing draft)
+        // and persist it BEFORE the Host submit, so the seam's submit
+        // idempotency comparison sees the byte-identical request and never a
+        // digest conflict against the placeholder draft. A lost response then
+        // leaves the final prepared intent for the next status-first pass
+        // (no duplicate effect, no fabricated reference).
+        let facts = crate::host_adapter::channel_facts_from_draft(&request.draft).map_err(|error| {
+            ChannelError::new(
+                codes::INTERNAL,
+                false,
+                ChannelOutcome::NotApplied,
+                format!("final attachment draft facts unavailable: {error:?}"),
+            )
+        })?;
+        let mut final_intent = crate::host_adapter::prepare_intent(
+            &self.principal,
+            self.config.revision,
+            &request,
+            &facts,
+        )?;
+        final_intent.attachments = resolved_records;
+        self.store.replace_pending_attachment_intent(&final_intent)?;
+        let submitted = {
+            let mut adapter = HostIngressCoreAdapter::new(
+                &mut self.host,
+                self.authority,
+                self.grant,
+                &mut self.store,
+                self.config.revision,
+            );
+            adapter.submit(&request)
+        };
+        match submitted {
+            Ok(IngressSubmitReceipt::Committed { commit, .. }) => {
+                let mut adapter = HostIngressCoreAdapter::new(
+                    &mut self.host,
+                    self.authority,
+                    self.grant,
+                    &mut self.store,
+                    self.config.revision,
+                );
+                adapter
+                    .commit_outcome(&final_intent.intent_key, Some(&commit.block_id), None)
+                    .map_err(|error| {
+                        ChannelError::new(
+                            codes::INTERNAL,
+                            false,
+                            ChannelOutcome::NotApplied,
+                            format!("attachment intent terminal commit failed: {error:?}"),
+                        )
+                    })?;
+                Ok(true)
+            }
+            _ => {
+                // Unknown/lost: the FINAL prepared intent stays (never a
+                // duplicate effect) for the next status-first pass.
+                Ok(false)
+            }
+        }
+    }
 }
+
+
 
 fn rebuild_request(
     intent: &crate::intent::ChannelIntent,

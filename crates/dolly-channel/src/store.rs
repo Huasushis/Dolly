@@ -1303,6 +1303,46 @@ impl<'connection> SqliteChannelStore<'connection> {
         transaction.commit().map_err(map_sqlite)
     }
 
+    /// Replace one `prepared` attachment intent with its FINAL Asset-bearing
+    /// form (placeholder draft -> final draft, new digest) as assets become
+    /// AVAILABLE during status-first recovery. Text-only prepared intents and
+    /// terminal rows are immutable; only rows carrying attachment records may
+    /// be upgraded, and only in the `Prepared` state, so the digest-bound
+    /// crash/replay guard is never bypassed for ordinary events.
+    pub fn replace_pending_attachment_intent(&mut self, intent: &ChannelIntent) -> Result<(), ChannelError> {
+        self.verify_owner_meta()?;
+        if intent.state != IntentState::Prepared || intent.attachments.is_empty() {
+            return Err(corrupted(
+                "replace_pending_attachment_intent requires a prepared attachment intent",
+            ));
+        }
+        if intent.schema != CHANNEL_INTENT_RECORD_SCHEMA {
+            return Err(corrupted("channel intent record discriminator mismatch"));
+        }
+        let Some(existing) = self.load_intent(&intent.intent_key)? else {
+            return Err(ChannelError::new(
+                codes::OPERATION_CONFLICT,
+                false,
+                ChannelOutcome::NotApplied,
+                "the attachment intent row vanished before finalization",
+            ));
+        };
+        if existing.state != IntentState::Prepared || existing.attachments.is_empty() {
+            return Err(ChannelError::new(
+                codes::OPERATION_CONFLICT,
+                false,
+                ChannelOutcome::NotApplied,
+                "only a prepared attachment intent may be finalized",
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite)?;
+        Self::write_intent_row(&transaction, intent)?;
+        transaction.commit().map_err(map_sqlite)
+    }
+
     /// Atomically commit the terminal outcome in ONE Channel DB transaction.
     /// If this transaction fails, the durable row stays `prepared`
     /// (reconcilable by `status`-first), never `accepted`-without-ledger.
@@ -2379,6 +2419,7 @@ impl<'connection> SqliteChannelStore<'connection> {
                     ingress_key: record.intent_key.clone(),
                     operation_digest: record.digest.clone(),
                     block_id: record.block_id.clone(),
+                    attachments: record.attachments.clone(),
                     pages: record.target_page_ids.clone(),
                     config_revision: record.config_revision,
                     attempts: Vec::new(),
@@ -2600,6 +2641,7 @@ mod tests {
             target_page_ids: vec!["page-a".to_string()],
             payload_digest,
             request_jcs,
+            attachments: Vec::new(),
             block_id: None,
             rejected_code: None,
         }

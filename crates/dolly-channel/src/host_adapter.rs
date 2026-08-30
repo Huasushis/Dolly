@@ -226,6 +226,7 @@ pub(crate) fn prepare_intent(
         target_page_ids: request.target_page_ids.clone(),
         payload_digest,
         request_jcs,
+        attachments: Vec::new(),
         block_id: None,
         rejected_code: None,
     })
