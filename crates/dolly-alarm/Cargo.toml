@@ -18,5 +18,9 @@ parking_lot = "0.12"
 tempfile = "3"
 
 [[test]]
+name = "contract"
+path = "tests/contract.rs"
+[[test]]
 name = "conformance"
 path = "tests/conformance.rs"
+

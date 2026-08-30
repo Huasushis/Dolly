@@ -16,7 +16,7 @@ use std::path::Path;
 
 /// 2025-11-02T05:30:00Z — inside the America/New_York 2025a autumn fold
 /// (06:00Z transition), on a Sunday.
-const T0_US: i64 = 1_762_072_200_000_000;
+const T0_US: i64 = 1_762_061_400_000_000; // 2025-11-02T05:30:00Z
 
 fn uuid_v7(seed: u64) -> String {
     // Valid UUIDv7 (version nibble 7, variant nibble a/b).
@@ -126,7 +126,6 @@ fn first_artifact_create_then_restart_same_next_and_identity() {
         .zone("America/New_York-2025a")
         .expect("fixture");
     assert_eq!(zone.offset_minutes_at(T0_US), -240); // EDT before 06:00Z
-    assert_eq!(zone.offset_minutes_at(1_762_072_200_000_000 + 1), -240);
     let _ = alarm_id;
 }
 
@@ -172,3 +171,6 @@ fn first_artifact_wakeup_never_creates_action_authority() {
     // Applying no action leaves no durable state behind.
     assert_eq!(scheduler.store().count_active_alarms().expect("count"), 0);
 }
+
+use dolly_alarm::clock::SharedFixedClock;
+use dolly_alarm::record::MisfirePolicy;

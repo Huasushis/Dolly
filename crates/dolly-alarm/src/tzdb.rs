@@ -207,7 +207,7 @@ fn fixture_zones() -> Vec<FixedZone> {
             },
             ZoneTransition {
                 // 2025-11-02T06:00:00Z: 02:00 EDT -> 01:00 EST.
-                at_us: 1762072800 * US_PER_SECOND,
+                at_us: 1762063200 * US_PER_SECOND,
                 to_offset_minutes: -300,
             },
         ],
@@ -218,12 +218,12 @@ fn fixture_zones() -> Vec<FixedZone> {
         transitions: vec![
             ZoneTransition {
                 // 2026-03-08T07:00:00Z: 02:00 EST -> 03:00 EDT.
-                at_us: 1772348400 * US_PER_SECOND,
+                at_us: 1772953200 * US_PER_SECOND,
                 to_offset_minutes: -240,
             },
             ZoneTransition {
                 // 2026-11-01T06:00:00Z: 02:00 EDT -> 01:00 EST.
-                at_us: 1793624400 * US_PER_SECOND,
+                at_us: 1793512800 * US_PER_SECOND,
                 to_offset_minutes: -300,
             },
         ],

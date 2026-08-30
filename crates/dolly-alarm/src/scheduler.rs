@@ -1117,7 +1117,7 @@ fn perform_misfire_pass(
         .collect();
     // 1. Within-grace unmaterialized instants become claimable rows.
     let (within_instants, _) =
-        window_occurrences(schedule, grace_lo.saturating_add(1), now, grace_cap)?;
+        window_occurrences(schedule, grace_lo.saturating_add(1), now, grace_cap, false)?;
     for instant in &within_instants {
         if row_by_instant.contains(&(instant.scheduled_us, instant.fold_ordinal)) {
             continue;
@@ -1147,7 +1147,7 @@ fn perform_misfire_pass(
     // 2. Beyond-grace: newest `keep_limit` instants may still fire; all older
     //    become missed, rounded into the bounded diagnostic.
     let (old_instants, old_total) =
-        window_occurrences(schedule, scan_lo, grace_lo, max_catch_up as usize + 4)?;
+        window_occurrences(schedule, scan_lo, grace_lo, max_catch_up as usize + 4, true)?;
     let keep_limit = match policy {
         MisfirePolicy::Skip => 0,
         MisfirePolicy::FireOnce => 1,
@@ -1267,13 +1267,44 @@ fn roll_occurrences_tx(
     horizon_seconds: u64,
 ) -> Result<(), AlarmError> {
     let horizon_us = now.saturating_add(horizon_seconds as i64 * US_PER_SECOND);
-    let (batch, _) =
-        window_occurrences(schedule, now.saturating_add(1), horizon_us, ROLL_BATCH_ROWS)?;
-    let mut inserted = 0usize;
+    // Always the exact next occurrence (even beyond the horizon) so the
+    // wakeup cursor is exact; then eagerly the following occurrences inside
+    // the horizon, head-first so a dense schedule never drops its earliest
+    // due row.
+    let Some(next) = next_after(schedule, now)? else {
+        return Ok(());
+    };
+    insert_occurrence_tx(
+        tx,
+        &NewOccurrence {
+            occurrence_id: occurrence_id(
+                alarm_id,
+                rule_revision,
+                next.scheduled_us,
+                next.fold_ordinal,
+            ),
+            scheduled_us: next.scheduled_us,
+            fold_ordinal: next.fold_ordinal,
+            kind: OccurrenceKind::Scheduled,
+            repeat_ordinal: 0,
+            parent_occurrence_id: None,
+        },
+        rule_revision,
+        alarm_id,
+        &format_utc_iso6(next.scheduled_us),
+        now_at,
+    )?;
+    if next.scheduled_us >= horizon_us {
+        return Ok(());
+    }
+    let (batch, _) = window_occurrences(
+        schedule,
+        next.scheduled_us.saturating_add(1),
+        horizon_us,
+        ROLL_BATCH_ROWS,
+        false,
+    )?;
     for instant in &batch {
-        if inserted >= ROLL_BATCH_ROWS {
-            break;
-        }
         insert_occurrence_tx(
             tx,
             &NewOccurrence {
@@ -1294,33 +1325,6 @@ fn roll_occurrences_tx(
             &format_utc_iso6(instant.scheduled_us),
             now_at,
         )?;
-        inserted += 1;
-    }
-    if batch.is_empty() {
-        // The exact next may sit beyond the horizon; materialize it anyway so
-        // the wakeup cursor is exact.
-        if let Some(next) = next_after(schedule, now)? {
-            insert_occurrence_tx(
-                tx,
-                &NewOccurrence {
-                    occurrence_id: occurrence_id(
-                        alarm_id,
-                        rule_revision,
-                        next.scheduled_us,
-                        next.fold_ordinal,
-                    ),
-                    scheduled_us: next.scheduled_us,
-                    fold_ordinal: next.fold_ordinal,
-                    kind: OccurrenceKind::Scheduled,
-                    repeat_ordinal: 0,
-                    parent_occurrence_id: None,
-                },
-                rule_revision,
-                alarm_id,
-                &format_utc_iso6(next.scheduled_us),
-                now_at,
-            )?;
-        }
     }
     Ok(())
 }

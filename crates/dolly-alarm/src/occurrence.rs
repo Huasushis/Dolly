@@ -297,15 +297,18 @@ pub fn next_after(
     }
 }
 
-/// Occurrence instants in the inclusive window `[lo, hi]`: at most `cap` of
-/// the most recent plus the total count. Used by the deterministic misfire
-/// backfill; per-day evaluation is bounded by the cron iteration bound and
-/// interval arithmetic is O(1). `cap == 0` retains no instants (count only).
+/// Occurrence instants in the inclusive window `[lo, hi]`: at most `cap`
+/// entries plus the total count. `most_recent == true` keeps the newest
+/// entries (misfire keepers); `false` keeps the oldest (the horizon roll must
+/// never drop the actual next occurrence). Per-day evaluation is bounded by
+/// the cron iteration bound and interval arithmetic is O(1). `cap == 0`
+/// retains no instants (count only).
 pub fn window_occurrences(
     schedule: &Schedule,
     lo: UsInstant,
     hi: UsInstant,
     cap: usize,
+    most_recent: bool,
 ) -> Result<(Vec<OccurrenceInstant>, u64), AlarmError> {
     if hi < lo {
         return Ok((Vec::new(), 0));
@@ -427,7 +430,11 @@ pub fn window_occurrences(
     out.sort_by_key(|o| o.scheduled_us);
     if out.len() > cap {
         let keep = out.len() - cap;
-        out.drain(..keep);
+        if most_recent {
+            out.drain(..keep);
+        } else {
+            out.truncate(cap);
+        }
     }
     Ok((out, total))
 }

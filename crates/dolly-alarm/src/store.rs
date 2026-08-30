@@ -310,21 +310,29 @@ fn transaction<T>(
 }
 
 fn row_from_statement(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlarmRow> {
-    let schedule_json: String = row.get("schedule_json")?;
-    let delivery_json: String = row.get("delivery_json")?;
-    let schedule_shape = serde_json::from_str(&schedule_json).map_err(sql_convert)?;
-    let delivery_shape = serde_json::from_str(&delivery_json).map_err(sql_convert)?;
-    let misfire_policy =
-        serde_json::from_str::<MisfirePolicy>(&row.get::<_, String>("misfire_policy")?)
+    let schedule_shape: ScheduleShape =
+        serde_json::from_str::<ScheduleShape>(&row.get::<_, String>("schedule_json")?)
             .map_err(sql_convert)?;
-    let dst_gap_policy = serde_json::from_str::<crate::occurrence::DstGapPolicy>(
-        &row.get::<_, String>("dst_gap_policy")?,
-    )
-    .map_err(sql_convert)?;
-    let dst_fold_policy = serde_json::from_str::<crate::occurrence::DstFoldPolicy>(
-        &row.get::<_, String>("dst_fold_policy")?,
-    )
-    .map_err(sql_convert)?;
+    let delivery_shape: DeliveryShape =
+        serde_json::from_str::<DeliveryShape>(&row.get::<_, String>("delivery_json")?)
+            .map_err(sql_convert)?;
+    let misfire_policy = match row.get::<_, String>("misfire_policy")?.as_str() {
+        "skip" => MisfirePolicy::Skip,
+        "fire_once" => MisfirePolicy::FireOnce,
+        "catch_up" => MisfirePolicy::CatchUp,
+        token => return Err(convert_token("misfire_policy", token)),
+    };
+    let dst_gap_policy = match row.get::<_, String>("dst_gap_policy")?.as_str() {
+        "shift_by_gap" => crate::occurrence::DstGapPolicy::ShiftByGap,
+        "skip" => crate::occurrence::DstGapPolicy::Skip,
+        token => return Err(convert_token("dst_gap_policy", token)),
+    };
+    let dst_fold_policy = match row.get::<_, String>("dst_fold_policy")?.as_str() {
+        "earlier" => crate::occurrence::DstFoldPolicy::Earlier,
+        "later" => crate::occurrence::DstFoldPolicy::Later,
+        "both" => crate::occurrence::DstFoldPolicy::Both,
+        token => return Err(convert_token("dst_fold_policy", token)),
+    };
     Ok(AlarmRow {
         alarm_id: row.get("alarm_id")?,
         revision: row.get::<_, i64>("revision").map(|v| v as u64)?,
@@ -344,6 +352,16 @@ fn row_from_statement(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlarmRow> {
         updated_at: row.get("updated_at")?,
         deleted: row.get("deleted")?,
     })
+}
+
+fn convert_token(field: &str, token: &str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::other(format!(
+            "invalid {field} token {token:?}"
+        ))),
+    )
 }
 
 fn sql_convert<E: std::error::Error + Send + Sync + 'static>(error: E) -> rusqlite::Error {
@@ -1458,6 +1476,7 @@ pub(crate) fn recompute_next_tx(
         )
         .optional()
         .map_err(|e| db_unavailable("next tx query", e))?
+        .flatten()
     } else {
         tx.query_row(
             "SELECT MIN(o.scheduled_at) FROM occurrences o
@@ -1467,6 +1486,7 @@ pub(crate) fn recompute_next_tx(
         )
         .optional()
         .map_err(|e| db_unavailable("next tx query", e))?
+        .flatten()
     };
     tx.execute(
         "UPDATE alarms SET next_occurrence = ?1 WHERE alarm_id = ?2",
