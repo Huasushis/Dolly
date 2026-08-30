@@ -1,28 +1,29 @@
-//! Authoritative WP-013B multimodal conformance seed — frozen at base
+//! Authoritative WP-013B multimodal conformance — frozen base
 //! `5edbd46ab4abb488d6c010c2eeb8d7f41e0b9dc3` (the G4 gate is closed: the
 //! Asset Host route, the durable Channel inbound route, and the committed
 //! targeted-Action outbound route are all wired and green).
 //!
-//! The matrix fixture is the authoritative document; the executables split
-//! into:
+//! The matrix fixture (`fixtures/wp013b_multimodal_conformance.json`) is the
+//! authoritative document: 17 frozen cases (11 `pass`, 6 causal
+//! `product_red`). Every executable drives only the accepted public
+//! runtime/Asset/Channel seams:
 //!
-//! - `pass` (`WP013B-AVAIL-LEASE-001`): the accepted base already satisfies
-//!   the Asset-side contract through the real public route/surface — a
-//!   canonical AVAILABLE AssetRef imported under the sealed Host authority,
-//!   and a valid current lease/read of that same asset in the same security
-//!   domain with deterministic GC and fail-closed tombstone refusal. A
-//!   regression here is a product violation.
-//! - causal `product_red` (`WP013B-STALE-REF-EFFECT-001`): the frozen
-//!   channel-send arguments schema already admits `{"kind":"asset"}` Parts,
-//!   but the v1 send authority rejects any asset Part with
-//!   `CHANNEL_UNSUPPORTED_MODALITY` and the committed-Action consumer drops
-//!   the Action silently, so a committed Action carrying a stale/revoked
-//!   (tombstoned) AssetRef is never refused by an asset authority at effect
-//!   time — no refusal outcome, no durable outbound row, no transport call.
-//!   The probe first proves the entire real causal chain works (a text twin
-//!   drains to Terminal Confirmed through the very same route), so the
-//!   failure is attributable only to the missing WP-013B AssetPart effect
-//!   authority, never to the harness.
+//! - `pass` cases verify the Asset authority (canonical AVAILABLE AssetRef,
+//!   current lease/ownership, fail-closed negatives, media kinds and bounds,
+//!   config bounds) and the Channel authority (current ActivationManifest +
+//!   current grant, bounded queue/caller deadlines, status-first restart
+//!   recovery, exact result envelopes, redaction, text-only non-regression,
+//!   runtime route lifecycle). A regression here is a product violation.
+//! - causal `product_red` cases drive the committed-Action consumer and the
+//!   inbound route with asset Parts/attachments and observe the absent
+//!   WP-013B seam: every asset-part action is silently dropped at
+//!   `authorize_send`'s `CHANNEL_UNSUPPORTED_MODALITY`, so ordering, media
+//!   authority, crop/view checks, inbound attachment import, and multimodal
+//!   crash/lease recovery cannot exist. Each red probe first proves the whole
+//!   real causal chain it names (route import, lease/tombstone, committed
+//!   Action, ActivationManifest authority, text-twin dispatch through the
+//!   same route), so every failure is attributable to the missing product
+//!   seam, never to the harness.
 //!
 //! Premise direction is invariant: producer/upstream premise -> durable
 //! explicit premise -> consumer/downstream only. No test here mints a
@@ -50,14 +51,15 @@ use dolly_asset::replica::DisabledReplica;
 use dolly_asset::service::AssetService;
 use dolly_asset::AssetCapability;
 use dolly_runtime::{
-    AssetHostRoute, ChannelOutboundRoute, authenticated_channel_event,
+    AssetHostRoute, ChannelOutboundRoute, HostRouteError, authenticated_channel_event,
     install_channel_store_schema, open_channel_inbound_route,
 };
 use dolly_channel::{
-    ChannelConfig, ChannelConfigBuilder, ChannelEventContent, EventKind, IngressOutcome,
-    TransportSendResult, VirtualClock,
+    ChannelConfig, ChannelConfigBuilder, ChannelEventContent, EventKind, InboundState,
+    IngressOutcome, OutboundState, TransportSendResult, VirtualClock, parse_event,
 };
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -286,6 +288,20 @@ fn png_bytes(w: u32, h: u32) -> Vec<u8> {
     bytes
 }
 
+/// A minimal byte sequence that sniffs as a GIF89a of size WxH.
+fn gif_bytes(w: u16, h: u16) -> Vec<u8> {
+    let mut bytes = b"GIF89a".to_vec();
+    bytes.extend_from_slice(&w.to_le_bytes());
+    bytes.extend_from_slice(&h.to_le_bytes());
+    bytes.extend_from_slice(&[0u8; 16]);
+    bytes
+}
+
+/// A minimal active-content (SVG) byte sequence.
+fn svg_bytes() -> Vec<u8> {
+    b"<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1\"/>".to_vec()
+}
+
 fn base64(bytes: &[u8]) -> String {
     const B64: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -413,6 +429,8 @@ struct RouteSharedTransport {
 struct RouteSharedInner {
     script: Vec<dolly_channel::transport::TransportSendResult>,
     calls: Vec<dolly_channel::transport::TransportSendRequest>,
+    status_script: Vec<(String, dolly_channel::transport::TransportStatusResult)>,
+    status_calls: Vec<dolly_channel::transport::TransportStatusRequest>,
 }
 
 impl RouteSharedTransport {
@@ -429,11 +447,29 @@ impl RouteSharedTransport {
             .script
             .push(result);
     }
+    fn push_status(
+        &self,
+        action_id: &str,
+        result: dolly_channel::transport::TransportStatusResult,
+    ) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .status_script
+            .push((action_id.to_string(), result));
+    }
     fn calls(&self) -> Vec<dolly_channel::transport::TransportSendRequest> {
         self.inner
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .calls
+            .clone()
+    }
+    fn status_calls(&self) -> Vec<dolly_channel::transport::TransportStatusRequest> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .status_calls
             .clone()
     }
 }
@@ -455,9 +491,42 @@ impl dolly_channel::ChannelTransport for RouteSharedTransport {
     }
     fn status(
         &mut self,
-        _request: &dolly_channel::transport::TransportStatusRequest,
+        request: &dolly_channel::transport::TransportStatusRequest,
     ) -> dolly_channel::transport::TransportStatusResult {
-        dolly_channel::transport::TransportStatusResult::Unknown
+        let mut inner = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
+        inner.status_calls.push(request.clone());
+        let pos = inner
+            .status_script
+            .iter()
+            .position(|(id, _)| id == &request.action_id);
+        match pos {
+            Some(idx) => inner.status_script.remove(idx).1.clone(),
+            None => dolly_channel::transport::TransportStatusResult::Unknown,
+        }
+    }
+}
+
+/// A fixed guest clock pinned to a later instant than the caller deadline,
+/// for deterministic caller-deadline expiry in the queue-bound probe.
+#[derive(Clone, Debug)]
+struct ChannelLateClock {
+    at: Arc<Mutex<dolly_core_domain::Timestamp>>,
+}
+
+impl ChannelLateClock {
+    fn at(timestamp: dolly_core_domain::Timestamp) -> Self {
+        Self {
+            at: Arc::new(Mutex::new(timestamp)),
+        }
+    }
+}
+
+impl dolly_channel::Clock for ChannelLateClock {
+    fn now(&self) -> dolly_core_domain::Timestamp {
+        self.at
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
     }
 }
 
@@ -562,21 +631,62 @@ fn route_send_block(module_id: &str, action_id: &str, session_id: &str, texts: &
     send_action(module_id, action_id, session_id, parts)
 }
 
-/// A committed send block whose only Part binds an AssetRef (`asset_id`).
-/// The frozen channel-send arguments schema admits this `kind:"asset"` Part;
-/// the v1 send authority does not.
-fn route_asset_send_block(
+/// A committed block carrying N targeted send Actions (burst shape).
+fn route_send_block_multi(
+    module_id: &str,
+    action_ids: &[&str],
+    session_id: &str,
+    texts: &[&str],
+) -> Value {
+    let parts: Vec<Value> = texts
+        .iter()
+        .map(|t| json!({"kind": "text", "text": t, "format": "plain"}))
+        .collect();
+    let actions = action_ids
+        .iter()
+        .map(|action_id| {
+            let action = send_action(module_id, action_id, session_id, parts.clone());
+            action["body"]["actions"]
+                .as_array()
+                .cloned()
+                .expect("one action per send")
+                .remove(0)
+        })
+        .collect::<Vec<Value>>();
+    json!({
+        "schema": "dolly.block/v1",
+        "id": format!("block-{}", action_ids[0]),
+        "body": {
+            "description": "model response",
+            "parts": [],
+            "actions": actions
+        }
+    })
+}
+
+/// A committed send block whose Part binds an AssetRef (`asset_id`). The
+/// frozen channel-send arguments schema admits this `kind:"asset"` Part; the
+/// v1 send authority does not.
+fn route_asset_send_block_with_parts(
     module_id: &str,
     action_id: &str,
     session_id: &str,
-    asset_id: &str,
+    parts: Vec<Value>,
 ) -> Value {
-    let part = json!({
+    send_action(module_id, action_id, session_id, parts)
+}
+
+/// The canonical asset Part shape the frozen schema already admits.
+fn asset_part(asset_id: &str, media_type: &str, view: Option<Value>) -> Value {
+    let mut part = json!({
         "kind": "asset",
         "asset_id": asset_id,
-        "media_type": "image/png"
+        "media_type": media_type
     });
-    send_action(module_id, action_id, session_id, vec![part])
+    if let Some(view) = view {
+        part["view"] = view;
+    }
+    part
 }
 
 /// Commit a targeted send block durably and persist an ACTIVATED manifest
@@ -758,6 +868,172 @@ fn product_red(case_id: &str, seam: &str, cause: &str, area: &str) -> ! {
 }
 
 // ---------------------------------------------------------------------------
+// Shared consumer scaffold: the real registration path with an authenticated
+// upstream premise that yields the account-owned session.
+// ---------------------------------------------------------------------------
+
+/// A real runtime DB + module-scoped Channel store with config, producer
+/// graph, sealed Host authority, capability grant, and a committed
+/// authenticated upstream premise (the exact base every outbound probe
+/// starts from). Returns the session bound to that premise.
+#[allow(clippy::type_complexity)]
+fn consumer_scaffold(
+    mark: &str,
+) -> (
+    Connection,
+    Connection,
+    HostConnectionAuthority,
+    HostCapabilityGrant,
+    ChannelConfig,
+    VirtualClock,
+    String,
+) {
+    let (mut runtime, authority, grant) = route_harness(
+        "web-channel",
+        "org.dolly.channel",
+        mark,
+        &["host.ingress.submit"],
+        &[TARGET_PAGE],
+    );
+    let mut module_store = channel_store_connection();
+    let config = channel_config();
+    let clock = channel_clock();
+    {
+        let mut receiver = open_channel_inbound_route(
+            &mut runtime,
+            &mut module_store,
+            config.clone(),
+            Box::new(clock.clone()),
+            &authority,
+            &grant,
+        )
+        .expect("channel route registration");
+        let event = authenticated_channel_event(
+            &authority,
+            &grant,
+            config.revision,
+            route_content_event("conv-1", "in-1", "What is the weather?"),
+        )
+        .expect("authenticated event seals under the grant");
+        assert!(
+            matches!(receiver.ingest_event(&event), IngressOutcome::Committed { .. }),
+            "the upstream premise commits through the route"
+        );
+    }
+    let principal = dolly_channel::ChannelPrincipal::from_authority_grant(&authority, &grant)
+        .expect("principal");
+    let session_id = dolly_channel::ids::dolly_session_id(principal.account(), "conv-1");
+    (
+        runtime,
+        module_store,
+        authority,
+        grant,
+        config,
+        clock,
+        session_id,
+    )
+}
+
+/// The generic causal-red probe for the outbound multimodal seam. It first
+/// dispatches a text twin to Terminal Confirmed through the very same route
+/// (harness health; a failure there is a harness error), then commits the
+/// given asset-part Action and observes the absent WP-013B effect path.
+fn asset_part_red_probe(
+    case_id: &str,
+    mark: &str,
+    control_action_id: &str,
+    asset_action_id: &str,
+    seam: &str,
+    cause: &str,
+    parts: Vec<Value>,
+) -> ! {
+    let (mut runtime, mut module_store, authority, grant, config, clock, session_id) =
+        consumer_scaffold(mark);
+
+    // Harness control: the committed-Action consumer route and the
+    // ActivationManifest authority dispatch a text twin to Terminal Confirmed.
+    let control_block = route_send_block("web-channel", control_action_id, &session_id, &["harness control"]);
+    commit_send_and_activate(
+        &mut runtime,
+        &authority,
+        &grant,
+        mark,
+        ROUTE_INPUT_PAGE,
+        control_block,
+        config.clone(),
+    );
+    let route = ChannelOutboundRoute::register(
+        config.clone(),
+        &mut module_store,
+        &authority,
+        &grant,
+    )
+    .expect("outbound route registration");
+    let control_transport = RouteSharedTransport::new(true);
+    control_transport.push(TransportSendResult::AllConfirmed {
+        message_ids: vec!["transport-control-1".to_string()],
+    });
+    let control = route
+        .consume_once(
+            &mut module_store,
+            &mut runtime,
+            Box::new(clock.clone()),
+            Box::new(control_transport.clone()),
+            &far_deadline_str(),
+        )
+        .expect("control consumer pass must succeed (harness health)");
+    assert_eq!(
+        control.transported, 1,
+        "harness control: the committed-Action text twin must dispatch"
+    );
+    assert_eq!(
+        control_transport.calls().len(),
+        1,
+        "harness control: exactly one transport call for the text twin"
+    );
+
+    // Asset leg: the committed Action now carries the multimodal Part.
+    let asset_block =
+        route_asset_send_block_with_parts("web-channel", asset_action_id, &session_id, parts);
+    commit_send_and_activate(
+        &mut runtime,
+        &authority,
+        &grant,
+        &format!("{mark}-asset"),
+        ROUTE_INPUT_PAGE,
+        asset_block,
+        config.clone(),
+    );
+    let asset_transport = RouteSharedTransport::new(true);
+    let pass = route
+        .consume_once(
+            &mut module_store,
+            &mut runtime,
+            Box::new(clock.clone()),
+            Box::new(asset_transport.clone()),
+            &far_deadline_str(),
+        )
+        .expect("consumer pass over the asset-part Action");
+    assert_eq!(
+        asset_transport.calls().len(),
+        0,
+        "no asset Part may reach the transport on the accepted base"
+    );
+    if pass.rejected == 0 && pass.transported == 0 && pass.terminal.is_empty() {
+        product_red(case_id, seam, cause, "channel_multimodal_effect_authority");
+    }
+    product_red(
+        case_id,
+        seam,
+        &format!(
+            "the run reported rejections {:?}, transported {}, terminal {}, pending {}, remaining {} instead of the missing multimodal effect path",
+            pass.rejected_codes, pass.transported, pass.terminal.len(), pass.pending, pass.remaining
+        ),
+        "channel_multimodal_effect_authority",
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Matrix retention: the authoritative document stays canonical.
 // ---------------------------------------------------------------------------
 
@@ -770,10 +1046,10 @@ fn wp013b_matrix_retains_declared_cases_and_causal_classification() {
         "matrix must name its normative spec basis"
     );
 
-    // The seed freezes exactly one pass and one causal product_red.
+    // The matrix freezes exactly 11 pass and 6 causal product_red cases.
     let counts = &document["expected_counts"];
-    assert_eq!(counts["pass"], 1);
-    assert_eq!(counts["product_red"], 1);
+    assert_eq!(counts["pass"], 11);
+    assert_eq!(counts["product_red"], 6);
 
     for expected in ["pass", "product_red"] {
         assert!(
@@ -824,8 +1100,8 @@ fn wp013b_matrix_retains_declared_cases_and_causal_classification() {
             other => panic!("case {id}: unexpected expected classification {other}"),
         }
     }
-    assert_eq!(pass, 1, "the seed matrix freezes exactly one pass case");
-    assert_eq!(red, 1, "the seed matrix freezes exactly one causal product_red");
+    assert_eq!(pass, 11, "the matrix freezes exactly eleven pass cases");
+    assert_eq!(red, 6, "the matrix freezes exactly six causal product_red cases");
     assert_eq!(
         case("WP013B-AVAIL-LEASE-001")["expected"],
         "pass",
@@ -852,7 +1128,22 @@ fn wp013b_matrix_retains_declared_cases_and_causal_classification() {
     }
     for required in [
         "wp013b_avail_lease_round_trip",
+        "wp013b_asset_fail_closed_negatives",
+        "wp013b_manifest_authority",
+        "wp013b_media_kinds_and_bounds",
+        "wp013b_config_bounds",
+        "wp013b_queue_deadline",
+        "wp013b_restart_status_first",
+        "wp013b_envelopes",
+        "wp013b_redaction",
+        "wp013b_text_nonregression",
+        "wp013b_route_lifecycle",
         "wp013b_stale_ref_effect_authority",
+        "wp013b_mixed_ordering",
+        "wp013b_media_abuse_send",
+        "wp013b_crop_view",
+        "wp013b_inbound_attachment",
+        "wp013b_lease_restart",
     ] {
         assert!(
             evidence.contains_key(required),
@@ -862,7 +1153,7 @@ fn wp013b_matrix_retains_declared_cases_and_causal_classification() {
 }
 
 // ---------------------------------------------------------------------------
-// Pass: canonical AVAILABLE AssetRef with a valid current lease under the
+// PASS: canonical AVAILABLE AssetRef with a valid current lease under the
 // route authority domain.
 // ---------------------------------------------------------------------------
 
@@ -963,19 +1254,9 @@ fn wp013b_avail_lease_canonical_assetref_round_trip() {
     let asset_id = asset.asset_id.as_str().to_string();
     let (mut service, clock) = asset_service_at(&asset_root);
     let domain = authority.extension_connection_id().to_string();
-    let capability = service.issue_capability(
-        domain.clone(),
-        asset_route_instance(&authority),
-        "module-a",
-    );
+    let capability = service.issue_capability(domain.clone(), asset_route_instance(&authority), "module-a");
     let lease = service
-        .lease(
-            &capability,
-            &asset_id,
-            "wp013b-send",
-            "channel asset part",
-            240_000,
-        )
+        .lease(&capability, &asset_id, "wp013b-send", "channel asset part", 240_000)
         .expect("finite lease under the same authority domain");
     assert!(lease.lease_id.len() >= 32, "unguessable LeaseId");
     assert_eq!(lease.asset_id, asset_id);
@@ -1033,6 +1314,1020 @@ fn asset_route_instance(authority: &HostConnectionAuthority) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// PASS: pending/failed/deleted/stale/revoked/expired/foreign/noncanonical
+// refs fail closed at the asset authority.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wp013b_asset_negatives_fail_closed() {
+    let entry = case("WP013B-ASSET-NEGATIVE-001");
+    assert_eq!(entry["expected"], "pass");
+
+    // Noncanonical AssetId encodings are rejected at parse: wrong prefix,
+    // wrong alphabet, wrong length.
+    assert!(
+        "ast-b3-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"
+            .parse::<AssetId>()
+            .is_err(),
+        "wrong AssetId prefix"
+    );
+    assert!(
+        "ast_b3_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaz"
+            .parse::<AssetId>()
+            .is_err(),
+        "z is outside the base32 alphabet"
+    );
+    assert!(
+        "ast_b3_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .parse::<AssetId>()
+            .is_err(),
+        "too short"
+    );
+
+    let scratch = ScratchDir::new("negatives");
+    let (mut service, clock) = asset_service_at(scratch.path());
+    let capability = asset_capability(&service);
+
+    // Failed import: over-limit source is a recorded rejection with no asset.
+    let mut big = png_bytes(4, 2);
+    big.resize(200 * 1024, 0);
+    let failed = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(501),
+                Source::InlineBase64 {
+                    base64: base64(&big),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("over-limit import is a recorded rejection");
+    assert_eq!(failed.state, "rejected");
+    assert!(failed.asset.is_none(), "no availability before refusal");
+    assert_eq!(failed.error.as_ref().expect("envelope")["code"], "SIZE_LIMIT");
+
+    // Foreign (cross-domain) read of otherwise-identical bytes is denied.
+    let png = png_bytes(4, 2);
+    let imported = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(502),
+                Source::InlineBase64 {
+                    base64: base64(&png),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("import");
+    let asset_id = imported.asset.expect("AssetRef").asset_id.as_str().to_string();
+    let uninvolved = service.issue_capability("other", "instance-a", "module-a");
+    match service.read(&uninvolved, &asset_id) {
+        Ok(_) => panic!("cross-domain read must be denied"),
+        Err(denied) => assert_eq!(denied.code, AssetErrorCode::NotFound),
+    }
+
+    // Expired lease confers no durability: after expiry + grace the sweep
+    // tombstones the asset and every further lease/read fails closed
+    // (deleted/stale/revoked-by-GC).
+    let expired = service
+        .lease(&capability, &asset_id, "model-op", "provider output", 60_000)
+        .expect("finite lease");
+    drop(expired);
+    clock.advance(120_000);
+    clock.advance(60_000);
+    let gc = service.run_gc().expect("gc");
+    assert_eq!(gc.tombstones_created, 1, "expired lease then grace tombstones");
+    assert!(
+        !scratch.path().join("objects").join(&asset_id).exists(),
+        "sweep removes the object"
+    );
+    let stale = service
+        .lease(&capability, &asset_id, "late", "late lease", 1000)
+        .expect_err("tombstone must block new leases");
+    assert_eq!(stale.code, AssetErrorCode::NotFound);
+    match service.read(&capability, &asset_id) {
+        Ok(_) => panic!("a tombstoned AssetRef must not be readable"),
+        Err(denied) => assert_eq!(denied.code, AssetErrorCode::NotFound),
+    }
+
+    // Never-created ImportIds answer an authoritative explicit absent through
+    // the real route (no asset, not terminal, no masquerade).
+    let (mut connection, authority, grant) = route_harness(
+        "module-a",
+        "org.dolly.asset",
+        "wp013b-negatives-route",
+        &["host.asset.import", "host.asset.status"],
+        &[],
+    );
+    let mut route = AssetHostRoute::for_activated_module(
+        &mut connection,
+        asset_config_at(scratch.path()),
+        &authority,
+        &grant,
+    )
+    .expect("asset route registration");
+    let absent = route
+        .status(
+            &dolly_asset::facade::AssetStatusRequest::new(
+                "0198ab31-6c44-7e8a-b2bb-000000000811",
+                "module-a",
+                &import_id(901),
+                "2026-08-28T00:00:00.000000Z",
+            )
+            .expect("valid asset status request"),
+        )
+        .expect("absent is an authoritative StatusResult");
+    assert_eq!(absent.state, "absent");
+    assert!(!absent.terminal, "absent must not masquerade as terminal");
+    assert!(absent.asset.is_none(), "absent must never mint an AssetRef");
+    assert!(absent.error.is_none(), "absent must not carry an error");
+}
+
+// ---------------------------------------------------------------------------
+// PASS: committed Action requires the current ActivationManifest, current
+// grant, and never an ingress/runtime-event/cross-extension premise.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wp013b_committed_action_requires_current_manifest_and_grant() {
+    let entry = case("WP013B-MANIFEST-AUTHORITY-001");
+    assert_eq!(entry["expected"], "pass");
+
+    let (mut runtime, mut module_store, authority, grant, config, clock, session_id) =
+        consumer_scaffold("wp013b-ma");
+    let a_id = "0198ab31-6c44-7e8a-b2bb-000000000821";
+    commit_send_and_activate(
+        &mut runtime,
+        &authority,
+        &grant,
+        "wp013b-ma-a",
+        ROUTE_INPUT_PAGE,
+        route_send_block("web-channel", a_id, &session_id, &["first"]),
+        config.clone(),
+    );
+    let route = ChannelOutboundRoute::register(config.clone(), &mut module_store, &authority, &grant)
+        .expect("outbound route registration");
+    let t1 = RouteSharedTransport::new(true);
+    t1.push(TransportSendResult::AllConfirmed {
+        message_ids: vec!["transport-a-1".to_string()],
+    });
+    let pass1 = route
+        .consume_once(
+            &mut module_store,
+            &mut runtime,
+            Box::new(clock.clone()),
+            Box::new(t1.clone()),
+            &far_deadline_str(),
+        )
+        .expect("first manifest pass");
+    assert_eq!(pass1.transported, 1, "manifest A action dispatches");
+    assert_eq!(t1.calls().len(), 1);
+
+    // A second authenticated inbound premise commits durably but is NEVER
+    // selected as an outbound Action: only committed targeted Actions inside
+    // the CURRENT manifest's input_items are referenced.
+    {
+        let mut receiver = open_channel_inbound_route(
+            &mut runtime,
+            &mut module_store,
+            config.clone(),
+            Box::new(clock.clone()),
+            &authority,
+            &grant,
+        )
+        .expect("channel route re-registration");
+        let event = authenticated_channel_event(
+            &authority,
+            &grant,
+            config.revision,
+            route_content_event("conv-2", "in-2", "Ingress premise must never send."),
+        )
+        .expect("sealed event");
+        assert!(
+            matches!(receiver.ingest_event(&event), IngressOutcome::Committed { .. }),
+            "the extra ingress premise commits"
+        );
+    }
+
+    // A NEW manifest (fencing the first) selects only its own Action; the
+    // prior Action and the ingress premise are never drained again.
+    let b_id = "0198ab31-6c44-7e8a-b2bb-000000000822";
+    commit_send_and_activate(
+        &mut runtime,
+        &authority,
+        &grant,
+        "wp013b-ma-b",
+        ROUTE_INPUT_PAGE,
+        route_send_block("web-channel", b_id, &session_id, &["second"]),
+        config.clone(),
+    );
+    let t2 = RouteSharedTransport::new(true);
+    t2.push(TransportSendResult::AllConfirmed {
+        message_ids: vec!["transport-b-1".to_string()],
+    });
+    let pass2 = route
+        .consume_once(
+            &mut module_store,
+            &mut runtime,
+            Box::new(clock.clone()),
+            Box::new(t2.clone()),
+            &far_deadline_str(),
+        )
+        .expect("second manifest pass");
+    assert_eq!(pass2.transported, 1, "only the current manifest Action drains");
+    assert_eq!(pass2.pending, 0);
+    assert_eq!(t2.calls().len(), 1, "the ingress premise is never transported");
+    assert_eq!(t2.calls()[0].pieces.len(), 1);
+    assert!(
+        !pass2
+            .terminal
+            .iter()
+            .any(|outcome| format!("{outcome:?}").contains(a_id)),
+        "fenced manifest A must not be re-dispatched"
+    );
+
+    // A revoked Host grant refuses the WHOLE pass before any transport
+    // effect with HOST_ROUTE_STALE_OR_REVOKED.
+    {
+        let mut store = SqliteCoreStore::new(&mut runtime).expect("core schema");
+        store
+            .revoke_host_capability_grant(&authority, "org.dolly.channel", "web-channel")
+            .expect("grant revoked");
+    }
+    let t3 = RouteSharedTransport::new(true);
+    let revoked = route.consume_once(
+        &mut module_store,
+        &mut runtime,
+        Box::new(clock.clone()),
+        Box::new(t3.clone()),
+        &far_deadline_str(),
+    );
+    match revoked {
+        Err(HostRouteError::StaleOrRevoked { .. }) => {}
+        Err(HostRouteError::Rejected { code, .. }) => {
+            assert_eq!(
+                code,
+                "CHANNEL_AUTHENTICATION_FAILED",
+                "the revoked grant refusal must be a fail-closed authentication refusal"
+            );
+        }
+        other => panic!("a revoked grant must refuse the consumer pass fail-closed, got {other:?}"),
+    }
+    assert_eq!(t3.calls().len(), 0, "zero transport effect after revocation");
+}
+
+// ---------------------------------------------------------------------------
+// PASS: supported media kinds, authoritative detection, size/type limits.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wp013b_media_kinds_and_bounds() {
+    let entry = case("WP013B-MEDIA-KINDS-001");
+    assert_eq!(entry["expected"], "pass");
+
+    let scratch = ScratchDir::new("media-kinds");
+    let (mut service, _clock) = asset_service_at(scratch.path());
+    let capability = asset_capability(&service);
+
+    // Supported passive kinds are detected authoritatively and recorded in
+    // the canonical AssetRef (lower-case).
+    let png = png_bytes(8, 4);
+    let p = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(521),
+                Source::InlineBase64 {
+                    base64: base64(&png),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("png import");
+    let png_ref = p.asset.expect("AssetRef");
+    assert_eq!(png_ref.media_type.as_str(), "image/png");
+    assert_eq!(png_ref.encoded_width, Some(8));
+    assert_eq!(png_ref.encoded_height, Some(4));
+
+    let gif = gif_bytes(2, 3);
+    let g = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(522),
+                Source::InlineBase64 {
+                    base64: base64(&gif),
+                },
+                Some("image/gif"),
+                false,
+            ),
+        )
+        .expect("gif import");
+    let gif_ref = g.asset.expect("AssetRef");
+    assert_eq!(gif_ref.media_type.as_str(), "image/gif");
+    assert_eq!(gif_ref.encoded_width, Some(2));
+    assert_eq!(gif_ref.encoded_height, Some(3));
+
+    // Active content declared as a passive image is refused before
+    // availability: MEDIA_TYPE_MISMATCH, never relabeled.
+    let svg = svg_bytes();
+    let spoof = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(523),
+                Source::InlineBase64 {
+                    base64: base64(&svg),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("media mismatch is a recorded rejection");
+    assert_eq!(spoof.state, "rejected");
+    assert_eq!(
+        spoof.error.as_ref().expect("envelope")["code"],
+        "MEDIA_TYPE_MISMATCH"
+    );
+    assert!(spoof.asset.is_none(), "no availability before refusal");
+
+    // Decoded size limit: cut off with SIZE_LIMIT, no asset.
+    let mut oversized = png_bytes(4, 2);
+    oversized.resize(200 * 1024, 0);
+    let over = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(524),
+                Source::InlineBase64 {
+                    base64: base64(&oversized),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("over-limit import is a recorded rejection");
+    assert_eq!(over.state, "rejected");
+    assert_eq!(over.error.as_ref().expect("envelope")["code"], "SIZE_LIMIT");
+    assert!(over.asset.is_none());
+
+    // Strict base64: malformed encoding fails before any durable record.
+    let invalid = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(525),
+                Source::InlineBase64 {
+                    base64: "aGVsbG8!".to_string(),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect_err("invalid base64 must be refused");
+    assert_eq!(invalid.code, AssetErrorCode::InvalidBase64);
+}
+
+// ---------------------------------------------------------------------------
+// PASS: channel configuration modality/part/text bounds fail closed.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wp013b_config_bounds_fail_closed() {
+    let entry = case("WP013B-CONFIG-BOUNDS-001");
+    assert_eq!(entry["expected"], "pass");
+
+    // Asset ground is a WP-013B capability: a configuration that admits any
+    // modality other than exactly {"text"} is rejected before dispatch.
+    let mut modality = channel_config();
+    modality.accepted_modalities = BTreeSet::from(["asset".to_string()]);
+    assert!(
+        modality.validate().is_err(),
+        "a multimodal accepted_modalities must be rejected before dispatch"
+    );
+    let mut modality2 = channel_config();
+    modality2.accepted_modalities = BTreeSet::from(["text".to_string(), "asset".to_string()]);
+    assert!(modality2.validate().is_err(), "text+asset must be rejected");
+
+    // Part-count and text-byte bounds are enforced by validate.
+    let mut parts_zero = channel_config();
+    parts_zero.max_parts = 0;
+    assert!(parts_zero.validate().is_err(), "max_parts 0 must be rejected");
+    let mut parts_over = channel_config();
+    parts_over.max_parts = dolly_channel::config::MAX_PARTS + 1;
+    assert!(
+        parts_over.validate().is_err(),
+        "max_parts above the ceiling must be rejected"
+    );
+    let mut text_zero = channel_config();
+    text_zero.max_text_bytes = 0;
+    assert!(
+        text_zero.validate().is_err(),
+        "max_text_bytes 0 must be rejected"
+    );
+    let mut text_over = channel_config();
+    text_over.max_text_bytes = dolly_channel::config::MAX_TEXT_BYTES + 1;
+    assert!(
+        text_over.validate().is_err(),
+        "max_text_bytes above the ceiling must be rejected"
+    );
+    // The valid text-only configuration still validates (control).
+    assert!(channel_config().validate().is_ok(), "text-only config is valid");
+}
+
+// ---------------------------------------------------------------------------
+// PASS: bounded queue and caller deadline refuse an expired burst.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wp013b_queue_deadline_bounds() {
+    let entry = case("WP013B-QUEUE-DEADLINE-001");
+    assert_eq!(entry["expected"], "pass");
+
+    let (mut runtime, mut module_store, authority, grant, config, clock, session_id) =
+        consumer_scaffold("wp013b-qd");
+    let host_ingress_ops_before: i64 = runtime
+        .query_row(
+            "SELECT COUNT(*) FROM core_operations WHERE command_id LIKE 'host-ingress-%'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("baseline op count");
+
+    let action_ids = [
+        "0198ab31-6c44-7e8a-b2bb-000000000831",
+        "0198ab31-6c44-7e8a-b2bb-000000000832",
+        "0198ab31-6c44-7e8a-b2bb-000000000833",
+    ];
+    let burst = route_send_block_multi("web-channel", &action_ids, &session_id, &["one", "two", "three"]);
+    commit_send_and_activate(
+        &mut runtime,
+        &authority,
+        &grant,
+        "wp013b-qd",
+        ROUTE_INPUT_PAGE,
+        burst,
+        config.clone(),
+    );
+    let route = ChannelOutboundRoute::register(config.clone(), &mut module_store, &authority, &grant)
+        .expect("outbound route registration");
+
+    // The guest clock is already past the caller deadline: the bounded queue
+    // admits nothing — every action is refused CHANNEL_RATE_LIMITED
+    // (retryable backpressure) before any transport effect.
+    let late_clock = ChannelLateClock::at(
+        dolly_channel::timestamp_plus_seconds(CHANNEL_NOW, 90)
+            .parse()
+            .expect("late timestamp"),
+    );
+    let expired_deadline = dolly_channel::timestamp_plus_seconds(CHANNEL_NOW, 60);
+    let transport = RouteSharedTransport::new(true);
+    let report = route
+        .consume_once(
+            &mut module_store,
+            &mut runtime,
+            Box::new(late_clock),
+            Box::new(transport.clone()),
+            &expired_deadline,
+        )
+        .expect("caller-deadline bounded pass");
+    assert_eq!(report.transported, 0, "nothing is sent past the caller deadline");
+    assert_eq!(report.rejected, 3, "every burst action is refused by the deadline bound");
+    assert!(
+        report.rejected_codes.iter().all(|code| code == "CHANNEL_RATE_LIMITED"),
+        "deadline refusals are retryable backpressure, got {:?}",
+        report.rejected_codes
+    );
+    assert_eq!(transport.calls().len(), 0, "zero transport effect");
+    let host_ingress_ops_after: i64 = runtime
+        .query_row(
+            "SELECT COUNT(*) FROM core_operations WHERE command_id LIKE 'host-ingress-%'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("op count after");
+    assert_eq!(
+        host_ingress_ops_after, host_ingress_ops_before,
+        "Core input state is untouched by the bounded pass"
+    );
+
+}
+
+// ---------------------------------------------------------------------------
+// PASS: crash/restart recovery is status-first and replay is idempotent.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wp013b_restart_status_first_recovery() {
+    let entry = case("WP013B-RESTART-RECOVERY-001");
+    assert_eq!(entry["expected"], "pass");
+
+    let (mut runtime, mut module_store, authority, grant, config, clock, session_id) =
+        consumer_scaffold("wp013b-rs");
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000841";
+    commit_send_and_activate(
+        &mut runtime,
+        &authority,
+        &grant,
+        "wp013b-rs",
+        ROUTE_INPUT_PAGE,
+        route_send_block("web-channel", action_id, &session_id, &["hello"]),
+        config.clone(),
+    );
+    let route = ChannelOutboundRoute::register(config.clone(), &mut module_store, &authority, &grant)
+        .expect("outbound route registration");
+
+    // Crash window: the transport is unavailable; the send is dispatched
+    // durably (never a fabricated success) and stays unresolved.
+    let silent = RouteSharedTransport::new(true);
+    let pass1 = route
+        .consume_once(
+            &mut module_store,
+            &mut runtime,
+            Box::new(clock.clone()),
+            Box::new(silent.clone()),
+            &far_deadline_str(),
+        )
+        .expect("transport-unavailable pass");
+    assert_eq!(silent.calls().len(), 1, "one dispatch attempted");
+    assert!(
+        pass1.remaining >= 1 || pass1.pending >= 1,
+        "the unresolved row must survive the crash window"
+    );
+
+    // Restart: a fresh pass with a status-capable transport settles the row
+    // status-first — exactly one status query, zero re-dispatch.
+    let reporting = RouteSharedTransport::new(true);
+    reporting.push_status(
+        action_id,
+        dolly_channel::transport::TransportStatusResult::Confirmed {
+            message_ids: vec!["transport-rs-1".to_string()],
+        },
+    );
+    let pass2 = route
+        .consume_once(
+            &mut module_store,
+            &mut runtime,
+            Box::new(clock.clone()),
+            Box::new(reporting.clone()),
+            &far_deadline_str(),
+        )
+        .expect("status-first consumer pass");
+    assert_eq!(reporting.status_calls().len(), 1, "one status query");
+    assert_eq!(reporting.calls().len(), 0, "zero re-dispatch after dispatch");
+    assert_eq!(pass2.remaining, 0, "status-first reconcile rests the row");
+
+    // Replay: consuming the confirmed Action again returns the stored frozen
+    // result with zero re-dispatch.
+    let replay_transport = RouteSharedTransport::new(true);
+    let pass3 = route
+        .consume_once(
+            &mut module_store,
+            &mut runtime,
+            Box::new(clock.clone()),
+            Box::new(replay_transport.clone()),
+            &far_deadline_str(),
+        )
+        .expect("replay consumer pass");
+    assert_eq!(pass3.transported, 1, "replay returns the stored terminal");
+    assert!(matches!(
+        &pass3.terminal[0],
+        dolly_channel::ConsumerOutcome::Terminal {
+            state: OutboundState::Confirmed,
+            ..
+        }
+    ));
+    assert_eq!(replay_transport.calls().len(), 0, "zero re-dispatch on replay");
+}
+
+// ---------------------------------------------------------------------------
+// PASS: exact result and refusal envelopes on the outbound route.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wp013b_exact_result_and_refusal_envelopes() {
+    let entry = case("WP013B-ENVELOPE-001");
+    assert_eq!(entry["expected"], "pass");
+
+    let (mut runtime, mut module_store, authority, grant, config, clock, session_id) =
+        consumer_scaffold("wp013b-env");
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000851";
+    commit_send_and_activate(
+        &mut runtime,
+        &authority,
+        &grant,
+        "wp013b-env",
+        ROUTE_INPUT_PAGE,
+        route_send_block("web-channel", action_id, &session_id, &["part one", "part two"]),
+        config.clone(),
+    );
+    let route = ChannelOutboundRoute::register(config.clone(), &mut module_store, &authority, &grant)
+        .expect("outbound route registration");
+    let transport = RouteSharedTransport::new(true);
+    transport.push(TransportSendResult::AllConfirmed {
+        message_ids: vec!["transport-env-0".to_string(), "transport-env-1".to_string()],
+    });
+    let pass = route
+        .consume_once(
+            &mut module_store,
+            &mut runtime,
+            Box::new(clock.clone()),
+            Box::new(transport.clone()),
+            &far_deadline_str(),
+        )
+        .expect("consumer pass");
+    assert_eq!(pass.transported, 1);
+    let result_jcs = match &pass.terminal[0] {
+        dolly_channel::ConsumerOutcome::Terminal { result_jcs, .. } => result_jcs.clone(),
+        other => panic!("expected Terminal outcome, got {other:?}"),
+    };
+    let envelope: Value = serde_json::from_str(&result_jcs).expect("action result envelope");
+    assert_eq!(envelope["schema"], "dolly.action-result/v1");
+    assert_eq!(envelope["action_id"], action_id);
+    assert_eq!(envelope["status"], "succeeded");
+    let messages = envelope["result"]["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 2, "two confirmed pieces");
+    for (index, message) in messages.iter().enumerate() {
+        assert_eq!(
+            message["ordinal"], index as i64,
+            "ordinals must be contiguous from zero"
+        );
+        let id = message["external_message_id"].as_str().expect("message id");
+        assert!(!id.is_empty(), "external ids must be non-empty");
+    }
+    let ids: BTreeSet<&str> = messages
+        .iter()
+        .map(|m| m["external_message_id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(ids.len(), 2, "external_message_id values must be unique");
+}
+
+// ---------------------------------------------------------------------------
+// PASS: credentials, paths, and signed URLs never enter drafts, ledgers, or
+// asset errors.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wp013b_redaction_never_leaks_secrets_or_paths() {
+    let entry = case("WP013B-REDACTION-001");
+    assert_eq!(entry["expected"], "pass");
+
+    // A hostile raw transport event carries credentials, a cookie, a local
+    // path, and a signed URL. parse_event reads only the validated allowlist;
+    // none of the secrets survive into the event.
+    let mut raw = json!({
+        "channel_id": "web-primary",
+        "transport": "web",
+        "account": "account-a",
+        "external_conversation_id": "conv-1",
+        "external_message_id": "msg-1",
+        "sender_class": "user",
+        "sender_id": "sender-account-a",
+        "event_kind": "message",
+        "text": "Hello, Dolly.",
+        "received_at": CHANNEL_NOW
+    });
+    for (key, value) in [
+        ("authorization", json!("Bearer super-secret-token")),
+        ("cookie", json!("session=leaky")),
+        ("attachment_path", json!("/home/ubuntu/secrets/private.png")),
+        ("signed_url", json!("https://storage.example/presigned?token=abc")),
+    ] {
+        raw[key] = value;
+    }
+    let event = parse_event(&raw).expect("hostile fields are ignored by parse");
+    let joined = format!("{event:?}");
+    for secret in [
+        "super-secret-token",
+        "session=leaky",
+        "secrets/private.png",
+        "presigned?token=abc",
+    ] {
+        assert!(!joined.contains(secret), "parse must not retain {secret}");
+    }
+
+    // Through the real route the committed draft and durable block carry only
+    // the allowlist; none of the hostile fields can be smuggled.
+    let (mut runtime, mut module_store, authority, grant, config, clock) = {
+        let (r, s, a, g, c, cl, _) = consumer_scaffold("wp013b-redact");
+        (r, s, a, g, c, cl)
+    };
+    let block_id = {
+        let mut receiver = open_channel_inbound_route(
+            &mut runtime,
+            &mut module_store,
+            config.clone(),
+            Box::new(clock.clone()),
+            &authority,
+            &grant,
+        )
+        .expect("channel route registration");
+        let content = ChannelEventContent {
+            channel_id: "web-primary".to_string(),
+            transport: "web".to_string(),
+            external_conversation_id: "conv-9".to_string(),
+            external_message_id: "redact-1".to_string(),
+            sender_class: "user".to_string(),
+            sender_id: "sender-redact-1".to_string(),
+            text: "Hello, Dolly.".to_string(),
+            received_at: CHANNEL_NOW.parse().expect("timestamp"),
+            event_kind: EventKind::Message,
+            references_external_message_id: None,
+        };
+        let sealed = authenticated_channel_event(&authority, &grant, config.revision, content)
+            .expect("sealed event");
+        match receiver.ingest_event(&sealed) {
+            IngressOutcome::Committed { block_id, .. } => block_id,
+            other => panic!("event must commit through the route, got {other:?}"),
+        }
+    };
+    {
+        let store = SqliteCoreStore::new(&mut runtime).expect("core schema");
+        let snapshot = store.snapshot().expect("snapshot");
+        let serialized = serde_json::to_string(&snapshot.blocks[&block_id]).expect("block json");
+        for secret in [
+            "authorization",
+            "Bearer",
+            "cookie",
+            "attachment_path",
+            "signed_url",
+            "super-secret-token",
+            "secrets/private.png",
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "the durable block must not contain {secret}"
+            );
+        }
+    }
+
+    // Asset authority failures never disclose the content root, object
+    // locator, or base64 bytes.
+    let scratch = ScratchDir::new("redaction-asset");
+    let (mut service, clock) = asset_service_at(scratch.path());
+    let capability = asset_capability(&service);
+    let png = png_bytes(4, 2);
+    let encoded = base64(&png);
+    let known = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(551),
+                Source::InlineBase64 {
+                    base64: encoded.clone(),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("import");
+    let asset_id = known.asset.expect("AssetRef").asset_id.as_str().to_string();
+    // Tombstone the asset deterministically so a later lease is refused.
+    let lease = service
+        .lease(&capability, &asset_id, "m", "p", 60_000)
+        .expect("finite lease");
+    drop(lease);
+    clock.advance(120_000);
+    clock.advance(60_000);
+    let gc = service.run_gc().expect("gc");
+    assert_eq!(gc.tombstones_created, 1, "asset tombstoned");
+    let root_str = scratch.path().to_string_lossy().to_string();
+    let error = service
+        .lease(&capability, &asset_id, "late", "late lease", 1000)
+        .expect_err("a refused operation must fail closed");
+    let debug = format!("{error:?}");
+    assert!(
+        !debug.contains(&root_str),
+        "asset errors must not disclose the content root"
+    );
+    assert!(
+        !debug.contains(&encoded),
+        "asset errors must not disclose payload bytes"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PASS: text-only G4 non-regression through the runtime route.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wp013b_text_only_nonregression() {
+    let entry = case("WP013B-TEXT-NONREGRESSION-001");
+    assert_eq!(entry["expected"], "pass");
+
+    let (mut runtime, mut module_store, authority, grant, config, clock, session_id) =
+        consumer_scaffold("wp013b-textnr");
+
+    // Byte-identical replay of the upstream premise is idempotent and an
+    // opposite premise never overwrites it.
+    let replay_or_conflict = {
+        let mut receiver = open_channel_inbound_route(
+            &mut runtime,
+            &mut module_store,
+            config.clone(),
+            Box::new(clock.clone()),
+            &authority,
+            &grant,
+        )
+        .expect("re-registration");
+        let same = authenticated_channel_event(
+            &authority,
+            &grant,
+            config.revision,
+            route_content_event("conv-1", "in-1", "What is the weather?"),
+        )
+        .expect("replay event");
+        let idempotent = receiver.ingest_event(&same);
+        assert!(
+            matches!(idempotent, IngressOutcome::IdempotentReplay { .. }),
+            "the byte-identical premise must replay idempotently"
+        );
+        let different = authenticated_channel_event(
+            &authority,
+            &grant,
+            config.revision,
+            route_content_event("conv-1", "in-1", "Different poll?"),
+        )
+        .expect("conflict event");
+        match receiver.ingest_event(&different) {
+            IngressOutcome::RejectedBeforeMutation { error } => {
+                assert_eq!(error.code, "CHANNEL_OPERATION_CONFLICT");
+            }
+            other => panic!("an opposite premise must not overwrite, got {other:?}"),
+        }
+    };
+    let _ = replay_or_conflict;
+
+    // The text send drains to Terminal Confirmed; replay returns the stored
+    // result with zero re-dispatch.
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000861";
+    commit_send_and_activate(
+        &mut runtime,
+        &authority,
+        &grant,
+        "wp013b-textnr",
+        ROUTE_INPUT_PAGE,
+        route_send_block("web-channel", action_id, &session_id, &["non-regression"]),
+        config.clone(),
+    );
+    let route = ChannelOutboundRoute::register(config.clone(), &mut module_store, &authority, &grant)
+        .expect("outbound route registration");
+    let t1 = RouteSharedTransport::new(true);
+    t1.push(TransportSendResult::AllConfirmed {
+        message_ids: vec!["transport-textnr-1".to_string()],
+    });
+    let first = route
+        .consume_once(
+            &mut module_store,
+            &mut runtime,
+            Box::new(clock.clone()),
+            Box::new(t1.clone()),
+            &far_deadline_str(),
+        )
+        .expect("consumer pass");
+    assert_eq!(first.transported, 1);
+    let t2 = RouteSharedTransport::new(true);
+    let replay = route
+        .consume_once(
+            &mut module_store,
+            &mut runtime,
+            Box::new(clock.clone()),
+            Box::new(t2.clone()),
+            &far_deadline_str(),
+        )
+        .expect("replay pass");
+    assert_eq!(replay.transported, 1, "replay returns the stored terminal");
+    assert_eq!(t2.calls().len(), 0, "no re-dispatch on replay");
+}
+
+// ---------------------------------------------------------------------------
+// PASS: runtime route registration, lifecycle, and fail-closed absence.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wp013b_route_lifecycle_fail_closed() {
+    let entry = case("WP013B-ROUTE-LIFECYCLE-001");
+    assert_eq!(entry["expected"], "pass");
+
+    // 1. A grant lacking the required host method refuses registration.
+    let (mut connection, authority, grant) = route_harness(
+        "module-a",
+        "org.dolly.asset",
+        "wp013b-lc-a",
+        &["host.asset.import"],
+        &[],
+    );
+    let scratch = ScratchDir::new("route-lifecycle");
+    match AssetHostRoute::for_activated_module(
+        &mut connection,
+        asset_config_at(scratch.path()),
+        &authority,
+        &grant,
+    ) {
+        Ok(_) => panic!("a grant without host.asset.status must not register"),
+        Err(error) => assert!(
+            matches!(error, HostRouteError::CapabilityDenied { .. }),
+            "expected CapabilityDenied, got {error:?}"
+        ),
+    }
+
+    // 2. A revoked grant refuses every effect with StaleOrRevoked.
+    let (mut connection2, authority2, grant2) = route_harness(
+        "module-a",
+        "org.dolly.asset",
+        "wp013b-lc-b",
+        &["host.asset.import", "host.asset.status"],
+        &[],
+    );
+    let registered = AssetHostRoute::for_activated_module(
+        &mut connection2,
+        asset_config_at(scratch.path()),
+        &authority2,
+        &grant2,
+    )
+    .expect("route registration");
+    drop(registered);
+    {
+        let mut store = SqliteCoreStore::new(&mut connection2).expect("core schema");
+        store
+            .revoke_host_capability_grant(&authority2, "org.dolly.asset", "module-a")
+            .expect("grant revoked");
+    }
+    let mut route = AssetHostRoute::for_activated_module(
+        &mut connection2,
+        asset_config_at(scratch.path()),
+        &authority2,
+        &grant2,
+    )
+    .expect("route re-registration over the revoked grant");
+    let instance = route.instance_id().to_string();
+    let denied = route
+        .import(&route_asset_request(
+            "module-a",
+            &instance,
+            &import_id(561),
+            Source::InlineBase64 {
+                base64: base64(&png_bytes(4, 2)),
+            },
+            Some("image/png"),
+        ))
+        .expect_err("a revoked grant must refuse import before effect");
+    assert!(
+        matches!(denied, HostRouteError::StaleOrRevoked { .. }),
+        "expected StaleOrRevoked, got {denied:?}"
+    );
+
+    // 3. A cross-module import request is refused before the façade.
+    let (mut connection3, authority3, grant3) = route_harness(
+        "module-a",
+        "org.dolly.asset",
+        "wp013b-lc-c",
+        &["host.asset.import", "host.asset.status"],
+        &[],
+    );
+    let mut route3 = AssetHostRoute::for_activated_module(
+        &mut connection3,
+        asset_config_at(scratch.path()),
+        &authority3,
+        &grant3,
+    )
+    .expect("route registration");
+    let instance3 = route3.instance_id().to_string();
+    let cross = route3.import(&route_asset_request(
+        "module-b",
+        &instance3,
+        &import_id(562),
+        Source::InlineBase64 {
+            base64: base64(&png_bytes(4, 2)),
+        },
+        Some("image/png"),
+    ));
+    assert!(
+        matches!(cross, Err(HostRouteError::CapabilityDenied { .. })),
+        "a cross-module import must be refused before any effect"
+    );
+
+    // 4. The outbound route owns exactly ONE identity-bound gate.
+    let (mut runtime, mut module_store, authority4, grant4, config, clock, _session) =
+        consumer_scaffold("wp013b-lc-d");
+    let route_a = ChannelOutboundRoute::register(config.clone(), &mut module_store, &authority4, &grant4)
+        .expect("first registration");
+    let gate_a = route_a.gate();
+    let route_b = ChannelOutboundRoute::register(config.clone(), &mut module_store, &authority4, &grant4)
+        .expect("second registration");
+    assert!(
+        std::sync::Arc::ptr_eq(&gate_a, &route_b.gate()),
+        "exactly one identity-bound gate per store/account/config"
+    );
+    let _ = (runtime, clock);
+}
+
+// ---------------------------------------------------------------------------
 // Causal PRODUCT_RED: a stale (tombstoned) AssetRef is refused by an asset
 // authority at Channel effect time.
 // ---------------------------------------------------------------------------
@@ -1069,13 +2364,7 @@ fn wp013b_stale_assetref_refused_at_effect_time() {
         .as_str()
         .to_string();
     let lease = service
-        .lease(
-            &capability,
-            &stale_asset_id,
-            "model-op",
-            "provider output",
-            60_000,
-        )
+        .lease(&capability, &stale_asset_id, "model-op", "provider output", 60_000)
         .expect("finite lease");
     // Lease expires; grace elapses; the sweep tombstones the asset.
     clock.advance(120_000);
@@ -1092,60 +2381,20 @@ fn wp013b_stale_assetref_refused_at_effect_time() {
     // ActivationManifest authority are proven working by draining a TEXT
     // twin to Terminal Confirmed through the very same route. A failure here
     // is a harness error, not the product red.
-    let (mut runtime, authority, grant) = route_harness(
-        "web-channel",
-        "org.dolly.channel",
-        "wp013b-stale",
-        &["host.ingress.submit"],
-        &[TARGET_PAGE],
-    );
-    let mut module_store = channel_store_connection();
-    let config = channel_config();
-    let clock_c = channel_clock();
-    {
-        let mut receiver = open_channel_inbound_route(
-            &mut runtime,
-            &mut module_store,
-            config.clone(),
-            Box::new(clock_c.clone()),
-            &authority,
-            &grant,
-        )
-        .expect("channel route registration");
-        let event = authenticated_channel_event(
-            &authority,
-            &grant,
-            config.revision,
-            route_content_event("conv-1", "in-1", "What is the weather?"),
-        )
-        .expect("authenticated event seals under the grant");
-        assert!(
-            matches!(receiver.ingest_event(&event), IngressOutcome::Committed { .. }),
-            "the upstream premise commits through the route"
-        );
-    }
-    let principal = dolly_channel::ChannelPrincipal::from_authority_grant(&authority, &grant)
-        .expect("principal");
-    let session_id = dolly_channel::ids::dolly_session_id(principal.account(), "conv-1");
-
+    let (mut runtime, mut module_store, authority, grant, config, clock_c, session_id) =
+        consumer_scaffold("wp013b-stale");
     let text_id = "0198ab31-6c44-7e8a-b2bb-000000000801";
-    let text_block = route_send_block("web-channel", text_id, &session_id, &["control text"]);
     commit_send_and_activate(
         &mut runtime,
         &authority,
         &grant,
         "wp013b-ctl",
         ROUTE_INPUT_PAGE,
-        text_block,
+        route_send_block("web-channel", text_id, &session_id, &["control text"]),
         config.clone(),
     );
-    let route = ChannelOutboundRoute::register(
-        config.clone(),
-        &mut module_store,
-        &authority,
-        &grant,
-    )
-    .expect("outbound route registration");
+    let route = ChannelOutboundRoute::register(config.clone(), &mut module_store, &authority, &grant)
+        .expect("outbound route registration");
     let control_transport = RouteSharedTransport::new(true);
     control_transport.push(TransportSendResult::AllConfirmed {
         message_ids: vec!["transport-control-1".to_string()],
@@ -1175,11 +2424,11 @@ fn wp013b_stale_assetref_refused_at_effect_time() {
     // authority code before any transport effect, durable outbound row, or
     // success envelope.
     let asset_id_action = "0198ab31-6c44-7e8a-b2bb-000000000802";
-    let asset_block = route_asset_send_block(
+    let asset_block = route_asset_send_block_with_parts(
         "web-channel",
         asset_id_action,
         &session_id,
-        &stale_asset_id,
+        vec![asset_part(&stale_asset_id, "image/png", None)],
     );
     commit_send_and_activate(
         &mut runtime,
@@ -1219,10 +2468,6 @@ fn wp013b_stale_assetref_refused_at_effect_time() {
             "channel_multimodal_effect_authority",
         );
     }
-    // If the base ever reported a rejection instead, that is a different but
-    // still causal product red: the refusal must come from an asset authority
-    // (lease/availability/domain), not a generic profile refusal, and the
-    // run report records exactly what happened.
     product_red(
         "WP013B-STALE-REF-EFFECT-001",
         "committed-Action AssetPart authority at effect time",
@@ -1231,5 +2476,357 @@ fn wp013b_stale_assetref_refused_at_effect_time() {
             pass.rejected_codes, pass.transported, pass.terminal.len(), pass.pending, pass.remaining
         ),
         "channel_multimodal_effect_authority",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Causal PRODUCT_RED: mixed text+asset parts must reach the transport in
+// exact ordinal order.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wp013b_mixed_text_asset_ordering() {
+    let entry = case("WP013B-MIXED-ORDER-001");
+    assert_eq!(entry["expected"], "product_red");
+
+    let scratch = ScratchDir::new("mixed-order");
+    let (mut service, _clock) = asset_service_at(scratch.path());
+    let capability = asset_capability(&service);
+    let png = png_bytes(4, 2);
+    let imported = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(411),
+                Source::InlineBase64 {
+                    base64: base64(&png),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("asset import");
+    let asset_id = imported.asset.expect("AssetRef").asset_id.as_str().to_string();
+
+    let parts = vec![
+        json!({"kind": "text", "text": "first", "format": "plain"}),
+        asset_part(&asset_id, "image/png", None),
+        json!({"kind": "text", "text": "last", "format": "plain"}),
+    ];
+    asset_part_red_probe(
+        "WP013B-MIXED-ORDER-001",
+        "wp013b-mixed",
+        "0198ab31-6c44-7e8a-b2bb-000000000811",
+        "0198ab31-6c44-7e8a-b2bb-000000000812",
+        "mixed text+asset ordinal ordering to the transport",
+        "authorize_send stops at the first asset part with CHANNEL_UNSUPPORTED_MODALITY, so a mixed text+asset Action is silently dropped by CommittedSendAction::from_manifest_input; no ordered asset piece (ordinal 1) can be built or transported between the text pieces, while the identical text twin dispatches to Terminal Confirmed through the same route",
+        parts,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Causal PRODUCT_RED: forged/overriding media_type is refused by a detected
+// type authority at effect time.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wp013b_media_abuse_refused_at_effect_time() {
+    let entry = case("WP013B-MEDIA-ABUSE-SEND-001");
+    assert_eq!(entry["expected"], "product_red");
+
+    let scratch = ScratchDir::new("media-abuse");
+    let (mut service, _clock) = asset_service_at(scratch.path());
+    let capability = asset_capability(&service);
+    let png = png_bytes(4, 2);
+    let imported = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(412),
+                Source::InlineBase64 {
+                    base64: base64(&png),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("asset import");
+    let asset_id = imported.asset.expect("AssetRef").asset_id.as_str().to_string();
+
+    // The action declares image/jpeg for an asset whose authoritative
+    // detected type is image/png: the effect-time media authority MUST refuse
+    // the override before dispatch (never trust the action media_type).
+    let parts = vec![asset_part(&asset_id, "image/jpeg", None)];
+    asset_part_red_probe(
+        "WP013B-MEDIA-ABUSE-SEND-001",
+        "wp013b-media-abuse",
+        "0198ab31-6c44-7e8a-b2bb-000000000813",
+        "0198ab31-6c44-7e8a-b2bb-000000000814",
+        "authoritative detected-media-type authority on the committed send",
+        "the send path has no detected-type/safe-view authority: authorize_send rejects every asset part at the profile seam and the Action is silently dropped, so an action declaring image/jpeg for a detected image/png AssetRef is neither refused by a media authority nor corrected to the authoritative type — the abuse gate is absent",
+        parts,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Causal PRODUCT_RED: view/crop bounds are checked against display geometry
+// at effect time.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wp013b_view_crop_checked_at_effect_time() {
+    let entry = case("WP013B-CROP-VIEW-001");
+    assert_eq!(entry["expected"], "product_red");
+
+    let scratch = ScratchDir::new("crop-view");
+    let (mut service, _clock) = asset_service_at(scratch.path());
+    let capability = asset_capability(&service);
+    let png = png_bytes(4, 2);
+    let imported = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(413),
+                Source::InlineBase64 {
+                    base64: base64(&png),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("asset import");
+    let asset = imported.asset.expect("AssetRef");
+    let asset_id = asset.asset_id.as_str().to_string();
+    // The authoritative display geometry is 4x2: this crop overflows it.
+    assert_eq!(asset.display_width, Some(4));
+    assert_eq!(asset.display_height, Some(2));
+
+    let parts = vec![asset_part(
+        &asset_id,
+        "image/png",
+        Some(json!({"kind": "image_rect_v1", "x0": 0, "y0": 0, "x1": 1_200_000, "y1": 1_000_000})),
+    )];
+    asset_part_red_probe(
+        "WP013B-CROP-VIEW-001",
+        "wp013b-crop",
+        "0198ab31-6c44-7e8a-b2bb-000000000815",
+        "0198ab31-6c44-7e8a-b2bb-000000000816",
+        "view/crop geometry authority at effect time",
+        "the send path performs no crop/view validation: authorize_send drops every asset part at the profile seam and the Action is silently dropped, so a view that exceeds the authoritative 4x2 display geometry (x1 beyond 1_000_000) is never refused by a geometry authority (EMPTY_CROP/INVALID_CROP class) at effect time",
+        parts,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Causal PRODUCT_RED: inbound attachments must import through the Asset
+// Service and AVAILABLE-gate the block submission.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wp013b_inbound_attachment_import() {
+    let entry = case("WP013B-INBOUND-ATTACHMENT-001");
+    assert_eq!(entry["expected"], "product_red");
+
+    // Leg A (foundation): host.asset.import works through the real route.
+    let scratch = ScratchDir::new("inbound-attach");
+    let png = png_bytes(4, 2);
+    let (mut connection, authority_a, grant_a) = route_harness(
+        "module-a",
+        "org.dolly.asset",
+        "wp013b-inbound-a",
+        &["host.asset.import", "host.asset.status"],
+        &[],
+    );
+    let mut asset_route = AssetHostRoute::for_activated_module(
+        &mut connection,
+        asset_config_at(scratch.path()),
+        &authority_a,
+        &grant_a,
+    )
+    .expect("asset route registration");
+    let instance = asset_route.instance_id().to_string();
+    let imported = asset_route
+        .import(&route_asset_request(
+            "module-a",
+            &instance,
+            &import_id(414),
+            Source::InlineBase64 {
+                base64: base64(&png),
+            },
+            Some("image/png"),
+        ))
+        .expect("host.asset.import commits");
+    assert_eq!(imported.state, "available");
+    let _asset_id = imported.asset.expect("AssetRef").asset_id.as_str().to_string();
+    drop(asset_route);
+
+    // Leg B (foundation): the inbound route commits authenticated text
+    // premises through the real durable Host ingress slice.
+    let (mut runtime, mut module_store, authority, grant, config, clock, _session) =
+        consumer_scaffold("wp013b-inbound-b");
+
+    // Leg C: the inbound surface has no attachment ground. The typed event
+    // carries only fixed fields (never attachment bytes or an AssetRef), the
+    // reachable inbound ledger states contain no assets_pending, and the
+    // committed draft for any event is exactly the text part — so a
+    // transport attachment can neither be imported nor AVAILABLE-gate the
+    // block submission.
+    let reachable_states: Vec<&str> = [
+        InboundState::Received,
+        InboundState::Submitted,
+        InboundState::Accepted,
+        InboundState::Rejected,
+    ]
+    .iter()
+    .map(|state| state.as_str())
+    .collect();
+    assert!(
+        !reachable_states.contains(&"assets_pending"),
+        "the inbound ledger has no assets_pending state to reach"
+    );
+    let block_id = {
+        let mut receiver = open_channel_inbound_route(
+            &mut runtime,
+            &mut module_store,
+            config.clone(),
+            Box::new(clock.clone()),
+            &authority,
+            &grant,
+        )
+        .expect("channel route registration");
+        let sealed = authenticated_channel_event(
+            &authority,
+            &grant,
+            config.revision,
+            route_content_event("conv-3", "in-3", "text without attachment"),
+        )
+        .expect("sealed event");
+        match receiver.ingest_event(&sealed) {
+            IngressOutcome::Committed { block_id, .. } => block_id,
+            other => panic!("event must commit, got {other:?}"),
+        }
+    };
+    {
+        let store = SqliteCoreStore::new(&mut runtime).expect("core schema");
+        let snapshot = store.snapshot().expect("snapshot");
+        let parts = snapshot.blocks[&block_id]["parts"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(parts.len(), 1, "the committed draft is text-only");
+        assert_eq!(parts[0]["kind"], "text");
+    }
+    // The import works (Leg A), the inbound route works (Leg B), yet the
+    // only AVAILABLE-gating link — attachment import -> assets_pending ->
+    // submit-after-AVAILABLE — is absent.
+    product_red(
+        "WP013B-INBOUND-ATTACHMENT-001",
+        "inbound attachment import and AVAILABLE gating (ChannelEventContent -> host.asset.import -> assets_pending)",
+        "the inbound surface has no attachment ground: ChannelEventContent carries no attachment, InboundState has no assets_pending variant, and the inbound route performs no Asset import, so the transport attachment referencing {asset_id} can neither be imported nor AVAILABLE-gate the block draft — while host.asset.import itself is proven working (state=available) through the same route",
+        "channel_multimodal_inbound_import",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Causal PRODUCT_RED: multimodal crash/restart recovery under the original
+// ImportId/lease is absent.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wp013b_lease_restart_recovery_absent() {
+    let entry = case("WP013B-LEASE-RESTART-001");
+    assert_eq!(entry["expected"], "product_red");
+
+    // Leg 0 (foundation): the asset authority issues a valid current lease on
+    // an AVAILABLE asset — exactly the lease a multimodal send would hold.
+    let scratch = ScratchDir::new("lease-restart");
+    let (mut service, _clock) = asset_service_at(scratch.path());
+    let capability = asset_capability(&service);
+    let png = png_bytes(4, 2);
+    let imported = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(415),
+                Source::InlineBase64 {
+                    base64: base64(&png),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("asset import");
+    let asset_id = imported.asset.expect("AssetRef").asset_id.as_str().to_string();
+    let lease = service
+        .lease(&capability, &asset_id, "model-op", "channel send", 240_000)
+        .expect("valid current lease");
+    assert!(lease.expires_at_ms > ASSET_T0, "the lease is current");
+    drop(lease);
+
+    // The committed send referencing that asset must leave a durable
+    // multimodal outbound row (original ImportId/lease-bound) that a crash/
+    // restart status-first pass could recover. On the accepted base there is
+    // no such row: the asset-part Action is silently dropped before a
+    // Prepared record, so no ImportId/lease recovery exists and no status
+    // query is ever attempted.
+    let (mut runtime, mut module_store, authority, grant, config, clock, session_id) =
+        consumer_scaffold("wp013b-lr");
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000817";
+    let asset_block = route_asset_send_block_with_parts(
+        "web-channel",
+        action_id,
+        &session_id,
+        vec![asset_part(&asset_id, "image/png", None)],
+    );
+    commit_send_and_activate(
+        &mut runtime,
+        &authority,
+        &grant,
+        "wp013b-lr",
+        ROUTE_INPUT_PAGE,
+        asset_block,
+        config.clone(),
+    );
+    let route = ChannelOutboundRoute::register(config.clone(), &mut module_store, &authority, &grant)
+        .expect("outbound route registration");
+    let silent = RouteSharedTransport::new(true);
+    let pass1 = route
+        .consume_once(
+            &mut module_store,
+            &mut runtime,
+            Box::new(clock.clone()),
+            Box::new(silent.clone()),
+            &far_deadline_str(),
+        )
+        .expect("consumer pass over the multimodal Action");
+    assert_eq!(silent.calls().len(), 0);
+    assert_eq!(pass1.transported, 0, "no multimodal dispatch on the accepted base");
+
+    // A status-first restart pass has nothing to recover: no Dispatched row,
+    // no lease record keyed to the action, zero status queries.
+    let reporting = RouteSharedTransport::new(true);
+    reporting.push_status(
+        action_id,
+        dolly_channel::transport::TransportStatusResult::Confirmed {
+            message_ids: vec!["transport-lr-1".to_string()],
+        },
+    );
+    let pass2 = route
+        .consume_once(
+            &mut module_store,
+            &mut runtime,
+            Box::new(clock.clone()),
+            Box::new(reporting.clone()),
+            &far_deadline_str(),
+        )
+        .expect("restart status-first pass");
+    assert_eq!(reporting.status_calls().len(), 0, "no durable row to recover");
+    assert_eq!(pass2.transported, 0);
+    assert_eq!(pass2.remaining, 0);
+    product_red(
+        "WP013B-LEASE-RESTART-001",
+        "multimodal send crash/restart recovery under the original ImportId/lease (status-first, lease invalidation after blocking work)",
+        "no multimodal outbound row can exist: the asset-part Action is dropped at the profile seam before a durable Prepared record or Asset lease is created, so there is no ImportId/lease record for crash recovery, no status-first multimodal reconcile, and no lease-invalidation-after-blocking-work path — status queries were never attempted",
+        "channel_multimodal_lease_restart",
     );
 }

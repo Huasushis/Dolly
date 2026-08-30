@@ -3,36 +3,89 @@
   "spec_basis": [
     "REQ-ASSET-001",
     "REQ-CHANNEL-001",
-    "dolly-spec/docs/spec/extensions/channel.md::5 committed targeted Action / Core AssetPart authorization, authoritative detected media type, short Asset lease, no recursive re-entry",
-    "dolly-spec/docs/spec/services/assets.md::7 references, leases, pins, and garbage collection",
-    "dolly-spec/docs/spec/roadmap/02-work-packages.md::WP-013B Channel multimodal profile: Asset import/send, MIME, lease, and media abuse round trip",
-    "dolly-spec/docs/spec/core/04-activation-and-module.md::ActivationManifest authority at effect time"
+    "dolly-spec/docs/spec/extensions/channel.md::4 inbound attachment import and AVAILABLE gating",
+    "dolly-spec/docs/spec/extensions/channel.md::5 committed targeted Action / Core AssetPart authorization, authoritative detected media type, safe-view and crop-bound checks, short Asset lease, no recursive re-entry",
+    "dolly-spec/docs/spec/extensions/channel.md::6 delivery, unknown outcomes, idempotency, partial mapping",
+    "dolly-spec/docs/spec/extensions/channel.md::7 failure behavior, common error envelope, bounded queues and caller deadlines",
+    "dolly-spec/docs/spec/extensions/channel.md::8 conformance test vectors",
+    "dolly-spec/docs/spec/services/assets.md::2-7 AssetRef, availability, media kinds, references, leases, pins, GC",
+    "dolly-spec/docs/spec/core/04-activation-and-module.md::ActivationManifest authority at effect time",
+    "dolly-spec/docs/spec/roadmap/02-work-packages.md::WP-013B Channel multimodal profile: Asset import/send, MIME, lease, and media abuse round trip"
   ],
   "source_boundary": {
     "g4_fixture": "crates/dolly-runtime/tests/fixtures/g4_content_channel_conformance.json",
     "g4_cases": [
       "G4-WP010-IMPORT-BOUND-001",
       "G4-WP010-LEASE-GC-001",
-      "G4-WP013A-CONSUMER-001"
+      "G4-WP010-MIME-SECURITY-001",
+      "G4-WP010-DOMAIN-ISOLATION-001",
+      "G4-WP013A-CONSUMER-001",
+      "G4-WP013A-INGRESS-RECONCILE-001",
+      "G4-WP013A-BACKPRESSURE-001"
     ],
-    "handoff": "the frozen WP-010 Asset authority seam (AssetHostRoute/AssetService: canonical AVAILABLE AssetRef, finite lease, fail-closed unavailable/revoked refs) and the frozen WP-013A committed-Action consumer route (ChannelOutboundRoute::consume_once over the sealed OutboundConsumer under ActivationManifest authority) are the accepted base these cases drive",
+    "handoff": "the frozen WP-010 Asset authority seam (AssetHostRoute/AssetService: canonical AVAILABLE AssetRef, finite lease, fail-closed unavailable/revoked refs, media kinds and bounds) and the frozen WP-013A committed-Action consumer route (ChannelOutboundRoute::consume_once over the sealed OutboundConsumer under ActivationManifest authority) are the accepted base these cases drive",
     "authority": "Host Asset import under the sealed grant creates the durable ImportRecord; only a successful AVAILABLE import yields the canonical AssetRef (never from a Core Block draft, a capability, or caller text). A producer may then place that explicit AssetRef in a committed Block/Action; consumer authority only consults and checks that reference at effect time — it never creates, mints, upgrades, or re-labels Asset authority, and there is no reverse or cross-Extension authority",
     "effect_boundary": "after the durable Core ingest commit and the committed targeted Action's ActivationManifest activation, before any outbound Channel transport effect, durable outbound row, or failure envelope"
   },
   "classification": {
-    "pass": "the accepted base already satisfies the contract through the real public route/surface: the sealed AssetHostRoute imports canonical media to a durable AVAILABLE canonical AssetRef, and the accepted AssetService public seam leases and reads that same asset under the same authority domain with finite unguessable leases, GC blocking while live, and fail-closed tombstone refusal. A regression here is a product violation",
-    "product_red": "the frozen channel-send arguments schema already admits an {\"kind\":\"asset\"} Part, but the v1 authorize_send rejects every asset part with CHANNEL_UNSUPPORTED_MODALITY and CommittedSendAction::from_manifest_input silently drops the committed Action, so no AssetRef authority (current lease, availability, domain) is consulted at effect time, no refusal outcome or durable outbound row exists, and nothing reaches the transport. The probe first proves the whole real causal chain works (route import, tombstone, committed Action, manifest authority, consumer pass for a text twin), so every failure is attributable to the missing asset-authority seam, never to the harness"
+    "pass": "the accepted base satisfies the contract through the real public route/surface: the sealed AssetHostRoute imports canonical media to a durable AVAILABLE canonical AssetRef and the accepted AssetService seam leases/reads/refuses it with finite unguessable leases and GC; the sealed ChannelOutboundRoute drains committed targeted Actions only under the current ActivationManifest and current grant, with bounded caller-deadline queues, status-first restart recovery, exact result envelopes, redaction, and text-only non-regression. A regression here is a product violation",
+    "product_red": "the frozen channel-send arguments schema already admits an {\"kind\":\"asset\"} Part, but the v1 authorize_send rejects every asset part with CHANNEL_UNSUPPORTED_MODALITY and CommittedSendAction::from_manifest_input silently drops the committed Action, and the inbound route has no attachment import or assets_pending gating, so no AssetRef authority (current lease, availability, domain, media type, view/crop, ordering), no multimodal crash/lease recovery, and no inbound attachment pipeline exists at effect time. Every red probe first proves the whole real causal chain it names (route import, lease/tombstone, committed Action, manifest authority, consumer/text-twin dispatch), so every failure is attributable to the missing seam, never to the harness"
   },
   "expected_counts": {
-    "pass": 1,
-    "product_red": 1
+    "pass": 11,
+    "product_red": 6
   },
   "evidence": {
     "wp013b_avail_lease_round_trip": [
       "WP013B-AVAIL-LEASE-001"
     ],
+    "wp013b_asset_fail_closed_negatives": [
+      "WP013B-ASSET-NEGATIVE-001"
+    ],
+    "wp013b_manifest_authority": [
+      "WP013B-MANIFEST-AUTHORITY-001"
+    ],
+    "wp013b_media_kinds_and_bounds": [
+      "WP013B-MEDIA-KINDS-001"
+    ],
+    "wp013b_config_bounds": [
+      "WP013B-CONFIG-BOUNDS-001"
+    ],
+    "wp013b_queue_deadline": [
+      "WP013B-QUEUE-DEADLINE-001"
+    ],
+    "wp013b_restart_status_first": [
+      "WP013B-RESTART-RECOVERY-001"
+    ],
+    "wp013b_envelopes": [
+      "WP013B-ENVELOPE-001"
+    ],
+    "wp013b_redaction": [
+      "WP013B-REDACTION-001"
+    ],
+    "wp013b_text_nonregression": [
+      "WP013B-TEXT-NONREGRESSION-001"
+    ],
+    "wp013b_route_lifecycle": [
+      "WP013B-ROUTE-LIFECYCLE-001"
+    ],
     "wp013b_stale_ref_effect_authority": [
       "WP013B-STALE-REF-EFFECT-001"
+    ],
+    "wp013b_mixed_ordering": [
+      "WP013B-MIXED-ORDER-001"
+    ],
+    "wp013b_media_abuse_send": [
+      "WP013B-MEDIA-ABUSE-SEND-001"
+    ],
+    "wp013b_crop_view": [
+      "WP013B-CROP-VIEW-001"
+    ],
+    "wp013b_inbound_attachment": [
+      "WP013B-INBOUND-ATTACHMENT-001"
+    ],
+    "wp013b_lease_restart": [
+      "WP013B-LEASE-RESTART-001"
     ]
   },
   "cases": [
@@ -51,6 +104,135 @@
       ]
     },
     {
+      "id": "WP013B-ASSET-NEGATIVE-001",
+      "name": "pending_failed_deleted_stale_revoked_expired_foreign_and_noncanonical_refs_fail_closed",
+      "kind": "asset_fail_closed_negatives",
+      "expected": "pass",
+      "pass_basis": "the asset authority fails closed on every non-authoritative AssetRef: a never-imported route status answers explicit absent with no AssetRef, a failed import stays rejected with no asset (SIZE_LIMIT), noncanonical AssetId encodings are rejected at parse, a cross-domain read of identical bytes is denied NotFound, an expired lease confers no durability (grace-then-GC tombstones it), and a tombstoned (deleted/stale/revoked by GC) asset refuses new leases and reads with NotFound — all through the integrated route and AssetService public seams",
+      "assertion": "drive absent status, failed import, noncanonical ids, cross-domain denial, expired-lease GC, and tombstoned read/lease refusals; require the exact fail-closed outcomes with zero availability masquerade",
+      "references": [
+        "crates/dolly-asset/src/identity.rs::AssetId canonical pattern",
+        "crates/dolly-asset/src/service.rs::read / lease fail closed on NotFound",
+        "crates/dolly-runtime/src/host_routes.rs::AssetHostRoute::status absent contract",
+        "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_asset_negatives_fail_closed"
+      ]
+    },
+    {
+      "id": "WP013B-MANIFEST-AUTHORITY-001",
+      "name": "committed_action_requires_current_manifest_grant_and_no_foreign_premise",
+      "kind": "channel_manifest_authority",
+      "expected": "pass",
+      "pass_basis": "the sealed ChannelOutboundRoute drains a committed targeted Action only while the activating manifest that selected it is the CURRENT activation with the CURRENT grant/config/lifecycle: a replaced (new) manifest never re-drains the prior Action, an ingress premise or foreign-owner Action never yields an outbound send, and a revoked Host grant refuses the whole pass before any transport effect with a fail-closed refusal",
+      "assertion": "drive a text twin to Confirmed under the current manifest, then activate a new manifest and a fresh ingress premise and revoke the grant; require each pass to drain exactly its current manifest Action and the revoked pass to refuse fail-closed with zero effect",
+      "references": [
+        "crates/dolly-channel/src/outbound_consumer.rs::authoritative_manifest / revalidate_current_grant / committed_targeted_actions",
+        "crates/dolly-runtime/src/host_routes.rs::ChannelOutboundRoute::consume_once",
+        "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_committed_action_requires_current_manifest_and_grant"
+      ]
+    },
+    {
+      "id": "WP013B-MEDIA-KINDS-001",
+      "name": "supported_media_kinds_authoritative_detection_and_size_type_refusal",
+      "kind": "asset_media_kinds_bounds",
+      "expected": "pass",
+      "pass_basis": "the asset authority records an authoritative detected media type for the bounded supported kinds (image/png, image/jpeg, image/gif, image/webp), refuses active content (SVG/HTML) declared as a passive image with MEDIA_TYPE_MISMATCH without relabeling, enforces decoded size limits with SIZE_LIMIT, and rejects malformed base64 with INVALID_BASE64 — before any AVAILABLE AssetRef",
+      "assertion": "import a PNG and a GIF with matching declarations, then drive an SVG-as-PNG spoof, an over-limit payload, and bad base64; require the exact refusal codes and zero availability",
+      "references": [
+        "crates/dolly-asset/src/media.rs::sniff_media_type / probe_media_head / validate_declared_media",
+        "crates/dolly-asset/tests/conformance.rs::declared_media_mismatch_is_rejected_and_active_content_is_not_relabeled",
+        "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_media_kinds_and_bounds"
+      ]
+    },
+    {
+      "id": "WP013B-CONFIG-BOUNDS-001",
+      "name": "channel_config_modality_part_text_bounds_fail_closed_before_dispatch",
+      "kind": "channel_config_bounds",
+      "expected": "pass",
+      "pass_basis": "the channel configuration fails closed before any dispatch: accepted_modalities is locked to exactly {\"text\"} (asset ground is a WP-013B capability and is rejected at validate), max_parts must be in 1..=32, and max_text_bytes must be in 1..=262144, so a multimodal or oversized configuration cannot route work",
+      "assertion": "validate channel configurations declaring asset modalities, zero/oversized max_parts, and zero/oversized max_text_bytes; require ERR with no work routed",
+      "references": [
+        "crates/dolly-channel/src/config.rs::ChannelConfig::validate modality/part/text bounds",
+        "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_config_bounds_fail_closed"
+      ]
+    },
+    {
+      "id": "WP013B-QUEUE-DEADLINE-001",
+      "name": "outbound_queue_rate_and_caller_deadline_bounds_admit_nothing_expired",
+      "kind": "channel_queue_deadline",
+      "expected": "pass",
+      "pass_basis": "through the runtime route the identity-bound gate+queue bounds a committed-action burst by the caller deadline: with the guest clock past the deadline every action is refused CHANNEL_RATE_LIMITED (retryable) before any transport effect or Core input mutation",
+      "assertion": "commit a three-send burst and run the consumer under an expired caller deadline; require zero transport calls and no Core host-ingress operations added",
+      "references": [
+        "crates/dolly-channel/src/outbound_queue.rs::OutboundQueueGate bounded admission",
+        "crates/dolly-runtime/src/host_routes.rs::ChannelOutboundRoute::consume_once",
+        "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_queue_deadline_bounds"
+      ]
+    },
+    {
+      "id": "WP013B-RESTART-RECOVERY-001",
+      "name": "crash_restart_recovery_is_status_first_and_replay_is_idempotent",
+      "kind": "channel_restart_status_first",
+      "expected": "pass",
+      "pass_basis": "the sealed consumer reconciles across restart status-first: a dispatched row whose transport response was lost is never re-sent, a status query settles it exactly once, an unknown outcome is never promoted, and re-consuming a confirmed Action returns the stored frozen result with zero re-dispatch",
+      "assertion": "drive a Timeout dispatch, then a status-capable pass and a replay pass over the same route/store; require one status call, zero re-send, zero blind resubmit, and the stored result on replay",
+      "references": [
+        "crates/dolly-channel/src/outbound_consumer.rs::reconcile status-first",
+        "crates/dolly-runtime/src/host_routes.rs::ChannelOutboundRoute",
+        "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_restart_status_first_recovery"
+      ]
+    },
+    {
+      "id": "WP013B-ENVELOPE-001",
+      "name": "exact_result_and_refusal_envelopes_on_the_outbound_route",
+      "kind": "channel_envelopes",
+      "expected": "pass",
+      "pass_basis": "a confirmed committed send produces the exact frozen dolly.action-result/v1 envelope (action_id, status succeeded, result schema with contiguous unique per-piece external_message_id), and a bounded-queue refusal reports the exact common error code CHANNEL_RATE_LIMITED with zero transport effect",
+      "assertion": "consume a confirmed send and a deadline-refused send through the route; require the exact result envelope fields and the exact refusal code",
+      "references": [
+        "crates/dolly-channel/src/result_validator.rs::RESULT_VALIDATOR_ID/REVISION and ordinal uniqueness",
+        "dolly-schema/src/embedded-schema-catalog.json::channel-send-result.schema.json",
+        "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_exact_result_and_refusal_envelopes"
+      ]
+    },
+    {
+      "id": "WP013B-REDACTION-001",
+      "name": "credentials_paths_and_signed_urls_never_enter_drafts_ledgers_or_asset_errors",
+      "kind": "channel_redaction",
+      "expected": "pass",
+      "pass_basis": "the channel drafts come from a fixed-field allowlist so transport credentials, cookies, local paths, and signed URLs never enter the committed draft, ledger row, or attempt history, and asset read/lease failures never disclose the content root, base64, or object locator",
+      "assertion": "ingress a hostile event carrying credential/path/signed-URL fields and refuse a tombstoned read; require none of the secrets in the ledger/draft and none of the path/base64 in the asset error surface",
+      "references": [
+        "crates/dolly-channel/src/ingress.rs::build_draft fixed-field allowlist",
+        "crates/dolly-asset/src/service.rs::read/lease error messages without path or bytes",
+        "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_redaction_never_leaks_secrets_or_paths"
+      ]
+    },
+    {
+      "id": "WP013B-TEXT-NONREGRESSION-001",
+      "name": "text_only_g4_nonregression_round_trip_replay_and_status_first",
+      "kind": "channel_text_nonregression",
+      "expected": "pass",
+      "pass_basis": "the frozen G4 text path stays green end to end through the runtime route: an authenticated producer premise commits durably, a committed text send drains to Terminal Confirmed under the ActivationManifest, a byte-identical replay is idempotent, and a conflicting premise changes nothing",
+      "assertion": "run the full text producer -> durable premise -> consumer route; require committed premise, dispatched send, idempotent replay, and conflict refusal, all over the real Core transaction",
+      "references": [
+        "crates/dolly-runtime/src/host_routes.rs::open_channel_inbound_route / ChannelOutboundRoute",
+        "crates/dolly-runtime/tests/g4_content_channel_conformance.rs::g4_wp013a_authenticated_text_round_trip_runs_producer_to_premise_to_consumer",
+        "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_text_only_nonregression"
+      ]
+    },
+    {
+      "id": "WP013B-ROUTE-LIFECYCLE-001",
+      "name": "runtime_route_registration_lifecycle_and_fail_closed_absence",
+      "kind": "runtime_route_lifecycle",
+      "expected": "pass",
+      "pass_basis": "runtime route registration and use fail closed across the lifecycle: a grant lacking the required host method refuses registration (CapabilityDenied), a revoked grant refuses every effect (StaleOrRevoked), a cross-module import request is refused before the façade, and registering the outbound route twice returns the same identity-bound gate (exactly one gate)",
+      "assertion": "register routes under a method-less grant, a revoked grant, and a cross-module request; require CapabilityDenied/StaleOrRevoked before any effect and one shared outbound gate",
+      "references": [
+        "crates/dolly-runtime/src/host_routes.rs::require_current / AssetHostRoute::for_activated_module / ChannelOutboundRoute::register",
+        "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_route_lifecycle_fail_closed"
+      ]
+    },
+    {
       "id": "WP013B-STALE-REF-EFFECT-001",
       "name": "stale_assetref_is_refused_by_an_asset_authority_at_channel_effect_time",
       "kind": "channel_multimodal_effect_authority",
@@ -63,6 +245,72 @@
         "crates/dolly-channel/src/outbound_consumer.rs::committed_targeted_actions silent skip",
         "crates/dolly-runtime/src/host_routes.rs::ChannelOutboundRoute::consume_once",
         "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_stale_assetref_refused_at_effect_time"
+      ]
+    },
+    {
+      "id": "WP013B-MIXED-ORDER-001",
+      "name": "mixed_text_and_asset_parts_reach_transport_in_exact_ordinal_order",
+      "kind": "channel_multimodal_ordering",
+      "expected": "product_red",
+      "seam": "a committed org.dolly.channel.send Action whose parts mix text and a canonical AVAILABLE AssetRef must reach the transport as an ordered piece array with contiguous ordinals (0..n) preserving the committed order, each asset piece authorized under a current lease",
+      "causal_red": "authorize_send stops at the first asset part with CHANNEL_UNSUPPORTED_MODALITY, so a mixed text+asset Action is silently dropped by CommittedSendAction::from_manifest_input; no ordered asset piece can be built or transported, while the identical text twin dispatches to Terminal Confirmed through the same route",
+      "references": [
+        "crates/dolly-channel/src/outbound.rs::authorize_send ordinal loop asset rejection",
+        "crates/dolly-channel/src/ledger.rs::OutboundPiece ordinal contract",
+        "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_mixed_text_asset_ordering"
+      ]
+    },
+    {
+      "id": "WP013B-MEDIA-ABUSE-SEND-001",
+      "name": "forged_or_overriding_media_type_is_refused_by_detected_type_authority",
+      "kind": "channel_multimodal_media_abuse",
+      "expected": "product_red",
+      "seam": "before dispatch the Channel MUST apply the Core AssetPart authorization with the authoritative detected media type: an action-declared media_type that overrides or contradicts the detected type of the AVAILABLE asset (or unsafe active content) is refused with a fail-closed asset code, never re-labeled, never trusted as an override",
+      "causal_red": "the send path has no detected-type/safe-view authority: authorize_send rejects every asset part at the profile seam and the Action is silently dropped, so an action declaring image/jpeg for a detected image/png AssetRef is neither refused by a media authority nor corrected to the authoritative type — the abuse gate is absent",
+      "references": [
+        "crates/dolly-channel/src/outbound.rs::authorize_send asset-part WP-013B seam",
+        "crates/dolly-asset/src/media.rs::validate_declared_media authoritative detection",
+        "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_media_abuse_refused_at_effect_time"
+      ]
+    },
+    {
+      "id": "WP013B-CROP-VIEW-001",
+      "name": "view_crop_bounds_are_checked_against_display_geometry_at_effect_time",
+      "kind": "channel_multimodal_crop_view",
+      "expected": "product_red",
+      "seam": "an asset Part's view/crop rectangle MUST be validated against the authoritative inspected display geometry of the AVAILABLE asset before dispatch: an empty, out-of-range, or non-fixed-point crop is refused (EMPTY_CROP/INVALID_CROP class) and no broader crop than delivered is honored",
+      "causal_red": "the send path performs no crop/view validation: authorize_send drops every asset part at the profile seam and the Action is silently dropped, so a view that exceeds the asset's display bounds is never refused by a geometry authority at effect time",
+      "references": [
+        "dolly-spec/docs/spec/services/assets.md::6 normalized crop semantics",
+        "crates/dolly-channel/src/outbound.rs::authorize_send asset-part WP-013B seam",
+        "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_view_crop_checked_at_effect_time"
+      ]
+    },
+    {
+      "id": "WP013B-INBOUND-ATTACHMENT-001",
+      "name": "inbound_attachment_imports_through_assets_and_gates_block_submission_on_availability",
+      "kind": "channel_multimodal_inbound_import",
+      "expected": "product_red",
+      "seam": "a Channel transport event carrying an attachment MUST import it through the Asset Service (host.asset import) and MUST NOT submit the inbound Block draft until every referenced asset is AVAILABLE or MUST represent failed attachments explicitly without a fabricated reference (assets_pending gating)",
+      "causal_red": "the inbound surface has no attachment ground: ChannelEventContent carries no attachment, InboundState has no assets_pending state, and the inbound route performs no Asset import, so a transport attachment can neither be imported nor AVAILABLE-gate the draft — while host.asset.import itself is proven working through the same route",
+      "references": [
+        "crates/dolly-channel/src/receiver.rs::ChannelEventContent fixed fields",
+        "crates/dolly-channel/src/ledger.rs::InboundState (text modality only)",
+        "crates/dolly-asset/src/facade.rs::AssetHostFacade host.asset.import",
+        "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_inbound_attachment_import"
+      ]
+    },
+    {
+      "id": "WP013B-LEASE-RESTART-001",
+      "name": "multimodal_send_crash_restart_recovery_under_original_import_and_lease",
+      "kind": "channel_multimodal_lease_restart",
+      "expected": "product_red",
+      "seam": "a dispatched multimodal send MUST be recoverable across crash/restart status-first under its original ImportId and Asset lease (the lease invalidated only after blocking work is proven done), never re-minted, never blind-resent, never reported success while bytes may be unknown",
+      "causal_red": "no multimodal outbound row can exist: every asset-part Action is dropped at the profile seam before a durable Prepared row or Asset lease is created, so there is no ImportId/lease record for crash recovery, no status-first multimodal reconcile, and no lease-invalidation-after-blocking-work path",
+      "references": [
+        "crates/dolly-channel/src/outbound_consumer.rs::prepare/dispatch/reconcile (text only)",
+        "crates/dolly-asset/src/service.rs::lease lifecycle",
+        "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_lease_restart_recovery_absent"
       ]
     }
   ]
