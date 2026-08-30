@@ -179,6 +179,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dolly-alarm"
+version = "0.1.0"
+dependencies = [
+ "dolly-canonical-json",
+ "parking_lot",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "dolly-asset"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,22 @@
+[package]
+name = "dolly-alarm"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Dolly Alarm extension core (WP-014): deterministic injected-time scheduler, versioned timezone rules, durable SQLite alarm/occurrence/claim/ack authority."
+autotests = false
+
+[dependencies]
+dolly-canonical-json = { path = "../dolly-canonical-json" }
+rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+parking_lot = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[test]]
+name = "conformance"
+path = "tests/conformance.rs"

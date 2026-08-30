@@ -17,6 +17,7 @@ members = [
     "crates/dolly-local-daemon",
     "crates/dolly-asset",
     "crates/dolly-channel",
+    "crates/dolly-alarm",
 ]
 
 [workspace.package]
