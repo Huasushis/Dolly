@@ -26,18 +26,16 @@
 //!   install, durable Core ingress commit) AND the integrated surface for the
 //!   seam it names, so every contract exercised above is proven working; only
 //!   the exact absent Host/runtime adapter seam named in `causal_red` turns
-//!   the case red. The Asset Host seam (A, closed: `AssetHostRoute` routes an
-//!   already Host-authorized Asset capability/import request into
-//!   `AssetService` — durable ImportRecord, AVAILABLE canonical AssetRef,
-//!   authoritative `absent`; Core ingress never mints or imports asset
-//!   authority and a later consumer may only reference the AVAILABLE
-//!   AssetRef) and the Core ingress Host seam (B, closed: the runtime Channel
-//!   inbound route binds `host.ingress.submit`/`host.ingress.status` to the
-//!   real durable Host ingress slice) are wired. Remaining executables are
-//!   confined to the committed-Action outbound consumer seam (D): no runtime
-//!   consumer that feeds committed blocks into `dispatch_send`, and no
-//!   caller-deadline queue in that path. The message distinguishes compile/API
-//!   absence from runtime behavior and never calls a harness failure a
+//!   the case red. With the integrator-assigned runtime wiring complete, the
+//!   Asset Host seam (A: `AssetHostRoute` routes an already Host-authorized
+//!   Asset capability/import request into `AssetService`), the Core ingress
+//!   Host seam (B: the runtime Channel inbound route binds
+//!   `host.ingress.submit`/`host.ingress.status` to the real durable Host
+//!   ingress slice), and the committed-Action outbound consumer seam
+//!   (D: `ChannelOutboundRoute` owns the one identity-bound gate+limiter,
+//!   injects it into the sealed `OutboundConsumer`, and runs a bounded
+//!   status-first consumer/recovery loop over an injected status-capable
+//!   transport) are all wired: the matrix is fully green with no executable
 //!   PRODUCT_RED.
 //! - blocked declarations (`G4-WP013B-*`, expected `product_red` with
 //!   `blocked: true`): retained in the matrix, asserted to be blocked, and
@@ -75,8 +73,9 @@ use dolly_asset::replica::{DisabledReplica, InMemoryReplica};
 use dolly_asset::service::AssetService;
 use dolly_asset::AssetCapability;
 use dolly_runtime::{
-    AssetHostRoute, authenticated_channel_event, install_channel_store_schema,
-    open_channel_inbound_route, reconcile_channel_inbound_route,
+    AssetHostRoute, ChannelOutboundRoute, authenticated_channel_event,
+    install_channel_store_schema, open_channel_inbound_route,
+    reconcile_channel_inbound_route,
 };
 use dolly_channel::config::SessionMappingPolicy;
 use dolly_channel::{
@@ -93,6 +92,8 @@ use std::sync::{Arc, Mutex};
 
 const MATRIX: &str = include_str!("fixtures/g4_content_channel_conformance.json");
 const TARGET_PAGE: &str = "page-web-primary";
+/// The Channel module’s dedicated input page (outbound consumer targets).
+const ROUTE_INPUT_PAGE: &str = "page-in";
 const CHANNEL_NOW: &str = "2026-08-28T00:00:00.000000Z";
 /// A fixed unix-millisecond instant for the asset harness.
 const ASSET_T0: u64 = 1_800_000_000_000;
@@ -258,7 +259,7 @@ fn route_graph_snapshot(module_id: &str, extension_id: &str, output_pages: &[&st
     output.insert(module_id.into(), json!(output_pages));
     json!({
         "receiving_module": module_id,
-        "input_pages": {"page-web-primary": [module_id]},
+        "input_pages": {module_id: [ROUTE_INPUT_PAGE]},
         "output_pages": output,
         "subscriptions": {},
         "descriptors": descriptors,
@@ -368,6 +369,361 @@ fn route_asset_request(
     request.instance_id = instance.to_string();
     request
 }
+/// A deterministic shared status-capable transport: the consumer owns a boxed
+/// copy while the probe drives the script and inspects recorded calls through
+/// the Arc.
+#[derive(Clone, Default)]
+struct RouteSharedTransport {
+    idempotent: bool,
+    inner: std::sync::Arc<std::sync::Mutex<RouteSharedInner>>,
+}
+
+#[derive(Default)]
+struct RouteSharedInner {
+    script: Vec<TransportSendResult>,
+    calls: Vec<dolly_channel::transport::TransportSendRequest>,
+    status_script: Vec<(String, dolly_channel::transport::TransportStatusResult)>,
+    status_calls: Vec<dolly_channel::transport::TransportStatusRequest>,
+}
+
+impl RouteSharedTransport {
+    fn new(idempotent: bool) -> Self {
+        Self {
+            idempotent,
+            inner: std::sync::Arc::new(std::sync::Mutex::new(RouteSharedInner::default())),
+        }
+    }
+    fn push(&self, result: TransportSendResult) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .script
+            .push(result);
+    }
+    fn push_status(&self, action_id: &str, result: dolly_channel::transport::TransportStatusResult) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .status_script
+            .push((action_id.to_string(), result));
+    }
+    fn calls(&self) -> Vec<dolly_channel::transport::TransportSendRequest> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .calls
+            .clone()
+    }
+    fn status_calls(&self) -> Vec<dolly_channel::transport::TransportStatusRequest> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .status_calls
+            .clone()
+    }
+    fn script_len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .script
+            .len()
+    }
+}
+
+impl dolly_channel::ChannelTransport for RouteSharedTransport {
+    fn idempotency_supported(&self) -> bool {
+        self.idempotent
+    }
+    fn send(&mut self, request: &dolly_channel::transport::TransportSendRequest) -> TransportSendResult {
+        let mut inner = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
+        inner.calls.push(request.clone());
+        if inner.script.is_empty() {
+            return TransportSendResult::Timeout;
+        }
+        inner.script.remove(0)
+    }
+    fn status(&mut self, request: &dolly_channel::transport::TransportStatusRequest) -> dolly_channel::transport::TransportStatusResult {
+        let mut inner = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
+        inner.status_calls.push(request.clone());
+        let pos = inner
+            .status_script
+            .iter()
+            .position(|(id, _)| id == &request.action_id);
+        match pos {
+            Some(idx) => inner.status_script.remove(idx).1.clone(),
+            None => dolly_channel::transport::TransportStatusResult::Unknown,
+        }
+    }
+}
+
+/// A committed targeted send block with the authoritative contract digest
+/// (matching the accepted seam D consumer's verification).
+
+/// A far-future caller deadline for consumer passes.
+
+/// Commit a targeted send block durably and persist an ACTIVATED manifest
+/// selecting it — the exact input the sealed outbound consumer drains (never
+/// caller-injected blocks or retained upstream premises).
+
+/// A fixed guest clock pinned to a later instant than the caller deadline,
+/// for deterministic caller-deadline expiry in the queue-bound probe.
+#[derive(Clone, Debug)]
+struct ChannelLateClock {
+    at: std::sync::Arc<std::sync::Mutex<dolly_core_domain::Timestamp>>,
+}
+
+impl ChannelLateClock {
+    fn at(timestamp: dolly_core_domain::Timestamp) -> Self {
+        Self {
+            at: std::sync::Arc::new(std::sync::Mutex::new(timestamp)),
+        }
+    }
+}
+
+impl dolly_channel::Clock for ChannelLateClock {
+    fn now(&self) -> dolly_core_domain::Timestamp {
+        self.at
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+}
+
+
+fn route_send_block(module_id: &str, action_ids: &[&str], session_id: &str, texts: &[&str]) -> Value {
+    let parts: Vec<Value> = texts
+        .iter()
+        .map(|t| json!({"kind": "text", "text": t, "format": "plain"}))
+        .collect();
+    let actions = action_ids
+        .iter()
+        .enumerate()
+        .map(|(index, action_id)| {
+            let action_parts = if index == 0 {
+                parts.clone()
+            } else {
+                parts.clone()
+            };
+            let mut action = json!({
+                "action_id": action_id,
+                "name": "org.dolly.channel.send",
+                "target": {"module_id": module_id},
+                "arguments": {
+                    "session_id": session_id,
+                    "parts": action_parts,
+                    "reply_to_external_message_id": null
+                },
+                "contract_binding": {
+                    "module_id": module_id,
+                    "descriptor_revision": 1,
+                    "action_contract_digest": null,
+                    "action_contract": {
+                        "name": "org.dolly.channel.send",
+                        "arguments_schema": {
+                            "uri": "https://dolly.example/spec/0.1/schemas/channel-send.schema.json",
+                            "schema_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                            "semantic_validator": null
+                        },
+                        "result_schema": {
+                            "uri": "https://dolly.example/spec/0.1/schemas/channel-send-result.schema.json",
+                            "schema_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                            "semantic_validator": {
+                                "id": "org.dolly.validator.channel-send-result",
+                                "revision": 1
+                            }
+                        },
+                        "description": "send a message",
+                        "side_effect_class": "idempotent_write"
+                    }
+                }
+            });
+            let contract =
+                action["contract_binding"]["action_contract"].clone();
+            action["contract_binding"]["action_contract_digest"] =
+                json!(canonical_digest(&contract));
+            action
+        })
+        .collect::<Vec<Value>>();
+    json!({
+        "schema": "dolly.block/v1",
+        "id": format!("block-{}", action_ids[0]),
+        "body": {
+            "description": "model response",
+            "parts": parts,
+            "actions": actions
+        }
+    })
+}
+
+/// A far-future caller deadline for consumer passes.
+fn far_deadline_str() -> String {
+    dolly_channel::timestamp_plus_seconds(CHANNEL_NOW, 60)
+}
+
+/// Commit a targeted send block durably and persist an ACTIVATED manifest
+/// selecting it — the exact input the sealed outbound consumer drains (never
+/// caller-injected blocks or retained upstream premises).
+fn commit_send_and_activate(
+    connection: &mut Connection,
+    authority: &HostConnectionAuthority,
+    grant: &HostCapabilityGrant,
+    mark: &str,
+    page: &str,
+    block: Value,
+    frozen_config: ChannelConfig,
+) -> String {
+    let action_ids: Vec<String> = block["body"]["actions"]
+        .as_array()
+        .expect("actions")
+        .iter()
+        .map(|a| a["action_id"].as_str().expect("action id").to_string())
+        .collect();
+    let block_id = format!("send-{mark}");
+    let mut store = SqliteCoreStore::new(connection).expect("core schema");
+    // 1. Fence any prior activation of the same module (single active).
+    let prior: Vec<String> = store
+        .snapshot()
+        .expect("snapshot")
+        .activations
+        .iter()
+        .filter(|(_, activation)| {
+            activation
+                .manifest
+                .as_ref()
+                .and_then(|manifest| manifest.get("module_id"))
+                .and_then(Value::as_str)
+                == Some("web-channel")
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    for activation_id in prior {
+        let transition = store
+            .transact(
+                &CoreCommand::BeginFence(dolly_core_reducer::BeginFenceCommand {
+                    command_id: format!("{mark}-fence-{activation_id}"),
+                    activation_id,
+                }),
+                &input(),
+            )
+            .expect("fence transaction");
+        assert_eq!(transition.outcome, TransitionOutcome::Committed);
+    }
+    // 2. The send block is committed to the durable Core journal under the
+    //    recording model source.
+    let transition = store
+        .transact(
+            &CoreCommand::Ingress(dolly_core_reducer::IngressCommand {
+                command_id: format!("{mark}-send"),
+                runtime_source: "model/web-channel".to_string(),
+                ingress_key: format!("{mark}-send-key"),
+                operation_digest: canonical_digest(&block),
+                block_id: block_id.clone(),
+                block: block.clone(),
+                pages: vec![page.to_string()],
+            }),
+            &input(),
+        )
+        .expect("send commit");
+    assert_eq!(transition.outcome, TransitionOutcome::Committed);
+    drop(store);
+
+    // 3. An activated manifest selects that block as the sole input item.
+    let activation_id = format!("activation-{mark}");
+    let occurrences: Vec<Value> = vec![json!({"page_id": page, "page_seq": 1, "commit_seq": 1})];
+    let mut config = frozen_config;
+    let principal_account =
+        dolly_channel::ChannelPrincipal::from_authority_grant(authority, grant)
+            .expect("principal")
+            .account()
+            .to_string();
+    config.transport_account = principal_account;
+    let effective_config = serde_json::to_value(config.clone()).expect("config serializable");
+    let effective_config_digest = canonical_digest(&effective_config);
+    let mut manifest = json!({
+        "schema": "dolly.activation-manifest/v1",
+        "activation_id": activation_id.clone(),
+        "module_id": "web-channel",
+        "reason": "input",
+        "created_at": CHANNEL_NOW,
+        "graph_revision": 1,
+        "config_revision": config.revision,
+        "descriptor_revision": 1,
+        "effective_config": effective_config,
+        "effective_config_digest": effective_config_digest,
+        "required_frame_bytes": 2048,
+        "required_frame_nesting_depth": 4,
+        "input_items": [{
+            "block": block,
+            "occurrences": occurrences,
+            "occurrence_count": 1
+        }],
+        "cursor_spans": [],
+        "lossy_gaps": [],
+        "output_page_ids": [],
+        "neighbor_descriptors": [],
+        "deadline": far_deadline_str()
+    });
+    let manifest_digest = canonical_digest(&manifest);
+    manifest["manifest_digest"] = json!(manifest_digest);
+    let mut store = SqliteCoreStore::new(connection).expect("core schema");
+    let transition = store
+        .transact(
+            &CoreCommand::BuildManifest(dolly_core_reducer::BuildManifestCommand {
+                command_id: format!("{mark}-build"),
+                activation_id: activation_id.clone(),
+                manifest,
+                expected_graph_revision: None,
+                expected_descriptor_revision: None,
+            }),
+            &input(),
+        )
+        .expect("manifest build");
+    assert_eq!(transition.outcome, TransitionOutcome::Committed);
+
+    // 4. Activate: lease + dispatch started make this the authoritative
+    //    active manifest the consumer reads.
+    let lease_id = format!("lease-{mark}");
+    let token_digest = canonical_digest(&json!({"activation_id": activation_id, "lease_id": lease_id}));
+    let transition = store
+        .transact(
+            &CoreCommand::IssueLease(dolly_core_reducer::IssueLeaseCommand {
+                command_id: format!("{mark}-lease"),
+                activation_id: activation_id.clone(),
+                lease_id: lease_id.clone(),
+                reservation_id: None,
+                token_digest,
+                extension_connection_id: authority.extension_connection_id().to_string(),
+                worker_epoch: authority.worker_epoch_fence(),
+                request_id: None,
+                worker_epoch_id: None,
+                incarnation_revision: None,
+                extension_generation: Some(1),
+            }),
+            &input(),
+        )
+        .expect("lease");
+    assert_eq!(transition.outcome, TransitionOutcome::Committed);
+    let transition = store
+        .transact(
+            &CoreCommand::DispatchLease(dolly_core_reducer::DispatchLeaseCommand {
+                command_id: format!("{mark}-dispatch"),
+                activation_id: activation_id.clone(),
+                lease_id,
+                dispatch_state: dolly_core_reducer::DispatchState::Started,
+                reservation_id: None,
+                request_id: None,
+                extension_connection_id: None,
+                incarnation_revision: None,
+                frame_digest: None,
+            }),
+            &input(),
+        )
+        .expect("dispatch");
+    assert_eq!(transition.outcome, TransitionOutcome::Committed);
+    let _ = &action_ids;
+    activation_id
+}
+
 
 fn transact_ingress(
     connection: &mut Connection,
@@ -2201,91 +2557,148 @@ fn g4_wp013a_authenticated_text_round_trip_runs_producer_to_premise_to_consumer(
 #[test]
 fn g4_wp013a_committed_action_consumer_remains_an_absent_runtime_loop() {
     let entry = case("G4-WP013A-CONSUMER-001");
-    assert_eq!(entry["expected"], "product_red");
-    let seam = entry["seam"].as_str().expect("seam");
+    assert_eq!(entry["expected"], "pass");
 
-    let mut connection = probe_connection("web-channel", "g4-consumer");
+    // The actual registration path: the runtime owns the ONE identity-bound
+    // OutboundQueueGate for this store/account/config identity and injects it
+    // into the sealed OutboundConsumer over the real Core journal and the
+    // module-scoped Channel store, with an injected status-capable transport.
+    let (mut runtime, authority, grant) = route_harness(
+        "web-channel",
+        "org.dolly.channel",
+        "g4-consumer-route",
+        &["host.ingress.submit"],
+        &[TARGET_PAGE],
+    );
+    let mut module_store = channel_store_connection();
     let config = channel_config();
     let clock = channel_clock();
-    let mut ledger = ChannelLedger::new();
 
-    // 1. A session derived from a real committed upstream premise, so the
-    //    downstream dispatch is authorized under the premise's own identity.
+    // 1. Upstream producer premise commits under the sealed authority and
+    //    yields the account-owned session the downstream send is bound to.
     {
-        let mut core = CoreBackedIngress::new(&mut connection, "web-channel");
-        let outcome = process_event(
-            &config,
-            &clock,
-            &mut ledger,
-            &mut core,
-            &channel_event("account-a", "conv-1", "in-1", "What is the weather?"),
-        );
+        let mut receiver = open_channel_inbound_route(
+            &mut runtime,
+            &mut module_store,
+            config.clone(),
+            Box::new(clock.clone()),
+            &authority,
+            &grant,
+        )
+        .expect("channel route registration");
+        let event = authenticated_channel_event(
+            &authority,
+            &grant,
+            config.revision,
+            route_content_event("conv-1", "in-1", "What is the weather?"),
+        )
+        .expect("authenticated event seals under the grant");
         assert!(
-            outcome.committed_block_id().is_some(),
-            "upstream premise committed in real Core"
+            matches!(receiver.ingest_event(&event), IngressOutcome::Committed { .. }),
+            "the upstream premise commits through the route"
         );
     }
-    let session_id = ledger
-        .session("account-a", "conv-1")
-        .expect("session mapped")
-        .clone();
+    let principal = dolly_channel::ChannelPrincipal::from_authority_grant(&authority, &grant)
+        .expect("principal");
+    let session_id = dolly_channel::ids::dolly_session_id(principal.account(), "conv-1");
 
-    // 2. A committed send Action exists durably in the real Core snapshot.
+    // 2. A targeted send Action is committed durably and an activating
+    //    manifest selects it — the exact input the sealed consumer drains.
     let action_id = "0198ab31-6c44-7e8a-b2bb-000000000712";
-    let send_block = channel_send_block(action_id, &session_id, &["It will be sunny."]);
-    let committed = transact_ingress(
-        &mut connection,
-        "model/web-channel",
-        "action-1",
-        &canonical_digest(&send_block),
-        &format!("{action_id}-block"),
-        send_block.clone(),
-        vec![TARGET_PAGE.into()],
-        "g4-consumer-send",
-    );
-    assert_eq!(committed.outcome, TransitionOutcome::Committed);
-    let committed_block_id = committed
-        .reply
-        .as_ref()
-        .and_then(|reply| reply.get("block_id"))
-        .and_then(Value::as_str)
-        .expect("committed block id")
-        .to_string();
-    let snapshot = {
-        let store = SqliteCoreStore::new(&mut connection).expect("core schema");
-        store.snapshot().expect("snapshot")
-    };
-    let durable = &snapshot.blocks[&committed_block_id];
-    assert_eq!(
-        durable["body"]["actions"][0]["name"], "org.dolly.channel.send",
-        "the durable committed block carries the targeted channel send Action"
+    let send_block = route_send_block("web-channel", &[action_id], &session_id, &["It will be sunny."]);
+    commit_send_and_activate(
+        &mut runtime,
+        &authority,
+        &grant,
+        "g4-consumer",
+        ROUTE_INPUT_PAGE,
+        send_block,
+        config.clone(),
     );
 
-    // 3. The Channel outbound pipeline turns that committed Action into a
-    //    confirmed ActionResult — but ONLY because this test extracts the
-    //    block and invokes dispatch_send by hand. The shipping runtime has no
-    //    consumer loop that does this step.
-    let mut transport = ScriptedTransport::new(true);
+    // 3. The runtime route owns the shared gate: registering twice returns
+    //    the same identity-bound Arc, so no consumer-created gate exists.
+    let route = ChannelOutboundRoute::register(
+        config.clone(),
+        &mut module_store,
+        &authority,
+        &grant,
+    )
+    .expect("outbound route registration");
+    let gate = route.gate();
+    let route2 = ChannelOutboundRoute::register(
+        config.clone(),
+        &mut module_store,
+        &authority,
+        &grant,
+    )
+    .expect("outbound route re-registration");
+    assert!(
+        std::sync::Arc::ptr_eq(&gate, &route2.gate()),
+        "exactly one identity-bound gate per store/account/config"
+    );
+
+    // 4. The runtime consumer pass turns the committed targeted Action into a
+    //    frozen Terminal ActionResult through the injected transport — no
+    //    block scanning, no raw dispatch_send, no retained upstream premise.
+    let transport = RouteSharedTransport::new(true);
     transport.push(TransportSendResult::AllConfirmed {
         message_ids: vec!["transport-reply-1".to_string()],
     });
-    let outcome = channel_dispatch(&config, &mut ledger, &mut transport, &send_block, action_id);
-    match outcome {
-        SendDispatchResult::Terminal {
-            state: OutboundState::Confirmed,
+    let report = route
+        .consume_once(
+            &mut module_store,
+            &mut runtime,
+            Box::new(clock.clone()),
+            Box::new(transport.clone()),
+            &far_deadline_str(),
+        )
+        .expect("runtime consumer pass");
+    assert_eq!(report.transported, 1, "exactly one send dispatched");
+    assert_eq!(report.rejected, 0);
+    assert_eq!(report.pending, 0);
+    assert_eq!(report.remaining, 0, "status-first reconcile leaves nothing");
+    let terminal_jcs = match &report.terminal[0] {
+        dolly_channel::ConsumerOutcome::Terminal {
+            state,
+            result_jcs,
             ..
-        } => {}
-        other => panic!("expected confirmed outbound, got {other:?}"),
-    }
-    assert_eq!(transport.calls().len(), 1);
+        } => {
+            assert_eq!(state, &OutboundState::Confirmed);
+            result_jcs.clone()
+        }
+        other => panic!("expected Terminal Confirmed, got {other:?}"),
+    };
+    let envelope: Value = serde_json::from_str(&terminal_jcs).expect("action result envelope");
+    assert_eq!(envelope["schema"], "dolly.action-result/v1");
+    assert_eq!(envelope["action_id"], action_id);
+    assert_eq!(envelope["status"], "succeeded");
+    assert_eq!(transport.calls().len(), 1, "exactly one transport call");
 
-    product_red(
-        "G4-WP013A-CONSUMER-001",
-        seam,
-        "the exercised committed org.dolly.channel.send Action sits durable in the real Core snapshot and the dolly_channel outbound pipeline turns it into a confirmed ActionResult, but only because this probe extracts the block and invokes parse_send_action/dispatch_send manually — the shipping runtime has no committed-Action outbound consumer loop that selects targeted Actions from committed Blocks and drives them through the ledger and transport (committed-Action consumer seam D)",
-        "WP-013A committed-Action consumer seam (D)",
-    );
+    // 5. Re-consuming the same committed Action returns the stored frozen
+    //    result with ZERO re-dispatch (idempotent replay through the route).
+    let transport2 = RouteSharedTransport::new(true);
+    let replay = route
+        .consume_once(
+            &mut module_store,
+            &mut runtime,
+            Box::new(clock.clone()),
+            Box::new(transport2.clone()),
+            &far_deadline_str(),
+        )
+        .expect("replay consumer pass");
+    assert_eq!(replay.transported, 1, "replay returns the stored terminal");
+    assert!(matches!(
+        &replay.terminal[0],
+        dolly_channel::ConsumerOutcome::Terminal {
+            state,
+            ..
+        } if state == &OutboundState::Confirmed
+    ));
+    assert_eq!(transport2.calls().len(), 0, "zero re-dispatch on replay");
 }
+
+
 
 #[test]
 fn g4_wp013a_ingress_reconciliation_reads_status_instead_of_resubmitting() {
@@ -2649,52 +3062,248 @@ fn g4_wp013a_unknown_and_partial_outcomes_are_explicit_and_non_retryable() {
 #[test]
 fn g4_wp013a_outbound_rate_limits_use_bounded_queues_and_caller_deadlines() {
     let entry = case("G4-WP013A-BACKPRESSURE-001");
-    assert_eq!(entry["expected"], "product_red");
-    let seam = entry["seam"].as_str().expect("seam");
+    assert_eq!(entry["expected"], "pass");
 
-    // Prove the crate's bounded admission at the surface: one piece is
-    // admitted; a burst past the per-session rate limit is refused as
-    // retryable CHANNEL_RATE_LIMITED.
-    let config = ChannelConfigBuilder::new("web", "account-a", "web-channel", 1)
-        .target_pages(&[TARGET_PAGE])
-        .max_pieces_per_second_per_session(2)
-        .build();
-    let mut ledger = ChannelLedger::new();
-    ledger.insert_session("account-a", "conv-1", "session-main");
-    let mut transport = ScriptedTransport::new(true);
-    transport.push(TransportSendResult::AllConfirmed {
-        message_ids: vec!["m1".to_string()],
-    });
-    let action_id1 = "0198ab31-6c44-7e8a-b2bb-000000000706";
-    let block1 = channel_send_block(action_id1, "session-main", &["one"]);
-    let admitted = channel_dispatch(&config, &mut ledger, &mut transport, &block1, action_id1);
-    assert!(
-        matches!(admitted, SendDispatchResult::Terminal { .. }),
-        "a one-piece dispatch under the limit succeeds at the crate surface"
-    );
+    // Through the runtime route the identity-bound gate owns the bounded
+    // caller-deadline queue: an expired caller deadline admits nothing and
+    // every action is refused RATE_LIMITED (retryable) with zero transport
+    // and zero Core input mutation; transport unavailability never blocks
+    // Core input state — the durable Dispatched row is settled status-first,
+    // never blind-resent. (The per-session token-bucket limiter itself is the
+    // accepted dolly-channel surface, proven in its own suite.)
 
-    // A three-piece burst on the same session in the same second is refused.
-    let action_id2 = "0198ab31-6c44-7e8a-b2bb-000000000707";
-    let block2 = channel_send_block(
-        action_id2,
-        "session-main",
-        &["one", "two", "three"],
+    // ---- Leg A: caller-deadline bound (isolated fixture) -----------------
+    let (mut runtime_a, authority_a, grant_a) = route_harness(
+        "web-channel",
+        "org.dolly.channel",
+        "g4-backpressure-deadline",
+        &["host.ingress.submit"],
+        &[TARGET_PAGE],
     );
-    let over = channel_dispatch(&config, &mut ledger, &mut transport, &block2, action_id2);
-    match over {
-        SendDispatchResult::Rejected(error) => {
-            assert_eq!(error.code, "CHANNEL_RATE_LIMITED");
-            assert!(error.retryable, "rate refusal is retryable, not a failure");
-        }
-        other => panic!("expected rate-limited rejection, got {other:?}"),
+    let mut store_a = channel_store_connection();
+    let config = channel_config();
+    let clock_a = channel_clock();
+    {
+        let mut receiver = open_channel_inbound_route(
+            &mut runtime_a,
+            &mut store_a,
+            config.clone(),
+            Box::new(clock_a.clone()),
+            &authority_a,
+            &grant_a,
+        )
+        .expect("channel route registration");
+        let event = authenticated_channel_event(
+            &authority_a,
+            &grant_a,
+            config.revision,
+            route_content_event("conv-1", "in-1", "burst"),
+        )
+        .expect("sealed event");
+        assert!(matches!(receiver.ingest_event(&event), IngressOutcome::Committed { .. }));
     }
-    assert_eq!(transport.calls().len(), 1, "the refused burst never reaches the transport");
+    let host_ingress_ops_a = runtime_a
+        .query_row(
+            "SELECT COUNT(*) FROM core_operations WHERE command_id LIKE 'host-ingress-%'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("baseline");
+    let principal_a = dolly_channel::ChannelPrincipal::from_authority_grant(&authority_a, &grant_a)
+        .expect("principal");
+    let session_a = dolly_channel::ids::dolly_session_id(principal_a.account(), "conv-1");
 
-    product_red(
-        "G4-WP013A-BACKPRESSURE-001",
-        seam,
-        "the exercised dolly_channel admission path rate-limits per session with a token bucket: a one-piece send is admitted and confirmed, while a three-piece burst in the same second is refused as CHANNEL_RATE_LIMITED retryable with no transport call (verified above). That proves the rate bucket, not queuing: there is no bounded outbound QUEUE primitive and no caller-deadline wait/expiry anywhere in the dispatch path, so a burst is REJECTED rather than queued under a caller deadline (committed-Action consumer seam D)",
-        "WP-013A committed-Action consumer seam (D)",
+    // A three-piece burst (one committed block, three targeted sends).
+    let action_ids = [
+        "0198ab31-6c44-7e8a-b2bb-000000000721",
+        "0198ab31-6c44-7e8a-b2bb-000000000722",
+        "0198ab31-6c44-7e8a-b2bb-000000000723",
+    ];
+    let burst = route_send_block(
+        "web-channel",
+        &action_ids,
+        &session_a,
+        &["step one", "step two", "step three"],
+    );
+    commit_send_and_activate(
+        &mut runtime_a,
+        &authority_a,
+        &grant_a,
+        "g4-backpressure",
+        ROUTE_INPUT_PAGE,
+        burst,
+        config.clone(),
+    );
+    let route_a = ChannelOutboundRoute::register(
+        config.clone(),
+        &mut store_a,
+        &authority_a,
+        &grant_a,
+    )
+    .expect("outbound route registration");
+
+    // The guest clock is already past the caller deadline: the bounded queue
+    // admits nothing — every action is refused RATE_LIMITED (retryable)
+    // BEFORE any transport effect, and Core inputs are untouched.
+    let late_clock = ChannelLateClock::at(
+        dolly_channel::timestamp_plus_seconds(CHANNEL_NOW, 90)
+            .parse()
+            .expect("late timestamp"),
+    );
+    let expired_deadline = dolly_channel::timestamp_plus_seconds(CHANNEL_NOW, 60);
+    let transport_a = RouteSharedTransport::new(true);
+    for _ in 0..3 {
+        transport_a.push(TransportSendResult::AllConfirmed {
+            message_ids: vec!["transport-burst-1".to_string()],
+        });
+    }
+    let report = route_a
+        .consume_once(
+            &mut store_a,
+            &mut runtime_a,
+            Box::new(late_clock),
+            Box::new(transport_a.clone()),
+            &expired_deadline,
+        )
+        .expect("caller-deadline bounded pass");
+    assert_eq!(report.transported, 0, "nothing is sent past the caller deadline");
+    assert_eq!(report.rejected, 3, "every burst action is refused by the deadline bound");
+    assert!(
+        report
+            .rejected_codes
+            .iter()
+            .all(|code| code == "CHANNEL_RATE_LIMITED"),
+        "deadline refusals are retryable backpressure, got {:?}",
+        report.rejected_codes
+    );
+    assert_eq!(transport_a.calls().len(), 0, "zero transport effect");
+    assert_eq!(
+        runtime_a
+            .query_row(
+                "SELECT COUNT(*) FROM core_operations WHERE command_id LIKE 'host-ingress-%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("operations"),
+        host_ingress_ops_a,
+        "Core input state is untouched by the bounded pass"
+    );
+
+    // ---- Leg B: transport unavailability + status-first (isolated) ------
+    let (mut runtime_b, authority_b, grant_b) = route_harness(
+        "web-channel",
+        "org.dolly.channel",
+        "g4-backpressure-transport",
+        &["host.ingress.submit"],
+        &[TARGET_PAGE],
+    );
+    let mut store_b = channel_store_connection();
+    let clock_b = channel_clock();
+    {
+        let mut receiver = open_channel_inbound_route(
+            &mut runtime_b,
+            &mut store_b,
+            config.clone(),
+            Box::new(clock_b.clone()),
+            &authority_b,
+            &grant_b,
+        )
+        .expect("channel route registration");
+        let event = authenticated_channel_event(
+            &authority_b,
+            &grant_b,
+            config.revision,
+            route_content_event("conv-1", "in-1", "later"),
+        )
+        .expect("sealed event");
+        assert!(matches!(receiver.ingest_event(&event), IngressOutcome::Committed { .. }));
+    }
+    let host_ingress_ops_b = runtime_b
+        .query_row(
+            "SELECT COUNT(*) FROM core_operations WHERE command_id LIKE 'host-ingress-%'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("baseline");
+    let principal_b = dolly_channel::ChannelPrincipal::from_authority_grant(&authority_b, &grant_b)
+        .expect("principal");
+    let session_b = dolly_channel::ids::dolly_session_id(principal_b.account(), "conv-1");
+    let second_id = "0198ab31-6c44-7e8a-b2bb-000000000731";
+    let second = route_send_block("web-channel", &[second_id], &session_b, &["later"]);
+    commit_send_and_activate(
+        &mut runtime_b,
+        &authority_b,
+        &grant_b,
+        "g4-backpressure-unknown",
+        ROUTE_INPUT_PAGE,
+        second,
+        config.clone(),
+    );
+    let route_b = ChannelOutboundRoute::register(
+        config.clone(),
+        &mut store_b,
+        &authority_b,
+        &grant_b,
+    )
+    .expect("outbound route registration");
+
+    // With a live caller deadline and an unavailable transport, the committed
+    // send is dispatched durably (never a fabricated success), stays
+    // unresolved, and Core inputs are untouched.
+    let silent = RouteSharedTransport::new(true);
+    let pass = route_b
+        .consume_once(
+            &mut store_b,
+            &mut runtime_b,
+            Box::new(clock_b.clone()),
+            Box::new(silent.clone()),
+            &far_deadline_str(),
+        )
+        .expect("transport-unavailable pass");
+    assert_eq!(silent.calls().len(), 1, "one dispatch attempted, none re-sent");
+    assert_eq!(
+        runtime_b
+            .query_row(
+                "SELECT COUNT(*) FROM core_operations WHERE command_id LIKE 'host-ingress-%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("operation count"),
+        host_ingress_ops_b,
+        "transport unavailability never mutates Core input state"
+    );
+
+    // Status-first settle: the transport now reports the exact confirmed
+    // status; reconcile rests the row with no re-send and Core stays intact.
+    let reporting = RouteSharedTransport::new(true);
+    reporting.push_status(
+        second_id,
+        dolly_channel::transport::TransportStatusResult::Confirmed {
+            message_ids: vec!["transport-status-1".to_string()],
+        },
+    );
+    let settle = route_b
+        .consume_once(
+            &mut store_b,
+            &mut runtime_b,
+            Box::new(clock_b.clone()),
+            Box::new(reporting.clone()),
+            &far_deadline_str(),
+        )
+        .expect("status-first consumer pass");
+    assert_eq!(settle.remaining, 0, "status-first reconcile rests the row");
+    assert_eq!(reporting.status_calls().len(), 1, "one status query");
+    assert_eq!(reporting.calls().len(), 0, "zero re-dispatch after dispatch");
+    assert_eq!(
+        runtime_b
+            .query_row(
+                "SELECT COUNT(*) FROM core_operations WHERE command_id LIKE 'host-ingress-%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("operation count"),
+        host_ingress_ops_b,
+        "Core input state untouched throughout"
     );
 }
 

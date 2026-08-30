@@ -262,9 +262,29 @@ CREATE TABLE channel_echo (
     echo_key TEXT PRIMARY KEY NOT NULL,
     record_digest TEXT NOT NULL,
     canonical_jcs BLOB NOT NULL
+);
+CREATE TABLE channel_outbound (
+    outbound_key TEXT PRIMARY KEY NOT NULL,
+    record_digest TEXT NOT NULL,
+    canonical_jcs BLOB NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('prepared','queued','dispatched','confirmed','partial','failed','unknown')),
+    session_id TEXT NOT NULL,
+    queued_seq INTEGER
+);
+CREATE TABLE channel_outbound_admission (
+    ticket INTEGER PRIMARY KEY AUTOINCREMENT,
+    outbound_key TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL,
+    deadline_micros INTEGER NOT NULL,
+    piece_count INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('waiting','cancelled','expired','granted'))
+);
+CREATE TABLE channel_outbound_rate (
+    session_id TEXT PRIMARY KEY NOT NULL,
+    tokens INTEGER NOT NULL,
+    last_refill_micros INTEGER NOT NULL
 )
 "#;
-
 /// Install the module-scoped Channel store schema on a fresh connection.
 /// Idempotent per the `CREATE TABLE` semantics; a later
 /// [`SqliteChannelStore`] open gate-verifies the exact schema.
@@ -362,4 +382,232 @@ pub fn reconcile_channel_inbound_route<'connection, 'principal>(
         code: error.code,
         message: error.message,
     })
+}
+
+// ---------------------------------------------------------------------------
+// D — committed targeted-Action outbound route (seam D): one identity-bound
+// OutboundQueueGate + per-session limiter owned by the registration and
+// injected into the sealed OutboundConsumer, with a bounded status-first
+// consumer/recovery loop over an injected status-capable transport.
+// ---------------------------------------------------------------------------
+
+use dolly_channel::outbound_consumer::{ConsumerOutcome, OutboundConsumer};
+use dolly_channel::outbound_queue::OutboundQueueGate;
+use dolly_channel::transport::ChannelTransport;
+
+/// The result of one bounded runtime consumer/recovery pass.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChannelOutboundRunReport {
+    /// The number of Actions admitted and dispatched to the transport.
+    pub transported: usize,
+    /// Deterministic rejections (authority, conflict, validation, rate or
+    /// queue backpressure) with no transport effect and no leaked slot.
+    pub rejected: usize,
+    /// The rejection error codes observed this pass.
+    pub rejected_codes: Vec<String>,
+    /// Outcomes still awaiting a terminal transport observation.
+    pub pending: usize,
+    /// The number of Actions left unresolved (pending/unknown) after
+    /// status-first reconcile; zero means the pass drained cleanly.
+    pub remaining: usize,
+    /// Terminal outcomes produced this pass (frozen ActionResult envelopes).
+    pub terminal: Vec<ConsumerOutcome>,
+}
+
+fn channel_error(code: String, message: String) -> HostRouteError {
+    HostRouteError::Rejected { code, message }
+}
+
+/// The registered outbound route for one activated `org.dolly.channel` module.
+///
+/// Registration owns EXACTLY ONE identity-bound [`OutboundQueueGate`] plus its
+/// per-session limiters for the store/account/config identity
+/// (`OutboundQueueGate::register` returns the same live `Arc` for repeated
+/// registration of the same identity, so no consumer-created gate ever
+/// exists). Every consumer opened by this route receives that gate, the
+/// injected status-capable transport, and the sealed current Host authority
+/// and grant; the runtime consumer/recovery loop is bounded and fail-closed —
+/// it selects committed targeted Actions from the journal-verified Core
+/// snapshot only, never from caller blocks, never retained upstream premises,
+/// and never blind-resends.
+pub struct ChannelOutboundRoute<'principal> {
+    config: ChannelConfig,
+    gate: std::sync::Arc<OutboundQueueGate>,
+    authority: &'principal HostConnectionAuthority,
+    grant: &'principal HostCapabilityGrant,
+}
+
+impl<'principal> ChannelOutboundRoute<'principal> {
+    /// Register (or reuse) the one identity-bound outbound gate for the
+    /// Channel store/account/config identity under the sealed current
+    /// authority and grant. The module-scoped store connection must already
+    /// carry the synchronized `dolly.channel-store/v1` schema.
+    pub fn register(
+        config: ChannelConfig,
+        module_connection: &mut Connection,
+        authority: &'principal HostConnectionAuthority,
+        grant: &'principal HostCapabilityGrant,
+    ) -> Result<Self, HostRouteError> {
+        require_current(authority, grant)?;
+        if grant.extension_id() != EXTENSION_ID {
+            return Err(capability_denied(
+                "the granted extension is not the built-in Channel extension",
+            ));
+        }
+        let gate = OutboundQueueGate::register(&config, module_connection, authority, grant)
+            .map_err(|error| channel_error(error.code, error.message))?;
+        Ok(Self {
+            config,
+            gate,
+            authority,
+            grant,
+        })
+    }
+
+    /// The single shared gate for this store identity (registered above).
+    pub fn gate(&self) -> std::sync::Arc<OutboundQueueGate> {
+        std::sync::Arc::clone(&self.gate)
+    }
+
+    /// Open the sealed [`OutboundConsumer`] injecting exactly this gate and
+    /// the supplied status-capable transport. The consumer re-verifies the
+    /// gate identity and the fresh current grant on every consume pass.
+    pub fn open<'store, 'core>(
+        &self,
+        module_connection: &'store mut Connection,
+        runtime_connection: &'core mut Connection,
+        clock: Box<dyn Clock>,
+        transport: Box<dyn ChannelTransport>,
+    ) -> Result<OutboundConsumer<'store, 'core, 'principal>, HostRouteError> {
+        OutboundConsumer::new(
+            self.config.clone(),
+            clock,
+            module_connection,
+            runtime_connection,
+            self.gate.clone(),
+            transport,
+            self.authority,
+            self.grant,
+        )
+        .map_err(|error| channel_error(error.code, error.message))
+    }
+
+    /// One bounded consumer pass: admit and dispatch every committed targeted
+    /// Action up to the caller deadline, then settle `Dispatched` rows
+    /// status-first through the transport. Fail-closed on error (no partial
+    /// acknowledgement).
+    pub fn consume_once<'store, 'core>(
+        &self,
+        module_connection: &'store mut Connection,
+        runtime_connection: &'core mut Connection,
+        clock: Box<dyn Clock>,
+        transport: Box<dyn ChannelTransport>,
+        caller_deadline: &str,
+    ) -> Result<ChannelOutboundRunReport, HostRouteError> {
+        let mut consumer = self.open(
+            module_connection,
+            runtime_connection,
+            clock,
+            transport,
+        )?;
+        let outcomes = consumer
+            .consume(caller_deadline)
+            .map_err(|error| channel_error(error.code, error.message))?;
+        let terminal: Vec<ConsumerOutcome> = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, ConsumerOutcome::Terminal { .. }))
+            .cloned()
+            .collect();
+        let outcomes_other: Vec<ConsumerOutcome> = outcomes
+            .into_iter()
+            .filter(|outcome| !matches!(outcome, ConsumerOutcome::Terminal { .. }))
+            .collect();
+        let transported = terminal.len();
+        let rejected = outcomes_other
+            .iter()
+            .filter(|outcome| matches!(outcome, ConsumerOutcome::Rejected { .. }))
+            .count();
+        let rejected_codes: Vec<String> = outcomes_other
+            .iter()
+            .filter_map(|outcome| match outcome {
+                ConsumerOutcome::Rejected { error, .. } => Some(error.code.clone()),
+                _ => None,
+            })
+            .collect();
+        let pending = outcomes_other
+            .iter()
+            .filter(|outcome| matches!(outcome, ConsumerOutcome::Pending { .. }))
+            .count();
+        let remaining = consumer
+            .reconcile()
+            .map_err(|error| channel_error(error.code, error.message))?;
+        Ok(ChannelOutboundRunReport {
+            transported,
+            rejected,
+            rejected_codes,
+            pending,
+            remaining,
+            terminal,
+        })
+    }
+
+    /// The bounded runtime consumer/recovery loop: drain until no committed
+    /// targeted Action remains or `max_passes` is reached (a caller deadline
+    /// bounds each pass, so a stuck transport cannot hold the loop forever),
+    /// then a final status-first reconcile. Every durable decision is the
+    /// accepted store's; errors abort the loop fail-closed.
+    pub fn run_loop<'store, 'core>(
+        &self,
+        module_connection: &'store mut Connection,
+        runtime_connection: &'core mut Connection,
+        clock: Box<dyn Clock>,
+        transport: Box<dyn ChannelTransport>,
+        caller_deadline: &str,
+        max_passes: usize,
+    ) -> Result<ChannelOutboundRunReport, HostRouteError> {
+        let mut consumer = self.open(
+            module_connection,
+            runtime_connection,
+            clock,
+            transport,
+        )?;
+        let mut transported = 0usize;
+        let mut rejected = 0usize;
+        let mut pending = 0usize;
+        let mut rejected_codes = Vec::new();
+        let mut remaining = 0usize;
+        let mut terminal = Vec::new();
+        for _ in 0..max_passes {
+            let outcomes = consumer
+                .consume(caller_deadline)
+                .map_err(|error| channel_error(error.code, error.message))?;
+            if outcomes.is_empty() {
+                break;
+            }
+            for outcome in outcomes {
+                match outcome {
+                    ConsumerOutcome::Terminal { .. } => {
+                        transported += 1;
+                        terminal.push(outcome);
+                    }
+                    ConsumerOutcome::Rejected { error, .. } => {
+                        rejected += 1;
+                        rejected_codes.push(error.code.clone());
+                    }
+                    ConsumerOutcome::Pending { .. } => pending += 1,
+                }
+            }
+        }
+        remaining = consumer
+            .reconcile()
+            .map_err(|error| channel_error(error.code, error.message))?;
+        Ok(ChannelOutboundRunReport {
+            transported,
+            rejected,
+            rejected_codes,
+            pending,
+            remaining,
+            terminal,
+        })
+    }
 }

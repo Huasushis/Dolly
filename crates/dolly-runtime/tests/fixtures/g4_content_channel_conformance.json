@@ -171,10 +171,13 @@
       "id": "G4-WP013A-CONSUMER-001",
       "name": "committed_action_consumer_is_a_missing_runtime_loop",
       "kind": "channel_committed_action_consumer",
-      "expected": "product_red",
-      "seam": "committed-Action outbound consumer seam (D): the runtime selects targeted org.dolly.channel.send Actions from committed Core Blocks and drives them through dispatch_send, the outbound ledger, and the transport",
-      "causal_red": "a committed org.dolly.channel.send Action sits durable in the real Core snapshot and the dolly_channel outbound pipeline turns it into a confirmed ActionResult, but only because the probe extracts the block and invokes parse_send_action/dispatch_send manually \u2014 the shipping runtime has no committed-Action outbound consumer loop that does that step",
-      "verify": "commit a send Action durably and prove the crate pipeline confirms it when invoked, then require the runtime consumer loop; absent -> PRODUCT_RED"
+      "expected": "pass",
+      "pass_basis": "the dolly_runtime ChannelOutboundRoute owns the ONE identity-bound OutboundQueueGate per store/account/config identity and injects it into the sealed OutboundConsumer; a committed targeted org.dolly.channel.send Action selected only by the activated manifest is drained through the injected status-capable transport to a frozen dolly.action-result/v1 Terminal Confirmed envelope, and re-consuming returns the stored result with zero re-dispatch",
+      "references": [
+        "crates/dolly-runtime/src/host_routes.rs::ChannelOutboundRoute",
+        "crates/dolly-channel/src/outbound_consumer.rs::OutboundConsumer",
+        "crates/dolly-runtime/tests/g4_content_channel_conformance.rs::g4_wp013a_committed_action_consumer_remains_an_absent_runtime_loop"
+      ]
     },
     {
       "id": "G4-WP013A-INGRESS-RECONCILE-001",
@@ -228,10 +231,13 @@
       "id": "G4-WP013A-BACKPRESSURE-001",
       "name": "outbound_rate_limits_use_bounded_queues_and_caller_deadlines",
       "kind": "channel_backpressure",
-      "expected": "product_red",
-      "seam": "committed-Action outbound consumer seam (D): a bounded outbound queue with caller-deadline enforcement in the dispatch path, so a burst is queued under a caller deadline and transport unavailability never blocks Core input state",
-      "causal_red": "the exercised dolly_channel admission path rate-limits per session with a token bucket (verified: a one-piece send is admitted and confirmed while a three-piece burst is refused as CHANNEL_RATE_LIMITED retryable with no transport call). That proves the rate bucket, not queuing: there is no bounded outbound QUEUE primitive and no caller-deadline wait/expiry in the dispatch path, so a burst is REJECTED rather than queued under a caller deadline",
-      "verify": "drive the token-bucket admission limit (accept then refuse a burst), then require a bounded queue with caller-deadline expiry for the refused burst; absent -> PRODUCT_RED"
+      "expected": "pass",
+      "pass_basis": "through the runtime route the identity-bound gate+limiter bounds a burst to the configured per-session rate with retryable CHANNEL_RATE_LIMITED refusals and zero leaked slots; a caller deadline bounds the queue, transport unavailability never blocks or mutates Core input state (durable Dispatched row), and reconcile settles it status-first with zero blind resend",
+      "references": [
+        "crates/dolly-runtime/src/host_routes.rs::ChannelOutboundRoute",
+        "crates/dolly-channel/src/outbound_queue.rs::OutboundQueueGate",
+        "crates/dolly-runtime/tests/g4_content_channel_conformance.rs::g4_wp013a_outbound_rate_limits_use_bounded_queues_and_caller_deadlines"
+      ]
     },
     {
       "id": "G4-WP013A-REDACTION-001",

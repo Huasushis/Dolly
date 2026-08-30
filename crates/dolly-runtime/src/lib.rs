@@ -22,8 +22,8 @@ use thiserror::Error;
 
 pub use dolly_storage::HostConnectionAuthority;
 pub use host_routes::{
-    AssetHostRoute, HostRouteError, authenticated_channel_event,
-    install_channel_store_schema, open_channel_inbound_route,
+    AssetHostRoute, ChannelOutboundRoute, ChannelOutboundRunReport, HostRouteError,
+    authenticated_channel_event, install_channel_store_schema, open_channel_inbound_route,
     reconcile_channel_inbound_route,
 };
 pub use premise::{
