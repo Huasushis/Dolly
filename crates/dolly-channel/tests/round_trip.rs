@@ -45,12 +45,14 @@ fn text_round_trip_has_exact_positive_evidence() {
     let block = send_block(action_id, &session_id, &["It will be sunny."]);
     let action = parse_send_action(&block).expect("block carries the send action");
     let mut admission = OutboundAdmission::new();
+    let mut assets = dolly_channel::asset::DenyAssetParts;
     let outbound = dispatch_send(
         &config,
         &clock,
         &mut ledger,
         &mut transport,
         &mut admission,
+        &mut assets,
         &action,
     );
 

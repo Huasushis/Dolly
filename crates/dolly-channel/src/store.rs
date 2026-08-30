@@ -3539,6 +3539,7 @@ mod tests {
                 pieces: vec![OutboundPiece {
                     ordinal: 0,
                     text: text.to_string(),
+                    asset: None,
                     transport_message_id: None,
                     outcome: None,
                 }],

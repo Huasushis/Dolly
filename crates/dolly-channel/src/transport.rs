@@ -11,11 +11,16 @@
 //! receives the exact transport-side outcome (confirmed/partial/unknown),
 //! never a blind resend or an age-to-unknown guess.
 
-/// One outbound piece handed to the transport.
+/// One outbound piece handed to the transport: text, or a prepared asset
+/// (frozen premise plus the opaque short-lease proof minted by the injected
+/// Asset authority). The transport seam resolves asset bytes through that
+/// proof; the Channel never reads asset bytes and never re-encodes parts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportPiece {
     pub ordinal: u32,
     pub text: String,
+    /// The prepared asset (asset pieces only). Absent for v1 text pieces.
+    pub asset: Option<crate::asset::PreparedAsset>,
 }
 
 /// The transport-facing send request.

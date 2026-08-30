@@ -193,11 +193,17 @@ impl PieceOutcome {
 }
 
 /// One piece of an outbound send: its ordinal, text payload (used only for
-/// dispatch), the resulting transport message ID, and its outcome.
+/// dispatch, empty for asset pieces), the prepared asset premise and lease
+/// proof (asset pieces only), the resulting transport message ID, and its
+/// outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboundPiece {
     pub ordinal: u32,
     pub text: String,
+    /// The prepared asset premise and short-lease proof (asset pieces only;
+    /// absent for v1 text pieces so the durable wire shape is unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset: Option<crate::asset::PreparedAsset>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

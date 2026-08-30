@@ -18,6 +18,7 @@
 //! are suppressed by the inbound ledger).
 
 pub mod clock;
+pub mod asset;
 
 pub mod config;
 pub mod error;

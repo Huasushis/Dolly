@@ -14,7 +14,8 @@ fn dispatch(config: &dolly_channel::ChannelConfig, ledger: &mut ChannelLedger, t
     let clock = clock();
     let action = parse_send_action(block).expect("block carries a channel send");
     let mut admission = OutboundAdmission::new();
-    dispatch_send(config, &clock, ledger, transport, &mut admission, &action)
+    let mut assets = dolly_channel::asset::DenyAssetParts;
+    dispatch_send(config, &clock, ledger, transport, &mut admission, &mut assets, &action)
 }
 
 #[test]
@@ -403,6 +404,7 @@ fn rate_limit_backpressure_is_deterministic() {
     ledger.insert_session("account-a", "conv-1", "session-main");
     let mut clock = clock();
     let mut admission = OutboundAdmission::new();
+    let mut assets = dolly_channel::asset::DenyAssetParts;
     let action = parse_send_action(&send_block(
         "0198ab31-6c44-7e8a-b2bb-000000000102",
         "session-main",
@@ -422,6 +424,7 @@ fn rate_limit_backpressure_is_deterministic() {
         &mut ledger,
         &mut t1,
         &mut admission,
+        &mut assets,
         &action,
     );
     assert!(matches!(first, SendDispatchResult::Terminal { state: OutboundState::Confirmed, .. }));
@@ -440,6 +443,7 @@ fn rate_limit_backpressure_is_deterministic() {
         &mut ledger,
         &mut t2,
         &mut admission,
+        &mut assets,
         &action2,
     );
     match second {
@@ -465,6 +469,7 @@ fn rate_limit_backpressure_is_deterministic() {
         &mut ledger,
         &mut t3,
         &mut admission,
+        &mut assets,
         &action2,
     );
     assert!(matches!(third, SendDispatchResult::Terminal { state: OutboundState::Confirmed, .. }));

@@ -75,6 +75,12 @@ pub struct OutboundConsumer<'store, 'core, 'principal> {
     /// waiter gate AND the configured per-session rate limiters, so
     /// constructors never create independent gates/buckets.
     gate: std::sync::Arc<OutboundQueueGate>,
+    /// The single injected Asset-authority seam for ordered multimodal
+    /// sends (sole integrator: the Host/Runtime). The default
+    /// [`crate::asset::DenyAssetParts`] keeps the accepted G4 constructor
+    /// text-only and fail-closed; only
+    /// [`OutboundConsumer::with_asset_preparation`] enables asset parts.
+    asset_preparation: Box<dyn crate::asset::AssetPreparation>,
     /// Test-support barrier invoked immediately before each post-blocking
     /// authority check.
     #[cfg(feature = "test-support")]
@@ -107,6 +113,66 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
         runtime_connection: &'core mut rusqlite::Connection,
         gate: std::sync::Arc<OutboundQueueGate>,
         transport: Box<dyn crate::transport::ChannelTransport>,
+        authority: &'principal HostConnectionAuthority,
+        grant: &'principal HostCapabilityGrant,
+    ) -> Result<Self, ChannelError> {
+        Self::create(
+            config,
+            clock,
+            module_connection,
+            runtime_connection,
+            gate,
+            transport,
+            Box::new(crate::asset::DenyAssetParts),
+            authority,
+            grant,
+        )
+    }
+
+    /// Open the module store, accepting only a gate created by
+    /// [`OutboundQueueGate::register`] for the exact same store owner,
+    /// account, config revision, and limits, and inject the sole
+    /// Asset-authority seam for ordered multimodal sends. The default
+    /// [`OutboundConsumer::new`] constructor remains the accepted v1
+    /// text-only G4 path and stays fail-closed on asset parts; this explicit
+    /// constructor is the single production injection seam for the sole
+    /// runtime integrator. It is not a second dispatcher and exposes no
+    /// public caller-shaped raw dispatch surface.
+    pub fn with_asset_preparation(
+        config: ChannelConfig,
+        clock: Box<dyn Clock>,
+        module_connection: &'store mut rusqlite::Connection,
+        runtime_connection: &'core mut rusqlite::Connection,
+        gate: std::sync::Arc<OutboundQueueGate>,
+        transport: Box<dyn crate::transport::ChannelTransport>,
+        asset_preparation: Box<dyn crate::asset::AssetPreparation>,
+        authority: &'principal HostConnectionAuthority,
+        grant: &'principal HostCapabilityGrant,
+    ) -> Result<Self, ChannelError> {
+        Self::create(
+            config,
+            clock,
+            module_connection,
+            runtime_connection,
+            gate,
+            transport,
+            asset_preparation,
+            authority,
+            grant,
+        )
+    }
+
+    /// Open the module store and wire the injected seam; shared by the
+    /// accepted text-only and the explicit multimodal constructors. No
+    /// consumer constructor creates admission, rate, or Asset state.
+    fn create(
+        config: ChannelConfig,
+        clock: Box<dyn Clock>,
+        module_connection: &'store mut rusqlite::Connection,
+        runtime_connection: &'core mut rusqlite::Connection,
+        gate: std::sync::Arc<OutboundQueueGate>,
+        transport: Box<dyn crate::transport::ChannelTransport>,
+        asset_preparation: Box<dyn crate::asset::AssetPreparation>,
         authority: &'principal HostConnectionAuthority,
         grant: &'principal HostCapabilityGrant,
     ) -> Result<Self, ChannelError> {
@@ -159,6 +225,7 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
             core,
             transport,
             gate,
+            asset_preparation,
             #[cfg(feature = "test-support")]
             effect_hook: None,
             authority,
@@ -168,7 +235,8 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
     }
 
     /// Test-support only: build over a pre-opened store so failpoints can be
-    /// injected while enforcing store/principal equality.
+    /// injected while enforcing store/principal equality; the injected
+    /// Asset-authority seam is explicit here as well.
     #[cfg(feature = "test-support")]
     pub fn new_with_store(
         config: ChannelConfig,
@@ -177,6 +245,7 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
         runtime_connection: &'core mut rusqlite::Connection,
         gate: std::sync::Arc<OutboundQueueGate>,
         transport: Box<dyn crate::transport::ChannelTransport>,
+        asset_preparation: Box<dyn crate::asset::AssetPreparation>,
         authority: &'principal HostConnectionAuthority,
         grant: &'principal HostCapabilityGrant,
     ) -> Result<Self, ChannelError> {
@@ -229,6 +298,7 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
             core,
             transport,
             gate,
+            asset_preparation,
             #[cfg(feature = "test-support")]
             effect_hook: None,
             authority,
@@ -515,6 +585,23 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
         }
         Ok(())
     }
+    /// Re-validate, after queue/blocking work, that every asset lease behind
+    /// the committed Action's prepared pieces is still live. An invalidated,
+    /// stale, or revoked lease fails closed before the transport is reached.
+    fn revalidate_asset_leases(
+        &mut self,
+        committed: &CommittedSendAction,
+    ) -> Result<(), ChannelError> {
+        let proofs: Vec<crate::asset::AssetLeaseProof> = committed
+            .pieces
+            .iter()
+            .filter_map(|piece| piece.asset.as_ref().map(|asset| asset.lease_proof.clone()))
+            .collect();
+        if !proofs.is_empty() {
+            self.asset_preparation.revalidate_leases(&proofs)?;
+        }
+        Ok(())
+    }
 
     fn revalidate_durable_record(
         &mut self,
@@ -778,6 +865,7 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                     &self.principal,
                     &self.config,
                     &ledger,
+                    &mut *self.asset_preparation,
                 ) {
                     actions.push(action);
                 }
@@ -953,9 +1041,12 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 }));
             }
         }
-        // Fresh execution authority after the queue wait.
+        // Fresh execution authority after the queue wait, then re-validate
+        // every prepared asset lease: lease invalidation after queue/blocking
+        // work fails closed with no transport effect.
         self.effect_ts("after_queue_wait");
         self.revalidate_committed_action(committed)?;
+        self.revalidate_asset_leases(committed)?;
         if crate::clock::timestamp_total_micros(self.clock.now().as_str())
             >= crate::clock::timestamp_total_micros(caller_deadline)
         {
@@ -992,6 +1083,9 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 // claim and immediately before the transport send.
                 self.effect_ts("after_dispatch_cas");
                 self.revalidate_committed_action(committed)?;
+                // The dispatch compare-and-swap is blocking; re-validate every
+                // prepared asset lease immediately before the transport send.
+                self.revalidate_asset_leases(committed)?;
                 // This caller won the CAS: drive the transport + settle.
                 if ledger.outbound_entry(&committed.action.action_id).is_none() {
                     let entry = build_prepared_entry(

@@ -261,9 +261,9 @@ fn validate_arguments(arguments: &CanonicalJsonValue) -> Result<(), ChannelError
 }
 
 /// The validated parts of one authorized channel send: the account-owned
-/// session and the v1 text pieces. Produced ONLY by [`authorize_send`] from a
-/// committed targeted Action; no caller-shaped authority or payload reaches
-/// this type.
+/// session and the ordered text pieces plus prepared asset pieces.
+/// Produced ONLY by [`authorize_send`] from a committed targeted Action; no
+/// caller-shaped authority or payload reaches this type.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AuthorizedSend {
     pub session_id: String,
@@ -272,13 +272,16 @@ pub(crate) struct AuthorizedSend {
 
 /// Shared authority verification for `org.dolly.channel.send`: owner name,
 /// targeted module, frozen result contract, frozen arguments schema, an
-/// account-owned session, and the v1 text-only pieces. Used by
-/// [`dispatch_send`] and the committed targeted-Action verification boundary;
-/// no durable effect and no transport call happens before this succeeds.
+/// account-owned session, and the ordered parts. Asset parts are parsed from
+/// the committed Action only and require the injected [`AssetPreparation`]
+/// seam to mint a short-lease proof before any durable effect or transport
+/// call happens. Used by [`dispatch_send`] and the committed targeted-Action
+/// verification boundary.
 pub(crate) fn authorize_send(
     config: &ChannelConfig,
     ledger: &ChannelLedger,
     action: &SendAction,
+    assets: &mut dyn crate::asset::AssetPreparation,
 ) -> Result<AuthorizedSend, ChannelError> {
     // 1. Owner and target authority.
     if action.name != crate::config::SEND_ACTION_NAME {
@@ -358,6 +361,7 @@ pub(crate) fn authorize_send(
         }
     };
     let mut pieces: Vec<OutboundPiece> = Vec::with_capacity(parts.len());
+        let mut premises: Vec<crate::asset::AssetPremise> = Vec::new();
     for (ordinal, part) in parts.iter().enumerate() {
         let part_obj = match part {
             CanonicalJsonValue::Object(obj) => obj,
@@ -401,20 +405,31 @@ pub(crate) fn authorize_send(
                 pieces.push(OutboundPiece {
                     ordinal: ordinal as u32,
                     text,
+                    asset: None,
                     transport_message_id: None,
                     outcome: None,
                 });
             }
             "asset" => {
-                // WP-013B seam: Asset parts are not deliverable in v1. They are
-                // rejected with a distinct code before any transport call; text
-                // parts alone remain supported.
-                return Err(ChannelError::new(
-                    codes::UNSUPPORTED_MODALITY,
-                    false,
-                    ChannelOutcome::NotApplied,
-                    "asset parts require the WP-013B channel multimodal profile",
-                ));
+                // WP-013B: ordered multimodal premise. Only this committed
+                // targeted-Action path may build an asset premise; the frozen
+                // schema already validated a canonical `asset_id`/`media_type`
+                // and the crop range, and this boundary additionally enforces
+                // the canonical forms and the crop invariants (`x0 < x1`,
+                // `y0 < y1`) the JSON Schema cannot express. The premise is
+                // prepared (lease-proofed) below by the injected seam before
+                // any durable prepared row or transport effect.
+                premises.push(crate::asset::parse_asset_premise(
+                    ordinal as u32,
+                    part,
+                )?);
+                pieces.push(OutboundPiece {
+                    ordinal: ordinal as u32,
+                    text: String::new(),
+                    asset: None,
+                    transport_message_id: None,
+                    outcome: None,
+                });
             }
             other => {
                 return Err(ChannelError::new(
@@ -431,8 +446,34 @@ pub(crate) fn authorize_send(
             codes::MALFORMED_EVENT,
             false,
             ChannelOutcome::NotApplied,
-            "send must contain at least one text part",
+            "send must contain at least one part",
         ));
+    }
+    // Asset preparation: one short-lease proof per premise, in Action part
+    // order, minted by the injected seam BEFORE any durable or transport
+    // effect. A refusal or a proof-count mismatch fails the whole send; the
+    // lease proofs are persisted with the durable record and handed to the
+    // transport seam.
+    if !premises.is_empty() {
+        let proofs = assets.prepare_assets(&premises)?;
+        if proofs.len() != premises.len() {
+            return Err(ChannelError::new(
+                codes::INTERNAL,
+                false,
+                ChannelOutcome::NotApplied,
+                "asset preparation returned a mismatched proof count",
+            ));
+        }
+        for (premise, proof) in premises.into_iter().zip(proofs) {
+            let piece = pieces
+                .iter_mut()
+                .find(|piece| piece.ordinal == premise.ordinal)
+                .expect("an asset premise always has a matching piece");
+            piece.asset = Some(crate::asset::PreparedAsset {
+                premise,
+                lease_proof: proof,
+            });
+        }
     }
     Ok(AuthorizedSend { session_id, pieces })
 }
@@ -449,12 +490,14 @@ pub fn dispatch_send(
     ledger: &mut ChannelLedger,
     transport: &mut dyn ChannelTransport,
     admission: &mut OutboundAdmission,
+    assets: &mut dyn crate::asset::AssetPreparation,
     action: &SendAction,
 ) -> SendDispatchResult {
-    // 1-2. Committed targeted-Action authority and text-only v1 pieces,
-    // shared with the verification boundary. Nothing durable and no
-    // transport call happens before this succeeds.
-    let authorized = match authorize_send(config, ledger, action) {
+    // 1-2. Committed targeted-Action authority and the ordered parts,
+    // shared with the verification boundary. Asset parts are prepared by
+    // the injected seam here; nothing durable and no transport call happens
+    // before this succeeds.
+    let authorized = match authorize_send(config, ledger, action, assets) {
         Ok(authorized) => authorized,
         Err(error) => return SendDispatchResult::Rejected(error),
     };
@@ -613,6 +656,7 @@ pub(crate) fn transport_and_settle(
                     .map(|p| TransportPiece {
                         ordinal: p.ordinal,
                         text: p.text.clone(),
+                        asset: p.asset.clone(),
                     })
                     .collect()
             })

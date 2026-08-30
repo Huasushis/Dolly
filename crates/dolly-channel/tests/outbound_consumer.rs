@@ -953,6 +953,7 @@ fn pre_admission_durability_failure_yields_zero_effect() {
             &mut fixture.harness.connection,
             gate,
             Box::new(transport.clone()),
+            Box::new(dolly_channel::asset::DenyAssetParts),
             &fixture.harness.authority,
             &fixture.harness.grant,
         )
@@ -1160,6 +1161,7 @@ fn crash_after_prepared_before_dispatch_redispatch_and_never_duplicates() {
             &mut fixture.harness.connection,
             gate,
             Box::new(transport.clone()),
+            Box::new(dolly_channel::asset::DenyAssetParts),
             &fixture.harness.authority,
             &fixture.harness.grant,
         )
@@ -1227,6 +1229,7 @@ fn crash_after_dispatch_marker_never_blind_resends_and_reconciles_status_first()
             &mut fixture.harness.connection,
             gate,
             Box::new(transport.clone()),
+            Box::new(dolly_channel::asset::DenyAssetParts),
             &fixture.harness.authority,
             &fixture.harness.grant,
         )
