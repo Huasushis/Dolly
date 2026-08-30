@@ -10,8 +10,9 @@
 //! crash recovery, the content-addressed local store, media sniffing and
 //! image metadata bounds, leases/pins/durable references, the
 //! mark/tombstone/sweep GC protocol, security-domain isolation, the
-//! replica/remote capability contracts, and the Asset Host import/status
-//! façade (`facade`). Channel and multimodal delivery are out of scope here.
+//! replica/remote capability contracts, the Asset Host import/status
+//! façade (`facade`), and the WP-013B media preparation seam (`prepare`).
+//! Channel and multimodal delivery are out of scope here.
 
 pub mod clock;
 pub mod config;
@@ -22,6 +23,7 @@ pub mod gc;
 pub mod identity;
 pub mod media;
 pub mod pipeline;
+pub mod prepare;
 pub mod record;
 pub mod remote;
 pub mod replica;
@@ -40,6 +42,7 @@ pub use error::{
 pub use facade::{AssetHostFacade, AssetStatusRequest};
 pub use identity::{AssetId, AssetRef, ContentHash, MediaType};
 pub use pipeline::{ImportPipeline, RecoveryReport};
+pub use prepare::{MediaPrepareRequest, PreparedMedia, PrepareFailpoint};
 pub use record::{
     AssetLease, AssetPin, AssetRecord, AssetReference, ImportRecord, ImportRequest, ImportState,
     Lifecycle, LocalState, MediaKind, ReplicaState, Source, StatusResult,
