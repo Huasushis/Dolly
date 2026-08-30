@@ -2618,6 +2618,66 @@ fn wp013b_stale_assetref_refused_at_effect_time() {
     let scratch = ScratchDir::new("stale-ref");
     let (mut runtime, mut module_store, authority, grant, config, clock, session_id) =
         consumer_scaffold_multimodal("wp013b-stale", scratch.path());
+
+    // 1. Through the SAME registered Asset route (root/authority/grant the
+    //    Channel route owns): import a real durable AVAILABLE asset and
+    //    obtain its canonical full AssetRef.
+    let png = png_bytes(4, 2);
+    let stale_asset_id = route_owned_import(
+        &mut runtime,
+        &authority,
+        &grant,
+        scratch.path(),
+        &import_id(401),
+        &png,
+        "image/png",
+    );
+    assert!(
+        stale_asset_id.starts_with("ast_b3_"),
+        "the canonical route-owned AssetRef is obtained"
+    );
+
+    // 2. Make THAT exact route-owned reference stale using the authoritative
+    //    Asset lifecycle over the same store/root and the same sealed
+    //    authority facts (domain, instance, module): take a finite lease,
+    //    let it expire, elapse the retention grace, and let the sweep
+    //    tombstone the asset — the canonical ID is retained for the Action.
+    let (mut lifecycle, interface_clock) = asset_service_at(scratch.path());
+    let route_capability = lifecycle.issue_capability(
+        authority.extension_connection_id().to_string(),
+        asset_route_instance(&authority),
+        grant.module_id().to_string(),
+    );
+    let lease = lifecycle
+        .lease(
+            &route_capability,
+            &stale_asset_id,
+            asset_route_instance(&authority).as_str(),
+            "route-owned send lease",
+            30_000,
+        )
+        .expect("finite route-owned lease on the AVAILABLE asset");
+    drop(lease);
+    interface_clock.advance(120_000);
+    interface_clock.advance(60_000);
+    let gc = lifecycle.run_gc().expect("authoritative retention sweep");
+    assert_eq!(gc.tombstones_created, 1, "the exact route-owned ref is tombstoned");
+    let not_available = lifecycle
+        .lease(
+            &route_capability,
+            &stale_asset_id,
+            asset_route_instance(&authority).as_str(),
+            "late lease",
+            1000,
+        )
+        .expect_err("the stale route-owned ref refuses a new lease");
+    assert_eq!(not_available.code, AssetErrorCode::NotFound);
+
+    // 3. The committed Action + manifest drive through the with-assets
+    //    Channel route: the stale route-owned AssetRef is prepared-fail-closed
+    //    (lease acquisition on the tombstoned generation fails) and the one
+    //    durable pre-provider-effect Terminal Failed envelope is produced —
+    //    zero transport, no Dispatched marker.
     text_control_pass(
         "wp013b-ctl",
         "0198ab31-6c44-7e8a-b2bb-000000000801",
@@ -2629,16 +2689,11 @@ fn wp013b_stale_assetref_refused_at_effect_time() {
         &config,
         &clock,
     );
-
-    // A canonical AssetRef that is NOT AVAILABLE under the route authority
-    // (never imported in this store/domain, so lease acquisition fails closed
-    // at prepare time).
-    let unavailable_id = AssetId::from_digest([0u8; 32]).as_str().to_string();
     let leg = drive_asset_send_leg(
         "wp013b-stale",
         "0198ab31-6c44-7e8a-b2bb-000000000802",
         &session_id,
-        vec![asset_part(&unavailable_id, "image/png", None)],
+        vec![asset_part(&stale_asset_id, "image/png", None)],
         scratch.path(),
         None,
         &mut runtime,
@@ -2653,9 +2708,9 @@ fn wp013b_stale_assetref_refused_at_effect_time() {
     }
     product_red(
         "WP013B-STALE-REF-EFFECT-001",
-        "effect-time AssetPart authority over the route-owned store/lease (pre-provider-effect terminal envelope)",
+        "effect-time AssetPart authority over the route-owned store/lease (real tombstoned generation -> pre-provider-effect terminal envelope)",
         &format!(
-            "target not met: the unavailable AssetRef {unavailable_id} was not settled as the one durable pre-provider-effect terminal Failed ActionResult — observed rejections {:?}, transported {}, terminal {}, pending {}, remaining {}, transport calls {}; requires result:null, CHANNEL_ASSET_IMPORT_FAILED, retryable false, outcome not_applied, delivery_outcome not_sent, no Dispatched marker, zero transport",
+            "target not met: the stale route-owned AssetRef {stale_asset_id} (real AVAILABLE provenance, advanced through lease expiry + retention grace + GC tombstone) was not settled as the one durable pre-provider-effect terminal Failed ActionResult — observed rejections {:?}, transported {}, terminal {}, pending {}, remaining {}, transport calls {}; requires result:null, CHANNEL_ASSET_IMPORT_FAILED, retryable false, outcome not_applied, delivery_outcome not_sent, no Dispatched marker, zero transport",
             leg.report.rejected_codes,
             leg.report.transported,
             leg.report.terminal.len(),
