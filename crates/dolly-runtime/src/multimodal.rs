@@ -27,10 +27,10 @@
 //! route without a bound Asset store must take; the bound construction is
 //! the single production registration per store/account/config lifecycle.
 
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dolly_asset::config::ResolvedAssetConfig;
-use dolly_asset::facade::{AssetHostFacade, AssetStatusRequest};
 use dolly_asset::prepare::{MediaPrepareRequest, PreparedMedia};
 use dolly_asset::record::{ImportRequest, MediaKind, Source, StatusResult};
 use dolly_asset::service::{AssetCapability, AssetService};
@@ -69,48 +69,109 @@ pub trait ProviderAttachmentReader {
 /// store/account/activation must resolve to the exact same Asset store, so
 /// registration records ONE root per identity and every later binding must
 /// match it or fail closed.
+/// The stable lookup key of one Asset route registration: the sealed
+/// extension/module/connection/account/config lifecycle facts. The full
+/// recorded identity additionally pins the extension generation and the
+/// exact content root, so a mismatch of either fails closed instead of
+/// reusing another registered store.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct AssetRouteIdentity {
+struct AssetRouteKey {
     extension_connection_id: String,
     worker_epoch: String,
+    extension_id: String,
     module_id: String,
     config_revision: i64,
+    principal_account: String,
 }
 
-#[derive(Debug, Clone)]
-struct AssetRouteBinding {
-    root: std::path::PathBuf,
+/// The complete recorded identity of one registration.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AssetRouteFacts {
+    key: AssetRouteKey,
+    extension_generation: i64,
+    root_key: String,
 }
 
-impl AssetRouteBinding {
-    fn root_key(&self) -> String {
-        asset_root_key(&self.root)
+/// The ONE owned Asset store/capability set shared by every outbound and
+/// inbound open of one Asset route identity. The accepted `AssetService` is
+/// not `Send`; the runtime serves a module sequentially (never two adapters
+/// at once), so the exact single service is shared through an
+/// interior-mutable handle and is never duplicated.
+struct SharedAssetStore {
+    service: std::cell::RefCell<AssetService>,
+    capability: AssetCapability,
+}
+
+// SAFETY: the accepted `AssetService` is not marked `Send`, but every access
+// to a `SharedAssetStore` happens under one of two single-threaded
+// invariants: the registry mutex (register/open/unregister/shutdown) or an
+// adapter method that holds the `RefCell` borrow for the duration of one
+// call. The runtime processes a module sequentially and no store is ever
+// borrowed from two threads at once, so marking the holder Send+Sync (with
+// the RefCell still enforcing single-borrow at runtime) is sound.
+unsafe impl Send for SharedAssetStore {}
+unsafe impl Sync for SharedAssetStore {}
+
+/// One bounded, identity-scoped Asset route registration. It owns the exact
+/// Asset service/capability set and is SHARED (Arc, never duplicated) by
+/// every outbound/inbound open for the identity. The registration is removed
+/// only by explicit `unregister` (lifecycle close) or bounded `shutdown`.
+pub(crate) struct AssetRouteRegistration {
+    facts: AssetRouteFacts,
+    store: Arc<SharedAssetStore>,
+}
+
+#[cfg(test)]
+impl SharedAssetStore {
+    /// Extract the owned service/capability for a test that holds the last
+    /// reference to the shared store.
+    fn into_parts(store: Arc<SharedAssetStore>) -> (AssetService, AssetCapability) {
+        let store = Arc::try_unwrap(store)
+            .unwrap_or_else(|_| panic!("sole holder in test"));
+        let service = std::cell::RefCell::into_inner(store.service);
+        (service, store.capability)
     }
 }
 
-/// Process-wide registry of the registered Asset routes. Only grows with
-/// distinct sealed route identities (bounded by the finite set of
-/// activations) and never stores capabilities, paths beyond the content
-/// root, or caller metadata.
-static ASSET_ROUTE_BINDINGS: std::sync::OnceLock<
-    parking_lot::Mutex<std::collections::HashMap<AssetRouteIdentity, AssetRouteBinding>>,
+impl AssetRouteRegistration {
+    /// The single shared store/capability set of this registration.
+    fn store(&self) -> Arc<SharedAssetStore> {
+        Arc::clone(&self.store)
+    }
+
+    /// The exact registered content root key the inbound binding verifies.
+    fn identity_root_key(&self) -> &str {
+        &self.facts.root_key
+    }
+}
+
+/// Process-wide registry of the registered Asset routes, keyed by the stable
+/// lifecycle identity. At most ONE live registration per identity; repeated
+/// registration shares it and never opens another service. Entries are
+/// removed only by explicit `unregister`/`shutdown`, so the map size is
+/// bounded by the finite set of distinct sealed identities and returns to
+/// its baseline after register/open/close/unregister cycles.
+static ASSET_ROUTE_REGISTRY: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<AssetRouteKey, Arc<AssetRouteRegistration>>>,
 > = std::sync::OnceLock::new();
 
-fn asset_route_registry() -> &'static parking_lot::Mutex<std::collections::HashMap<AssetRouteIdentity, AssetRouteBinding>> {
-    ASSET_ROUTE_BINDINGS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+fn asset_route_registry() -> &'static parking_lot::Mutex<std::collections::HashMap<AssetRouteKey, Arc<AssetRouteRegistration>>> {
+    ASSET_ROUTE_REGISTRY
+        .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
-fn asset_route_identity(
+/// The sealed Channel principal of the current authority/grant (the account/
+/// extension/module identity used for registration keys).
+fn route_principal(
     authority: &HostConnectionAuthority,
     grant: &HostCapabilityGrant,
-    config_revision: i64,
-) -> AssetRouteIdentity {
-    AssetRouteIdentity {
-        extension_connection_id: authority.extension_connection_id().to_owned(),
-        worker_epoch: authority.worker_epoch().to_string(),
-        module_id: grant.module_id().to_owned(),
-        config_revision,
-    }
+) -> Result<dolly_channel::ChannelPrincipal, HostRouteError> {
+    dolly_channel::ChannelPrincipal::from_authority_grant(authority, grant).map_err(|error| {
+        HostRouteError::Rejected {
+            code: error.code,
+            message: error.message,
+        }
+    })
 }
 
 /// A canonical absolute form of the content root used for equality (never a
@@ -123,57 +184,147 @@ fn asset_root_key(root: &std::path::Path) -> String {
         .unwrap_or_else(|| root.to_string_lossy().into_owned())
 }
 
-/// Register (or verify) the one Asset route for this sealed store/account/
-/// config identity and its exact content root. Requires the current
-/// `host.asset.import` and `host.asset.status` capability under the same
-/// extension/module authority; a different root for the same identity is a
-/// stale/re-placed registration and fails closed.
+fn asset_route_facts(
+    principal: &dolly_channel::ChannelPrincipal,
+    authority: &HostConnectionAuthority,
+    grant: &HostCapabilityGrant,
+    config_revision: i64,
+    config: &ResolvedAssetConfig,
+) -> Result<AssetRouteFacts, HostRouteError> {
+    let instance_id = format!("i{}", authority.worker_epoch());
+    if instance_id.parse::<dolly_core_domain::InstanceId>().is_err() {
+        return Err(HostRouteError::CapabilityDenied {
+            detail: "sealed worker epoch cannot form a stable instance identifier".into(),
+        });
+    }
+    Ok(AssetRouteFacts {
+        key: AssetRouteKey {
+            extension_connection_id: authority.extension_connection_id().to_owned(),
+            worker_epoch: authority.worker_epoch().to_string(),
+            extension_id: principal.extension_id().to_string(),
+            module_id: principal.module_id().to_string(),
+            config_revision,
+            principal_account: principal.account().to_string(),
+        },
+        extension_generation: grant.extension_generation(),
+        root_key: asset_root_key(&config.local_root),
+    })
+}
+
+/// Register the one Asset route for this sealed store/account/config identity
+/// and open its single Asset service/capability set EXACTLY ONCE. A later
+/// registration with the exact same identity shares the same owned set (never
+/// a second service); a mismatched content root or generation fails closed.
+/// Requires the current `host.asset.import` and `host.asset.status` grants
+/// under the same extension/module authority.
 pub(crate) fn asset_route_register(
     authority: &HostConnectionAuthority,
     grant: &HostCapabilityGrant,
     config_revision: i64,
-    root: &std::path::Path,
-) -> Result<(), HostRouteError> {
+    config: ResolvedAssetConfig,
+) -> Result<Arc<AssetRouteRegistration>, HostRouteError> {
     if !grant.allows("host.asset.import") || !grant.allows("host.asset.status") {
         return Err(HostRouteError::CapabilityDenied {
             detail: "the multimodal Channel route requires host.asset.import and host.asset.status grants under the same authority".into(),
         });
     }
-    let key = asset_route_identity(authority, grant, config_revision);
+    config.validate().map_err(|detail| HostRouteError::CapabilityDenied {
+        detail: format!("asset config invalid: {detail}"),
+    })?;
+    let principal = route_principal(authority, grant)?;
+    let facts = asset_route_facts(&principal, authority, grant, config_revision, &config)?;
     let mut registry = asset_route_registry().lock();
-    if let Some(existing) = registry.get(&key) {
-        if existing.root_key() != asset_root_key(root) {
+    if let Some(existing) = registry.get(&facts.key) {
+        if existing.facts != facts {
             return Err(HostRouteError::CapabilityDenied {
-                detail: "a different Asset content root is already registered for this store/account/config identity".into(),
+                detail: "registration identity mismatch (a different Asset content root or extension generation is already registered for this store/account/config identity)".into(),
             });
         }
-        return Ok(());
+        return Ok(Arc::clone(existing));
     }
-    registry.insert(
-        key,
-        AssetRouteBinding {
-            root: root.to_path_buf(),
-        },
+    let service = AssetService::open(config).map_err(|error| {
+        let envelope = error.to_envelope();
+        HostRouteError::Rejected {
+            code: envelope.code,
+            message: envelope.message,
+        }
+    })?;
+    let capability = service.issue_capability(
+        authority.extension_connection_id().to_owned(),
+        format!("i{}", authority.worker_epoch()),
+        grant.module_id().to_owned(),
     );
-    Ok(())
+    let key = facts.key.clone();
+    let registration = Arc::new(AssetRouteRegistration {
+        facts,
+        store: Arc::new(SharedAssetStore {
+            service: std::cell::RefCell::new(service),
+            capability,
+        }),
+    });
+    registry.insert(key, Arc::clone(&registration));
+    Ok(registration)
 }
 
-/// Resolve the exact registered Asset content root for this sealed identity,
-/// failing closed when no route registered it (the outbound registration owns
-/// the Asset store under the authority direction).
-fn asset_route_registered_root(
+/// Open (reuse) the registered Asset route for this sealed identity without
+/// constructing any new service/capability. Fails closed when no outbound
+/// registration created it yet (the outbound registration owns the store).
+pub(crate) fn asset_route_open(
     authority: &HostConnectionAuthority,
     grant: &HostCapabilityGrant,
     config_revision: i64,
-) -> Result<std::path::PathBuf, HostRouteError> {
-    let key = asset_route_identity(authority, grant, config_revision);
+) -> Result<Arc<AssetRouteRegistration>, HostRouteError> {
+    let principal = route_principal(authority, grant)?;
+    let key = AssetRouteKey {
+        extension_connection_id: authority.extension_connection_id().to_owned(),
+        worker_epoch: authority.worker_epoch().to_string(),
+        extension_id: principal.extension_id().to_string(),
+        module_id: principal.module_id().to_string(),
+        config_revision,
+        principal_account: principal.account().to_string(),
+    };
     let registry = asset_route_registry().lock();
     registry
         .get(&key)
-        .map(|binding| binding.root.clone())
+        .cloned()
         .ok_or_else(|| HostRouteError::CapabilityDenied {
             detail: "no Asset route is registered for this store/account/config identity; register the outbound Asset route first".into(),
         })
+}
+
+/// Explicit unregister/close of one Asset route (route/activation lifecycle
+/// end). Removes the registration so new opens fail closed; live route and
+/// adapter handles keep the owned set alive until they drop (in-use
+/// unregister is safe and never tears a live adapter). Returns whether an
+/// entry was present.
+pub(crate) fn asset_route_unregister(
+    authority: &HostConnectionAuthority,
+    grant: &HostCapabilityGrant,
+    config_revision: i64,
+) -> Result<bool, HostRouteError> {
+    let principal = route_principal(authority, grant)?;
+    let key = AssetRouteKey {
+        extension_connection_id: authority.extension_connection_id().to_owned(),
+        worker_epoch: authority.worker_epoch().to_string(),
+        extension_id: principal.extension_id().to_string(),
+        module_id: principal.module_id().to_string(),
+        config_revision,
+        principal_account: principal.account().to_string(),
+    };
+    let mut registry = asset_route_registry().lock();
+    Ok(registry.remove(&key).is_some())
+}
+
+/// Bounded shutdown: releases every registered Asset route (services,
+/// capabilities, and the adapters that reference them) deterministically.
+pub(crate) fn asset_route_shutdown() {
+    asset_route_registry().lock().clear();
+}
+
+/// Test/diagnostic: the current number of registered Asset routes.
+#[cfg(test)]
+fn asset_route_registry_len() -> usize {
+    asset_route_registry().lock().len()
 }
 
 /// The finite short Asset lease the outbound adapter holds per prepared
@@ -280,8 +431,9 @@ fn wire_deadline_after(seconds: u64) -> String {
 /// (fail closed on every asset part); bound by the route with the module's
 /// resolved Asset configuration and the sealed authority/grant facts.
 pub struct ChannelAssetSeam {
-    service: Option<AssetService>,
-    capability: Option<AssetCapability>,
+    /// The ONE shared Asset store/capability set owned by the route's
+    /// registration; `None` is the fail-closed unbound seam.
+    store: Option<Arc<SharedAssetStore>>,
 }
 
 impl ChannelAssetSeam {
@@ -289,46 +441,16 @@ impl ChannelAssetSeam {
     /// committed asset part is refused with the Channel asset code before
     /// any durable prepared row or transport effect.
     pub fn unbound() -> Self {
-        Self {
-            service: None,
-            capability: None,
-        }
+        Self { store: None }
     }
 
-    /// Bind the module's Asset store and capability. `domain`, `instance`,
-    /// and `module` come only from the sealed authority/grant facts (the
-    /// exact `AssetHostRoute` derivation), so no caller can choose or mint a
-    /// capability and a stale Host lifecycle is refused by the service.
-    pub fn bind(
-        config: ResolvedAssetConfig,
-        authority: &HostConnectionAuthority,
-        grant: &HostCapabilityGrant,
-    ) -> Result<Self, HostRouteError> {
-        config.validate().map_err(|detail| HostRouteError::CapabilityDenied {
-            detail: format!("asset config invalid: {detail}"),
-        })?;
-        let service = AssetService::open(config).map_err(|error| {
-            let envelope = error.to_envelope();
-            HostRouteError::Rejected {
-                code: envelope.code,
-                message: envelope.message,
-            }
-        })?;
-        let instance_id = format!("i{}", authority.worker_epoch());
-        if instance_id.parse::<dolly_core_domain::InstanceId>().is_err() {
-            return Err(HostRouteError::CapabilityDenied {
-                detail: "sealed worker epoch cannot form a stable instance identifier".into(),
-            });
+    /// Construct the outbound seam from the route's single owned
+    /// registration: shares the exact registered Asset service/capability
+    /// and never opens another service for the identity.
+    pub(crate) fn from_registration(registration: &Arc<AssetRouteRegistration>) -> Self {
+        Self {
+            store: Some(registration.store()),
         }
-        let capability = service.issue_capability(
-            authority.extension_connection_id().to_owned(),
-            instance_id,
-            grant.module_id().to_owned(),
-        );
-        Ok(Self {
-            service: Some(service),
-            capability: Some(capability),
-        })
     }
 
     /// Test-support: bind a pre-opened service and capability directly, so
@@ -340,14 +462,16 @@ impl ChannelAssetSeam {
         _owner: &str,
     ) -> Self {
         Self {
-            service: Some(service),
-            capability: Some(capability),
+            store: Some(Arc::new(SharedAssetStore {
+                service: std::cell::RefCell::new(service),
+                capability,
+            })),
         }
     }
 
     #[cfg(test)]
-    fn take_service(&mut self) -> AssetService {
-        self.service.take().expect("service bound")
+    fn take_store(&mut self) -> Arc<SharedAssetStore> {
+        self.store.take().expect("store bound")
     }
 }
 
@@ -356,13 +480,14 @@ impl AssetPreparation for ChannelAssetSeam {
         &mut self,
         premises: &[AssetPremise],
     ) -> Result<Vec<AssetPayload>, ChannelError> {
-        let Some((service, capability)) = self.service.as_mut().zip(self.capability.as_ref())
-        else {
+        let Some(store) = self.store.as_ref() else {
             if let Some(first) = premises.first() {
                 return Err(asset_refused(first.ordinal, "NO_ASSET_STORE"));
             }
             return Ok(Vec::new());
         };
+        let mut service = store.service.borrow_mut();
+        let capability = &store.capability;
         let mut payloads = Vec::with_capacity(premises.len());
         for premise in premises {
             let asset_id = premise.asset_id.as_str().to_string();
@@ -408,23 +533,33 @@ fn error_code(error: &dolly_asset::error::AssetError) -> String {
 }
 
 /// Field-for-field mirror of the accepted Asset `PreparedMedia` into the
-/// closed Channel `AssetPayload`. Every reference field is the value the
-/// Asset service minted from the durable row; no caller metadata is echoed
-/// and no absent geometry is fabricated.
+/// closed Channel `AssetPayload`. The ephemeral byte buffer is MOVED into the
+/// payload (never copied), and every reference field is the value the Asset
+/// service minted from the durable row; no caller metadata is echoed and no
+/// absent geometry is fabricated.
 fn convert_prepared_media(ordinal: u32, prepared: PreparedMedia) -> Result<AssetPayload, ChannelError> {
+    let PreparedMedia {
+        asset_ref,
+        media_kind,
+        generation,
+        digest,
+        lease_id,
+        lease_expires_at_ms,
+        bytes,
+    } = prepared;
     let asset_ref = ChannelAssetRef {
-        asset_id: ChannelAssetId::parse(prepared.asset_ref.asset_id.as_str()).map_err(|_| {
+        asset_id: ChannelAssetId::parse(asset_ref.asset_id.as_str()).map_err(|_| {
             asset_refused(ordinal, "NONCANONICAL_ASSET_ID")
         })?,
-        media_type: ChannelMediaType::parse(prepared.asset_ref.media_type.as_str()).map_err(|_| {
+        media_type: ChannelMediaType::parse(asset_ref.media_type.as_str()).map_err(|_| {
             asset_refused(ordinal, "INVALID_MEDIA_TYPE")
         })?,
-        byte_length: prepared.asset_ref.byte_length,
-        orientation: prepared.asset_ref.orientation,
-        encoded_width: prepared.asset_ref.encoded_width,
-        encoded_height: prepared.asset_ref.encoded_height,
-        display_width: prepared.asset_ref.display_width,
-        display_height: prepared.asset_ref.display_height,
+        byte_length: asset_ref.byte_length,
+        orientation: asset_ref.orientation,
+        encoded_width: asset_ref.encoded_width,
+        encoded_height: asset_ref.encoded_height,
+        display_width: asset_ref.display_width,
+        display_height: asset_ref.display_height,
     };
     asset_ref.validate().map_err(|message| {
         ChannelError::new(
@@ -436,12 +571,13 @@ fn convert_prepared_media(ordinal: u32, prepared: PreparedMedia) -> Result<Asset
     })?;
     Ok(AssetPayload {
         asset_ref,
-        media_kind: channel_kind_of_type(prepared.media_kind),
-        generation: prepared.generation,
-        digest: ChannelContentHash::from_digest(prepared.digest.digest),
-        lease_id: prepared.lease_id.clone(),
-        lease_expiry_unix_ms: prepared.lease_expires_at_ms,
-        bytes: prepared.bytes.clone(),
+        media_kind: channel_kind_of_type(media_kind),
+        generation,
+        digest: ChannelContentHash::from_digest(digest.digest),
+        lease_id,
+        lease_expiry_unix_ms: lease_expires_at_ms,
+        // The bounded immutable bytes are moved, never cloned.
+        bytes,
     })
 }
 
@@ -454,8 +590,9 @@ fn convert_prepared_media(ordinal: u32, prepared: PreparedMedia) -> Result<Asset
 /// route with the module's resolved Asset configuration, the sealed
 /// authority/grant facts, and the authenticated Channel account.
 pub struct ChannelAttachmentImport {
-    facade: Option<AssetHostFacade>,
-    capability: Option<AssetCapability>,
+    /// The ONE shared Asset store/capability set owned by the route's
+    /// registration (never a second service for the identity).
+    store: Option<Arc<SharedAssetStore>>,
     /// The sealed Channel principal account this seam serves. Every
     /// attachment request key must be scoped to exactly this account;
     /// anything else is refused before any Asset call.
@@ -471,20 +608,21 @@ impl ChannelAttachmentImport {
     /// transport effect.
     pub fn unbound() -> Self {
         Self {
-            facade: None,
-            capability: None,
+            store: None,
             account: String::new(),
             provider: None,
         }
     }
 
-    /// Bind the module's Asset facade, capability, and the sealed principal
+    /// Bind the module's registered Asset store and the sealed principal
     /// account, with the required bounded provider reader. Fails closed when
     /// the grant does not authorize `host.asset.import`/`host.asset.status`
     /// under the same extension/module authority, when the caller account is
-    /// not the sealed Channel principal account, when the Asset content root
-    /// is not the one registered for this store/account/config identity, or
-    /// when the supplied reader is missing.
+    /// not the sealed Channel principal account, when no registered Asset
+    /// route exists for this identity (register the outbound route first),
+    /// when the Asset content root differs from the registered one, or when
+    /// the supplied reader is missing. Binding never opens a new service:
+    /// the inbound seam shares the outbound registration's owned set.
     pub fn bind(
         config: ResolvedAssetConfig,
         config_revision: i64,
@@ -493,9 +631,6 @@ impl ChannelAttachmentImport {
         account: &str,
         provider: Box<dyn ProviderAttachmentReader>,
     ) -> Result<Self, HostRouteError> {
-        config.validate().map_err(|detail| HostRouteError::CapabilityDenied {
-            detail: format!("asset config invalid: {detail}"),
-        })?;
         if !grant.allows("host.asset.import") || !grant.allows("host.asset.status") {
             return Err(HostRouteError::CapabilityDenied {
                 detail: "the grant does not authorize host.asset.import/host.asset.status".into(),
@@ -503,47 +638,23 @@ impl ChannelAttachmentImport {
         }
         // The account is a sealed fact of the current authority/grant, never
         // an unchecked caller choice.
-        let principal = dolly_channel::ChannelPrincipal::from_authority_grant(authority, grant)
-            .map_err(|error| HostRouteError::Rejected {
-                code: error.code,
-                message: error.message,
-            })?;
+        let principal = route_principal(authority, grant)?;
         if principal.account() != account {
             return Err(HostRouteError::CapabilityDenied {
                 detail: "caller account does not match the sealed Channel principal account".into(),
             });
         }
-        // The exact same Asset store the outbound route registered for this
+        // The exact shared Asset store the outbound route registered for this
         // identity must serve the inbound imports (one adapter set per
-        // store/account/config lifecycle).
-        let registered =
-            asset_route_registered_root(authority, grant, config_revision)?;
-        if asset_root_key(&config.local_root) != asset_root_key(&registered) {
+        // store/account/config lifecycle; never a second service).
+        let registration = asset_route_open(authority, grant, config_revision)?;
+        if registration.identity_root_key() != asset_root_key(&config.local_root) {
             return Err(HostRouteError::CapabilityDenied {
                 detail: "inbound Asset content root does not match the registered outbound Asset root for this identity".into(),
             });
         }
-        let facade = AssetHostFacade::open(config).map_err(|error| {
-            let envelope = error.to_envelope();
-            HostRouteError::Rejected {
-                code: envelope.code,
-                message: envelope.message,
-            }
-        })?;
-        let instance_id = format!("i{}", authority.worker_epoch());
-        if instance_id.parse::<dolly_core_domain::InstanceId>().is_err() {
-            return Err(HostRouteError::CapabilityDenied {
-                detail: "sealed worker epoch cannot form a stable instance identifier".into(),
-            });
-        }
-        let capability = facade.issue_capability(
-            authority.extension_connection_id().to_owned(),
-            instance_id,
-            grant.module_id().to_owned(),
-        );
         Ok(Self {
-            facade: Some(facade),
-            capability: Some(capability),
+            store: Some(registration.store()),
             account: account.to_string(),
             provider: Some(provider),
         })
@@ -567,20 +678,22 @@ impl ChannelAttachmentImport {
         Ok(())
     }
 
-    /// Test-support: bind a pre-opened facade and capability directly, so the
-    /// adapter's import/status path can be proven without Host scaffolding.
-    /// The provider is required here as well: the multimodal seam never runs
-    /// without a bounded provider reader.
+    /// Test-support: bind a pre-opened service and capability directly, so
+    /// the adapter's import/status path can be proven without Host
+    /// scaffolding. The provider is required here as well: the multimodal
+    /// seam never runs without a bounded provider reader.
     #[cfg(test)]
     pub(crate) fn for_test(
-        facade: AssetHostFacade,
+        service: AssetService,
         capability: AssetCapability,
         account: &str,
         provider: Box<dyn ProviderAttachmentReader>,
     ) -> Self {
         Self {
-            facade: Some(facade),
-            capability: Some(capability),
+            store: Some(Arc::new(SharedAssetStore {
+                service: std::cell::RefCell::new(service),
+                capability,
+            })),
             account: account.to_string(),
             provider: Some(provider),
         }
@@ -620,13 +733,14 @@ impl ChannelAttachmentImport {
     ) -> Result<AttachmentImportStatus, ChannelError> {
         self.check_attachment_ownership(request)?;
         let import_id = self.import_id_for(request);
-        let Some((facade, capability)) = self.facade.as_mut().zip(self.capability.as_ref())
-        else {
+        let Some(store) = self.store.as_ref() else {
             return Err(attachment_refused(
                 &request.provider_key,
                 "no Asset store/capability is bound to the Channel inbound route",
             ));
         };
+        let mut service = store.service.borrow_mut();
+        let capability = &store.capability;
         let Some(reader) = self.provider.as_mut() else {
             return Err(attachment_refused(
                 &request.provider_key,
@@ -670,12 +784,15 @@ impl ChannelAttachmentImport {
             expected_byte_length: Some(bytes.len() as u64),
             deadline: wire_deadline_after(120),
         };
-        match facade.import(capability, &import_request) {
+        match service.import(capability, &import_request) {
             Ok(status) => Ok(map_import_status(status)),
-            Err(envelope) => Err(attachment_refused(
-                &request.provider_key,
-                &format!("asset import refused (code {})", envelope.code),
-            )),
+            Err(error) => {
+                let code = error.to_envelope().code;
+                Err(attachment_refused(
+                    &request.provider_key,
+                    &format!("asset import refused (code {code})"),
+                ))
+            }
         }
     }
 
@@ -685,28 +802,26 @@ impl ChannelAttachmentImport {
     ) -> Result<AttachmentImportStatus, ChannelError> {
         self.check_attachment_ownership(request)?;
         let import_id = self.import_id_for(request);
-        let Some((facade, capability)) = self.facade.as_mut().zip(self.capability.as_ref())
-        else {
+        let Some(store) = self.store.as_ref() else {
             return Err(attachment_refused(
                 &request.provider_key,
                 "no Asset store/capability is bound to the Channel inbound route",
             ));
         };
-        let status_request = AssetStatusRequest::new(
-            import_id.clone(),
-            capability.module_id().to_string(),
-            import_id,
-            wire_deadline_after(120),
-        )
-        .map_err(|message| {
-            attachment_refused(&request.provider_key, &format!("invalid status request: {message}"))
-        })?;
-        match facade.status(capability, &status_request) {
+        let mut service = store.service.borrow_mut();
+        let capability = &store.capability;
+        // Authoritative exact-key status through the shared Asset service:
+        // `Absent` is emitted only when no durable ImportRecord/effect exists
+        // for exactly this key under the bound account/domain.
+        match service.status(capability, &import_id) {
             Ok(status) => Ok(map_import_status(status)),
-            Err(envelope) => Err(attachment_refused(
-                &request.provider_key,
-                &format!("asset status refused (code {})", envelope.code),
-            )),
+            Err(error) => {
+                let code = error.to_envelope().code;
+                Err(attachment_refused(
+                    &request.provider_key,
+                    &format!("asset status refused (code {code})"),
+                ))
+            }
         }
     }
 }
@@ -946,7 +1061,7 @@ mod tests {
 
         // A foreign-domain capability cannot prepare the identical AVAILABLE
         // asset: the lease/authority is domain-bound.
-        let service = seam.take_service();
+        let (service, _cap) = SharedAssetStore::into_parts(seam.take_store());
         let foreign = service.issue_capability("other-domain", "instance-a", "module-a");
         let mut foreign_seam =
             ChannelAssetSeam::for_test(service, foreign, "test-owner");
@@ -982,10 +1097,10 @@ mod tests {
     fn inbound_seam_imports_available_and_reports_absent_for_unknown_keys() {
         let dir = tempfile::tempdir().expect("tempdir");
         let png = png_bytes(4, 2);
-        let facade = AssetHostFacade::open(config_at(dir.path())).expect("facade");
-        let capability = facade.issue_capability("domain-a", "instance-a", "module-a");
+        let service = AssetService::open(config_at(dir.path())).expect("service");
+        let capability = service.issue_capability("domain-a", "instance-a", "module-a");
         let mut seam = ChannelAttachmentImport::for_test(
-            facade,
+            service,
             capability.clone(),
             "account-a",
             Box::new(FakeProvider::serving(png.clone())),
@@ -1025,10 +1140,10 @@ mod tests {
     fn inbound_seam_refuses_foreign_account_and_missing_provider_before_import() {
         let dir = tempfile::tempdir().expect("tempdir");
         let png = png_bytes(4, 2);
-        let facade = AssetHostFacade::open(config_at(dir.path())).expect("facade");
-        let capability = facade.issue_capability("domain-a", "instance-a", "module-a");
+        let service = AssetService::open(config_at(dir.path())).expect("service");
+        let capability = service.issue_capability("domain-a", "instance-a", "module-a");
         let mut seam = ChannelAttachmentImport::for_test(
-            facade,
+            service,
             capability.clone(),
             "account-a",
             Box::new(FakeProvider::serving(png.clone())),
@@ -1057,7 +1172,7 @@ mod tests {
         // A provider that cannot serve the authenticated key fails closed
         // before any Asset record, with zero duplicate effect.
         let mut on_missing = ChannelAttachmentImport::for_test(
-            AssetHostFacade::open(config_at(dir.path())).expect("facade"),
+            AssetService::open(config_at(dir.path())).expect("service"),
             capability.clone(),
             "account-a",
             Box::new(FakeProvider::default()),
@@ -1096,5 +1211,304 @@ mod tests {
         assert_eq!(err.outcome, ChannelOutcome::NotApplied);
         let err = seam.status(&request).expect_err("unbound refuses status");
         assert_eq!(err.code, codes::ASSET_IMPORT_FAILED);
+    }
+
+    // -------------------------------------------------------------------
+    // Registration ownership: shared, bounded, unregister/close, shutdown.
+    // -------------------------------------------------------------------
+
+    use dolly_core_reducer::TransitionOutcome;
+
+    fn grid_config(now: &str) -> dolly_core_reducer::EnvironmentInput {
+        dolly_core_reducer::EnvironmentInput {
+            now: now.into(),
+            ..Default::default()
+        }
+    }
+
+    fn life_descriptor(module_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "schema": "dolly.module-descriptor/v1",
+            "module_id": module_id,
+            "descriptor_revision": 1,
+            "display_name": module_id,
+            "accepts": {"summary":"input","part_kinds":["text","asset"],"action_names":[]},
+            "emits": {"summary":"output","part_kinds":["text","asset"],"action_names":["org.dolly.channel.send"]},
+            "actions": [{"name":"org.dolly.channel.send","summary":"send"}],
+            "activation_replay_contract": {"mode":"fenced_replay","evidence":"pure_compute","ledger":null},
+            "trust": "trusted",
+            "metadata": {}
+        })
+    }
+
+    fn life_graph(module_id: &str) -> serde_json::Value {
+        let descriptor = life_descriptor(module_id);
+        let (_, digest) =
+            dolly_canonical_json::canonicalize(&descriptor).expect("descriptor canonical");
+        let mut descriptors = serde_json::Map::new();
+        descriptors.insert(
+            module_id.into(),
+            serde_json::json!({
+                "module_id": module_id,
+                "descriptor_revision": 1,
+                "source_descriptor_digest": digest.to_canonical_string(),
+                "owner_extension_id": "org.dolly.channel",
+                "value": descriptor
+            }),
+        );
+        serde_json::json!({
+            "receiving_module": module_id,
+            "input_pages": {module_id: ["page-in"]},
+            "output_pages": {module_id: ["page-web-primary"]},
+            "subscriptions": {},
+            "descriptors": descriptors,
+            "authorized_metadata_namespaces": ["org.dolly.channel"],
+            "authorized_action_names": ["org.dolly.channel.send"]
+        })
+    }
+
+    /// A sealed authority/grant carrying the exact asset host methods —
+    /// the minimal durable state `asset_route_register` binds to.
+    fn life_authority_grant(
+        mark: &str,
+    ) -> (
+        rusqlite::Connection,
+        dolly_storage::HostConnectionAuthority,
+        dolly_storage::HostCapabilityGrant,
+    ) {
+        use dolly_core_reducer::{CoreCommand, InstallConfigCommand, InstallGraphCommand};
+        let now = "2026-08-28T00:00:00.000000Z";
+        let mut runtime = rusqlite::Connection::open_in_memory().unwrap();
+        let authority = {
+            let mut store =
+                dolly_storage::SqliteCoreStore::new(&mut runtime).expect("core schema");
+            let config = serde_json::json!({
+                "execution_timeout_ms": 120000,
+                "lease_grace_ms": 30000,
+                "fencing_grace_ms": 5000,
+                "extension_connection_id": format!("{mark}-connection"),
+                "worker_epoch": "0198ab31-6c44-7e8a-b2bb-000000000110",
+                "worker_epoch_fence": 17
+            });
+            let (_, cdigest) =
+                dolly_canonical_json::canonicalize(&config).expect("config canonical");
+            let transition = store
+                .transact(
+                    &CoreCommand::InstallConfig(InstallConfigCommand {
+                        command_id: format!("{mark}-config"),
+                        revision: 1,
+                        digest: cdigest.to_canonical_string(),
+                        effective_config: config,
+                    }),
+                    &grid_config(now),
+                )
+                .expect("config install");
+            assert_eq!(transition.outcome, TransitionOutcome::Committed);
+            store.bootstrap_host_connection().expect("host connection bootstrap");
+            let graph = life_graph("web-channel");
+            let (_, gdigest) = dolly_canonical_json::canonicalize(&graph).expect("graph canonical");
+            let transition = store
+                .transact(
+                    &CoreCommand::InstallGraph(InstallGraphCommand {
+                        command_id: format!("{mark}-graph"),
+                        revision: 1,
+                        digest: gdigest.to_canonical_string(),
+                        graph,
+                    }),
+                    &grid_config(now),
+                )
+                .expect("graph install");
+            assert_eq!(transition.outcome, TransitionOutcome::Committed);
+            let authority = store.authenticated_host_connection().expect("authority");
+            let descriptor = life_descriptor("web-channel");
+            let (_, ddigest) =
+                dolly_canonical_json::canonicalize(&descriptor).expect("descriptor canonical");
+            store
+                .install_host_capability_grant(
+                    &authority,
+                    "org.dolly.channel",
+                    "web-channel",
+                    1,
+                    1,
+                    &ddigest.to_canonical_string(),
+                    1,
+                    &cdigest.to_canonical_string(),
+                    1,
+                    &gdigest.to_canonical_string(),
+                    &["host.asset.import", "host.asset.status"],
+                )
+                .expect("grant");
+            authority
+        };
+        let grant = {
+            let store =
+                dolly_storage::SqliteCoreStore::new(&mut runtime).expect("core schema");
+            store
+                .current_host_capability_grant(
+                    &authority,
+                    "org.dolly.channel",
+                    "web-channel",
+                )
+                .expect("current grant read")
+                .expect("grant present")
+        };
+        (runtime, authority, grant)
+    }
+
+    fn life_config(root: &std::path::Path) -> ResolvedAssetConfig {
+        let mut config = ResolvedAssetConfig::with_local_root(root.to_path_buf());
+        config.max_decoded_bytes = 64 * 1024;
+        config.max_inline_base64_chars = 128 * 1024;
+        config.max_image_pixels = 1_000_000;
+        config
+    }
+
+    #[test]
+    fn asset_route_registration_is_shared_bounded_and_lifecycle_closed() {
+        let baseline = asset_route_registry_len();
+        let (_db, authority, grant) = life_authority_grant("acc-life");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let other_dir = tempfile::tempdir().expect("other tempdir");
+        let config = life_config(dir.path());
+
+        // Registering opens the single Asset service/capability set ONCE;
+        // a second registration shares the exact same owned set.
+        let first = super::asset_route_register(&authority, &grant, 1, config.clone())
+            .expect("first registration");
+        let second = super::asset_route_register(&authority, &grant, 1, config.clone())
+            .expect("second registration");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "re-registration shares the exact owned set, never a second service"
+        );
+        assert_eq!(asset_route_registry_len(), baseline + 1, "one entry per identity");
+        // Opens reuse the same owned set.
+        let opened = super::asset_route_open(&authority, &grant, 1).expect("open shares");
+        assert!(std::sync::Arc::ptr_eq(&first, &opened), "open never constructs a new service");
+
+        // A mismatched content root for the same identity fails closed and
+        // cannot reuse the registered store.
+        let mismatched =
+            super::asset_route_register(&authority, &grant, 1, life_config(other_dir.path()));
+        match mismatched {
+            Err(HostRouteError::CapabilityDenied { .. }) => {}
+            _ => panic!("expected CapabilityDenied for a mismatched root, got an unexpected success"),
+        }
+        assert_eq!(asset_route_registry_len(), baseline + 1, "no duplicate on mismatch");
+
+        // Repeated register/open/close (unregister) cycles return the
+        // registry to its baseline: bounded growth.
+        for cycle in 0..5 {
+            let registered =
+                super::asset_route_register(&authority, &grant, 1, config.clone())
+                    .expect("cycle register");
+            let _unused = super::asset_route_open(&authority, &grant, 1).expect("cycle open");
+            assert_eq!(
+                asset_route_registry_len(),
+                baseline + 1,
+                "cycle {cycle} holds exactly one live registration"
+            );
+            let removed = super::asset_route_unregister(&authority, &grant, 1).expect("cycle close");
+            assert!(removed, "cycle {cycle} unregister removes the entry");
+            drop(registered);
+            assert_eq!(
+                asset_route_registry_len(),
+                baseline,
+                "cycle {cycle} returns the registry to its baseline"
+            );
+        }
+
+        // In-use unregister is safe and fail-closed for new opens: the
+        // registration is withdrawn while a live handle keeps working.
+        let held = super::asset_route_register(&authority, &grant, 1, config.clone())
+            .expect("re-register");
+        let removed = super::asset_route_unregister(&authority, &grant, 1).expect("withdraw while in use");
+        assert!(removed);
+        match super::asset_route_open(&authority, &grant, 1) {
+            Err(HostRouteError::CapabilityDenied { .. }) => {}
+            _ => panic!("withdrawn registration must fail new opens, got an unexpected success"),
+        }
+        // The held handle's shared store is still alive and usable.
+        let mut seam = ChannelAssetSeam::from_registration(&held);
+        let refused = seam.prepare_assets(&[AssetPremise {
+            ordinal: 0,
+            asset_id: ChannelAssetId::parse(&("ast_b3_".to_string() + &"a".repeat(52)))
+                .expect("canonical id"),
+            media_type: ChannelMediaType::parse("image/png").expect("type"),
+            view: None,
+        }]);
+        let err = refused.expect_err("the withdrawn handle still answers through the owned set");
+        assert_eq!(err.code, codes::ASSET_IMPORT_FAILED);
+        drop(seam);
+        drop(held);
+
+        // Stale/mismatched identity can never reuse: registering under the
+        // wrong revision has no entry and fails closed.
+        match super::asset_route_open(&authority, &grant, 99) {
+            Err(HostRouteError::CapabilityDenied { .. }) => {}
+            _ => panic!("a stale/mismatched identity must fail closed, got an unexpected success"),
+        }
+
+        // Bounded shutdown releases every registration.
+        let _last = super::asset_route_register(&authority, &grant, 1, config).expect("final register");
+        super::asset_route_shutdown();
+        assert_eq!(
+            asset_route_registry_len(),
+            0,
+            "shutdown releases every registered adapter set"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Ownership/copy: the prepared byte buffer is MOVED, never cloned.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn convert_prepared_media_moves_the_owned_byte_buffer() {
+        // A large bounded payload: the same allocation must be moved into the
+        // Channel AssetPayload (a clone would allocate a second buffer with a
+        // different address).
+        let large = vec![0xABu8; 48 * 1024];
+        let asset_ref_parts = {
+            let asset_id = dolly_asset::identity::AssetId::from_digest([0u8; 32]);
+            dolly_asset::identity::AssetRef {
+                asset_id,
+                media_type: dolly_asset::identity::MediaType::parse("image/png").expect("type"),
+                byte_length: large.len() as u64,
+                orientation: None,
+                encoded_width: None,
+                encoded_height: None,
+                display_width: None,
+                display_height: None,
+            }
+        };
+        asset_ref_parts.validate().expect("canonical ref");
+        let prepared = PreparedMedia {
+            asset_ref: asset_ref_parts,
+            media_kind: MediaKind::Image,
+            generation: 7,
+            digest: dolly_asset::identity::ContentHash {
+                algorithm: "blake3-256",
+                digest: [0u8; 32],
+            },
+            lease_id: "lease-moved".to_string(),
+            lease_expires_at_ms: 1_800_000_000_000 + 30_000,
+            bytes: large,
+        };
+        let original_ptr = prepared.bytes.as_ptr();
+        let payload = convert_prepared_media(0, prepared).expect("conversion consumes by value");
+        assert_eq!(payload.bytes.len(), 48 * 1024, "exact large bounded payload");
+        assert_eq!(payload.bytes[0], 0xAB, "exact byte content");
+        assert_eq!(
+            payload.bytes.as_ptr(),
+            original_ptr,
+            "the owned byte buffer is moved into the Channel payload, never cloned"
+        );
+        // Every typed field survives the move losslessly.
+        assert_eq!(payload.generation, 7);
+        assert_eq!(payload.lease_id, "lease-moved");
+        assert_eq!(payload.media_kind, ChannelMediaKind::Image);
+        assert_eq!(payload.asset_ref.byte_length, 48 * 1024);
+        assert_eq!(payload.asset_ref.media_type.as_str(), "image/png");
     }
 }

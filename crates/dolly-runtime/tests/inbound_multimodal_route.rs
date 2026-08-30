@@ -564,6 +564,65 @@ fn restart_reconcile_reuses_the_bound_adapter_set_status_first() {
 }
 
 // ---------------------------------------------------------------------------
+// Lifecycle: explicit unregister withdraws the shared Asset registration so
+// new opens fail closed while nothing else is disturbed.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unregister_withdraws_the_route_registration_for_new_opens() {
+    let scratch = Scratch::new("withdraw");
+    let methods = &["host.ingress.submit", "host.asset.import", "host.asset.status"];
+    let (mut runtime, mut module_store, authority, grant, config) = harness("route-with", methods);
+    let asset_config = asset_config_at(scratch.path());
+    register_outbound_assets(&mut module_store, &authority, &grant, &config, asset_config.clone());
+
+    // While registered, inbound bound opens share the registration.
+    let mut receiver = open_channel_inbound_route_with_assets(
+        &mut runtime,
+        &mut module_store,
+        config.clone(),
+        Box::new(dolly_channel::VirtualClock::at(CHANNEL_NOW.parse().unwrap())),
+        asset_config.clone(),
+        Box::new(FakeProvider::serving(png_bytes())),
+        &authority,
+        &grant,
+    )
+    .expect("bound route opens while registered");
+    drop(receiver);
+
+    // Explicit lifecycle close withdraws the registration for this identity.
+    let route = ChannelOutboundRoute::register_with_assets(
+        config.clone(),
+        &mut module_store,
+        &authority,
+        &grant,
+        asset_config.clone(),
+    )
+    .expect("route registration");
+    let removed = route.unregister().expect("lifecycle close returns");
+    assert!(removed, "the registered Asset route was withdrawn");
+    // Re-unregister is idempotent (nothing left to remove).
+    let second_time = route.unregister().expect("second close is idempotent");
+    assert!(!second_time, "a second close has nothing to remove");
+
+    // New inbound opens fail closed after the withdrawal.
+    let inbound = open_channel_inbound_route_with_assets(
+        &mut runtime,
+        &mut module_store,
+        config.clone(),
+        Box::new(dolly_channel::VirtualClock::at(CHANNEL_NOW.parse().unwrap())),
+        asset_config,
+        Box::new(FakeProvider::serving(png_bytes())),
+        &authority,
+        &grant,
+    );
+    match inbound {
+        Err(HostRouteError::CapabilityDenied { .. }) => {}
+        other => panic!("withdrawn registration must fail new opens, got an unexpected success"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // No cross-extension or asset-root leakage in any fail-closed surface.
 // ---------------------------------------------------------------------------
 

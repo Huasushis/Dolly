@@ -600,6 +600,14 @@ fn classify_outcome(outcome: &ConsumerOutcome) -> (bool, Option<String>, bool) {
     }
 }
 
+/// Bounded process/daemon shutdown for every registered Asset route: each
+/// registration's single Asset service/capability set is released
+/// deterministically (in-flight route and adapter handles complete normally;
+/// their stores are dropped when the last handle releases).
+pub fn shutdown_asset_routes() {
+    crate::multimodal::asset_route_shutdown();
+}
+
 fn channel_error(code: String, message: String) -> HostRouteError {
     HostRouteError::Rejected { code, message }
 }
@@ -619,10 +627,11 @@ fn channel_error(code: String, message: String) -> HostRouteError {
 pub struct ChannelOutboundRoute<'principal> {
     config: ChannelConfig,
     gate: std::sync::Arc<OutboundQueueGate>,
-    /// The module's resolved Asset configuration when the runtime owns an
-    /// Asset store for this route (production); `None` keeps the route's
-    /// outbound Asset seam fail-closed on every asset part.
-    asset_config: Option<ResolvedAssetConfig>,
+    /// The route's single owned Asset registration when multimodal
+    /// (production): it owns the exact Asset service/capability set shared
+    /// by every outbound/inbound open; `None` keeps the route's outbound
+    /// Asset seam fail-closed on every asset part.
+    registration: Option<std::sync::Arc<crate::multimodal::AssetRouteRegistration>>,
     authority: &'principal HostConnectionAuthority,
     grant: &'principal HostCapabilityGrant,
 }
@@ -649,7 +658,7 @@ impl<'principal> ChannelOutboundRoute<'principal> {
         Ok(Self {
             config,
             gate,
-            asset_config: None,
+            registration: None,
             authority,
             grant,
         })
@@ -669,21 +678,27 @@ impl<'principal> ChannelOutboundRoute<'principal> {
     ) -> Result<Self, HostRouteError> {
         let revision = config.revision;
         let mut route = Self::register(config, module_connection, authority, grant)?;
-        asset_config.validate().map_err(|detail| {
-            capability_denied(format!("asset config invalid: {detail}"))
-        })?;
-        // Own the one Asset route for this store/account/config identity
+        // Own the one Asset route for this store/account/config identity:
+        // opens the single Asset service/capability set exactly once
         // (requires the exact current host.asset grants under the same
-        // authority and records the single registered content root shared
-        // with the inbound route).
-        crate::multimodal::asset_route_register(
-            authority,
-            grant,
-            revision,
-            &asset_config.local_root,
-        )?;
-        route.asset_config = Some(asset_config);
+        // authority) and records the shared content root. Later registrations
+        // and every inbound open reuse the exact same owned set.
+        let registration =
+            crate::multimodal::asset_route_register(authority, grant, revision, asset_config)?;
+        route.registration = Some(registration);
         Ok(route)
+    }
+
+    /// Explicit lifecycle close for this route's owned Asset registration:
+    /// withholds the registration so new outbound/inbound opens fail closed
+    /// while any still-live route or adapter handle keeps the owned service
+    /// set alive safely. Returns whether the registration was present.
+    pub fn unregister(&self) -> Result<bool, HostRouteError> {
+        crate::multimodal::asset_route_unregister(
+            self.authority,
+            self.grant,
+            self.config.revision,
+        )
     }
 
     /// The single shared gate for this store identity (registered above).
@@ -701,8 +716,8 @@ impl<'principal> ChannelOutboundRoute<'principal> {
         clock: Box<dyn Clock>,
         transport: Box<dyn ChannelTransport>,
     ) -> Result<OutboundConsumer<'store, 'core, 'principal>, HostRouteError> {
-        let assets = match &self.asset_config {
-            Some(config) => ChannelAssetSeam::bind(config.clone(), self.authority, self.grant)?,
+        let assets = match &self.registration {
+            Some(registration) => ChannelAssetSeam::from_registration(registration),
             None => ChannelAssetSeam::unbound(),
         };
         OutboundConsumer::with_asset_preparation(
@@ -804,7 +819,7 @@ impl<'principal> ChannelOutboundRoute<'principal> {
         let mut rejected = 0usize;
         let mut pending = 0usize;
         let mut rejected_codes = Vec::new();
-        let mut remaining;
+        let remaining;
         let mut terminal = Vec::new();
         // Per-effect idempotency across the drain: a terminal or refused
         // action is counted at most once even when a later pass re-observes

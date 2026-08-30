@@ -26,7 +26,7 @@ pub use host_routes::{
     AssetHostRoute, ChannelOutboundRoute, ChannelOutboundRunReport, HostRouteError,
     authenticated_channel_event, install_channel_store_schema, open_channel_inbound_route,
     open_channel_inbound_route_with_assets, reconcile_channel_inbound_route,
-    reconcile_channel_inbound_route_with_assets,
+    reconcile_channel_inbound_route_with_assets, shutdown_asset_routes,
 };
 pub use multimodal::ProviderAttachmentReader;
 pub use premise::{
