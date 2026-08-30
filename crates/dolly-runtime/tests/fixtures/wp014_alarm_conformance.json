@@ -1,0 +1,711 @@
+{
+  "schema": "dolly.wp014-alarm-conformance/v1",
+  "spec_basis": [
+    "REQ-ALARM-001",
+    "dolly-spec/docs/spec/extensions/alarm.md::1 responsibility and clock",
+    "dolly-spec/docs/spec/extensions/alarm.md::2 configuration and record",
+    "dolly-spec/docs/spec/extensions/alarm.md::3 schedule kinds",
+    "dolly-spec/docs/spec/extensions/alarm.md::4 occurrence identity and competing schedulers",
+    "dolly-spec/docs/spec/extensions/alarm.md::5 misfire semantics",
+    "dolly-spec/docs/spec/extensions/alarm.md::6 inputs outputs and actions",
+    "dolly-spec/docs/spec/extensions/alarm.md::7 snooze acknowledgement and repeat races",
+    "dolly-spec/docs/spec/extensions/alarm.md::8 failure semantics",
+    "dolly-spec/docs/spec/extensions/alarm.md::9 conformance tests",
+    "dolly-spec/docs/spec/roadmap/02-work-packages.md::WP-014 Alarm: virtual time/DST/restart completion evidence"
+  ],
+  "source_boundary": {
+    "premise_seam": "the real committed-premise seams of the accepted base: Core InstallConfig + InstallGraph (receiving module owned by Extension org.dolly.alarm) + Ingress (committed Block carrying the Alarm Action) + BuildManifest + IssueLease + DispatchLease; the checked-in alarm-action.schema.json/alarm-record.schema.json/alarm-result.schema.json/common.schema.json validated through dolly_schema; dolly_canonical_json JCS + Sha256Digest for occurrence identity",
+    "boundary_double": "WP-014's integration rule starts the package behind a boundary test double with recorded deterministic dependencies: crates/dolly-runtime/tests/common/wp014_alarm_reference.rs evaluates the frozen contract purely over an injected RefClock (wall+monotonic) and injected IANA-derived zone-rule fixtures. It never writes to the Core store; every crossing to shared substrate uses real public seams",
+    "authority": "producer/upstream premise -> durable explicit premise -> consumer/downstream only. A committed Alarm Action is honored only inside a committed Block selected into an active Activation owned by org.dolly.alarm; the boundary double and any production consumer read exactly that premise. The alarm premise grants no Page-append or cursor-advance authority; the only egresses are committed due-output Blocks and request_wakeup(next_utc_instant, wakeup_key)",
+    "effect_boundary": "the accepted base (3172f470) ships no org.dolly.alarm consumer, so product-behavior cases red through the real-store production-presence probe: the durable artifacts a production consumer MUST leave in the real Core store (committed due-output Blocks carrying the frozen dolly.alarm.event/v1 rows, or journal WakeupRequested records) are absent at the base, with the exact missing seam named in the cause. When the consumer lands, the same frozen probes observe the same real store and go green with no expectation edits"
+  },
+  "classification": {
+    "pass": "the frozen contract the case asserts is satisfied by the accepted base's real public seams (Core committed-premise transactions, the checked-in alarm action schemas through dolly_schema, canonical JCS/sha256 identity, the deterministic boundary double and its real-seam crossings), or is a spec-executability anchor (REQ-ALARM-001 determinism, ordering/identity definitions)",
+    "product_red": "the accepted base does not yet satisfy the frozen target because it ships no org.dolly.alarm committed-Action consumer, alarm repository, scheduler, claim/lease machinery, or wakeup path; every causal step the probe actually drove (the real Core premise transactions and the deterministic boundary double) succeeded, so each red is directly attributable to the absent product behavior named in the cause",
+    "harness_error": "any other failure (real transaction rejected, deterministic double violation, fixture/build/environment fault); the accepted base shows zero"
+  },
+  "target_expected_counts": {
+    "pass": 37,
+    "product_red": 0,
+    "harness_error": 0
+  },
+  "baseline": {
+    "accepted_base_head": "3172f470fba22677598023c319f5e81f4ed6e5cc",
+    "fixture_commit": "frozen 37-case boundary",
+    "recorded_at": "accepted-base observation; not the frozen target",
+    "observed_counts": {
+      "pass": 12,
+      "product_red": 25,
+      "harness_error": 0
+    }
+  },
+  "zone_rules": {
+    "fixture": "injected deterministic IANA-derived zone rules; the only timezone data the suite reads",
+    "America/Los_Angeles@2026b": [
+      [
+        "1825578000",
+        -28800,
+        false
+      ],
+      [
+        "1805018400",
+        -25200,
+        true
+      ],
+      [
+        "1793523600",
+        -28800,
+        false
+      ],
+      [
+        "1772964000",
+        -25200,
+        true
+      ]
+    ],
+    "America/Los_Angeles@2027a": [
+      [
+        "1793523600",
+        -28800,
+        false
+      ],
+      [
+        "1772964000",
+        -25200,
+        true
+      ]
+    ],
+    "Europe/Berlin@2026b": [
+      [
+        "1792890000",
+        3600,
+        false
+      ],
+      [
+        "1774746000",
+        7200,
+        true
+      ]
+    ],
+    "UTC@2026b": []
+  },
+  "identity_fixture": {
+    "spec_example_occurrence": "sha256:de6e0c4a8d13637ae4ef80d7240d58f14d4d61ab7bd0043b18561ed48e498a39",
+    "spec_example_tuple": [
+      "dolly.alarm.occurrence/v1",
+      "019535d4-6f00-7a2c-9b31-8e11d2345000",
+      1,
+      "2026-08-10T15:30:00.000000Z",
+      0
+    ]
+  },
+  "evidence": {
+    "wp014_activated_manifest_authority": [
+      "WP014-PREMISE-001"
+    ],
+    "wp014_invalid_target_authority_scoped": [
+      "WP014-PREMISE-002"
+    ],
+    "wp014_no_page_or_cursor_authority_from_wakeup": [
+      "WP014-PREMISE-003"
+    ],
+    "wp014_once_schedule_raw_contract": [
+      "WP014-RULE-001"
+    ],
+    "wp014_interval_schedule_raw_contract": [
+      "WP014-RULE-002"
+    ],
+    "wp014_cron_expression_raw_contract": [
+      "WP014-RULE-003"
+    ],
+    "wp014_unknown_fields_rejected": [
+      "WP014-RULE-004"
+    ],
+    "wp014_missing_required_and_target_rejected": [
+      "WP014-RULE-005"
+    ],
+    "wp014_stable_action_names_only": [
+      "WP014-RULE-006"
+    ],
+    "wp014_reprocessable_pure_schedule": [
+      "WP014-DETERM-001"
+    ],
+    "wp014_occurrence_identity_digests": [
+      "WP014-IDENT-001"
+    ],
+    "wp014_list_order_definition": [
+      "WP014-ORDER-001"
+    ],
+    "wp014_valid_create_durable_normalized_and_advance": [
+      "WP014-CREATE-001"
+    ],
+    "wp014_create_replay_idempotent_by_action_id": [
+      "WP014-CREATE-002"
+    ],
+    "wp014_enabled_toggle_and_delivery_bounds": [
+      "WP014-CREATE-003"
+    ],
+    "wp014_maximum_alarms_limit": [
+      "WP014-CREATE-004"
+    ],
+    "wp014_cron_field_rules": [
+      "WP014-CRON-001"
+    ],
+    "wp014_cron_dom_dow_or_semantics": [
+      "WP014-CRON-002"
+    ],
+    "wp014_cron_month_end_and_leap_day": [
+      "WP014-CRON-003"
+    ],
+    "wp014_once_and_interval_occurrence_sets": [
+      "WP014-CRON-004"
+    ],
+    "wp014_cron_iteration_bound": [
+      "WP014-CRON-005"
+    ],
+    "wp014_dst_gap_policies": [
+      "WP014-DST-001"
+    ],
+    "wp014_dst_fold_policies": [
+      "WP014-DST-002"
+    ],
+    "wp014_dst_defaults_materialized": [
+      "WP014-DST-003"
+    ],
+    "wp014_tzdb_revision_recorded_and_upgrade_recomputes_future_only": [
+      "WP014-TZDB-001"
+    ],
+    "wp014_wall_jump_and_suspend_resume_recompute_future": [
+      "WP014-CLOCK-001"
+    ],
+    "wp014_monotonic_governs_local_repeat_waits": [
+      "WP014-CLOCK-002"
+    ],
+    "wp014_within_grace_processed_in_scheduled_order": [
+      "WP014-MISFIRE-001"
+    ],
+    "wp014_misfire_skip_policy": [
+      "WP014-MISFIRE-002"
+    ],
+    "wp014_misfire_fire_once_policy": [
+      "WP014-MISFIRE-003"
+    ],
+    "wp014_misfire_catch_up_policy_and_cap": [
+      "WP014-MISFIRE-004"
+    ],
+    "wp014_misfire_persisted_before_next_schedule_and_no_synthesis": [
+      "WP014-MISFIRE-005"
+    ],
+    "wp014_records_occurrences_and_identities_survive_restart": [
+      "WP014-DURABLE-001"
+    ],
+    "wp014_competing_claims_converge_exactly_once": [
+      "WP014-CLAIM-001"
+    ],
+    "wp014_crash_windows_same_identity_after_outcome_query": [
+      "WP014-CLAIM-002"
+    ],
+    "wp014_wakeup_after_each_state_change_no_polling": [
+      "WP014-WAKEUP-001"
+    ],
+    "wp014_simultaneous_alarms_share_ordered_block_independently": [
+      "WP014-WAKEUP-002"
+    ]
+  },
+  "cases": [
+    {
+      "id": "WP014-PREMISE-001",
+      "name": "alarm_actions_arrive_only_inside_committed_blocks_selected_into_an_active_activation",
+      "kind": "activated_manifest_authority",
+      "base": "pass",
+      "expected": "pass",
+      "pass_basis": "a stable org.dolly.alarm Action targets a Module configured with Extension owner org.dolly.alarm and arrives only inside a committed Block selected into an active Activation; the real committed-premise seams deliver exactly that invocation context",
+      "assertion": "drive the real config/graph/ingress/manifest/lease/dispatch for one spec-anchored create Action; read the committed Action back from the real Core snapshot via the active Activation's manifest input items; assert active dispatch state",
+      "references": [
+        "crates/dolly-runtime/tests/wp014_alarm_conformance.rs::Premise",
+        "crates/dolly-runtime/tests/wp014_alarm_conformance.rs::commit_and_activate",
+        "dolly-storage::SqliteCoreStore::transact"
+      ]
+    },
+    {
+      "id": "WP014-PREMISE-002",
+      "name": "block_reachability_scoped_by_graph_for_org_dolly_alarm",
+      "kind": "invalid_target_authority_scoped",
+      "base": "pass",
+      "expected": "pass",
+      "pass_basis": "an Action committed to a page the org.dolly.alarm module does not consume is unreachable by its Activation; only the manifest-selected input Block reaches the alarm premise (invalid-authority is structurally closed)",
+      "assertion": "commit one block on the alarm input page and one on an unrelated page; build+activate a manifest over the alarm page only; assert the manifest input items contain exactly the alarm-page block and its sole Action",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::6",
+        "crates/dolly-runtime/tests/wp014_alarm_conformance.rs::commit_and_activate"
+      ]
+    },
+    {
+      "id": "WP014-PREMISE-003",
+      "name": "no_page_append_or_cursor_authority_derived_from_wakeup",
+      "kind": "no_page_or_cursor_authority_from_wakeup",
+      "base": "pass",
+      "expected": "pass",
+      "pass_basis": "the Alarm cannot append directly to a Page, mutate a committed Block, or advance a cursor; request_wakeup carries exactly (next_utc_instant, wakeup_key) and grants no Page/cursor authority; the only egresses are committed output Blocks and wakeup requests",
+      "assertion": "run create through the boundary double; assert every wakeup entry is exactly (next_utc_instant, wakeup_key) and the reference store exposes no cursor authority",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::1",
+        "dolly-spec/docs/spec/extensions/alarm.md::6"
+      ]
+    },
+    {
+      "id": "WP014-RULE-001",
+      "name": "once_schedule_raw_action_contract",
+      "kind": "schedule_raw_contract",
+      "base": "pass",
+      "expected": "pass",
+      "pass_basis": "once accepts an RFC3339 timestamp with explicit Z or numeric offset; before persistence it is converted without loss of the represented instant to the Core six-digit UTC form; leap seconds and invalid calendar dates are rejected",
+      "assertion": "validate valid Z/offset once inputs against the checked-in alarm-action.schema.json through dolly_schema; assert the normalizer converts exactly (frozen goldens) and rejects leap second / implicit offset / invalid date",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::3",
+        "dolly-spec/schemas/alarm-action.schema.json",
+        "dolly-schema::SchemaBundle"
+      ]
+    },
+    {
+      "id": "WP014-RULE-002",
+      "name": "interval_schedule_raw_action_contract",
+      "kind": "schedule_raw_contract",
+      "base": "pass",
+      "expected": "pass",
+      "pass_basis": "interval requires a positive integer duration in seconds (1..=315576000) and an explicit UTC anchor; occurrences are anchor + n*duration and DST has no effect",
+      "assertion": "validate valid intervals; assert every_seconds=0 and a missing anchor are rejected by the checked-in schema",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::3",
+        "dolly-spec/schemas/alarm-action.schema.json#/$defs/CreateSchedule"
+      ]
+    },
+    {
+      "id": "WP014-RULE-003",
+      "name": "cron_v1_expression_raw_action_contract",
+      "kind": "invalid_rule_rejected",
+      "base": "pass",
+      "expected": "pass",
+      "pass_basis": "cron_v1 is five fields minute hour dom month dow with `*`, comma lists, numeric ranges, and positive steps; names, L, W, # and seconds are forbidden; dow is 0..6 with Sunday 0",
+      "assertion": "validate the valid grammar through the checked-in schema and the reference parser; reject names/L/W/#/seconds/wrong-field-count/out-of-range/descending forms (schema or normalizer); this is the invalid-rule seed",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::3",
+        "dolly-spec/schemas/alarm-action.schema.json"
+      ]
+    },
+    {
+      "id": "WP014-RULE-004",
+      "name": "unknown_action_fields_rejected",
+      "kind": "unknown_fields_rejected",
+      "base": "pass",
+      "expected": "pass",
+      "pass_basis": "the raw Action input contract rejects unknown fields (additionalProperties false) on all seven stable argument shapes",
+      "assertion": "append an unknown field to create/list/get/update/delete/snooze/acknowledge arguments and assert the checked-in schema rejects each",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::2",
+        "dolly-spec/schemas/alarm-action.schema.json"
+      ]
+    },
+    {
+      "id": "WP014-RULE-005",
+      "name": "missing_required_and_target_rejected",
+      "kind": "missing_required_rejected",
+      "base": "pass",
+      "expected": "pass",
+      "pass_basis": "create requires title/schedule/delivery/enabled and every stable Action requires target; the frozen action schema rejects any omission",
+      "assertion": "drop target and each required argument in turn and assert the checked-in schema rejects the Action",
+      "references": [
+        "dolly-spec/schemas/alarm-action.schema.json",
+        "dolly-spec/docs/spec/extensions/alarm.md::6"
+      ]
+    },
+    {
+      "id": "WP014-RULE-006",
+      "name": "stable_action_names_only",
+      "kind": "stable_action_names_only",
+      "base": "pass",
+      "expected": "pass",
+      "pass_basis": "the only stable v1 actions are create/list/get/update/delete/snooze/acknowledge under org.dolly.alarm; any other name is not an Alarm Action",
+      "assertion": "assert the checked-in action schema rejects a non-stable action name",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::6"
+      ]
+    },
+    {
+      "id": "WP014-DETERM-001",
+      "name": "schedule_evaluation_is_pure_and_bounded",
+      "kind": "reprocessable_pure_schedule",
+      "base": "pass",
+      "expected": "pass",
+      "pass_basis": "REQ-ALARM-001: a fixed alarm revision, tzdb revision, boundary interval, and clock sequence MUST produce one deterministic ordered occurrence set; schedule evaluation is pure for (alarm revision, tzdb revision, last boundary, next boundary) with a configured iteration bound",
+      "assertion": "run the identical create + clock sequence twice through the boundary double; assert identical ordered fired occurrence sets and a byte-identical durable snapshot; assert a fixed Mon-Fri 09:00 LA sequence fires four times",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::3",
+        "dolly-spec/docs/spec/extensions/alarm.md::9",
+        "REQ-ALARM-001"
+      ]
+    },
+    {
+      "id": "WP014-IDENT-001",
+      "name": "occurrence_and_repeat_identity_are_the_frozen_sha256_formula",
+      "kind": "occurrence_identity_digests",
+      "base": "pass",
+      "expected": "pass",
+      "pass_basis": "occurrence identity is sha256: over the UTF-8 JCS bytes of [\"dolly.alarm.occurrence/v1\", alarm_id, alarm_revision, scheduled_utc_instant, fold_ordinal]; repeat identity over [\"dolly.alarm.repeat/v1\", occurrence_id, repeat_ordinal]; identities must survive restart",
+      "assertion": "pin the ES-anchored example digest sha256:de6e0c4a...(frozen golden); assert distinct (alarm_revision, fold_ordinal, alarm_id, scheduled_utc) inputs yield distinct identities via the real JCS+sha256 seams",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::4",
+        "dolly-canonical-json::canonicalize",
+        "dolly-canonical-json::Sha256Digest"
+      ]
+    },
+    {
+      "id": "WP014-ORDER-001",
+      "name": "list_ordering_definition_is_frozen",
+      "kind": "list_order_definition",
+      "base": "pass",
+      "expected": "pass",
+      "pass_basis": "List order is ascending by (next_occurrence nulls last, alarm_id) with canonical UTC timestamp strings first, JSON null after every timestamp, alarm_id bytewise tie-break; the semantic validator rejects duplicate or descending keys and performs no clock/db/tzdb lookup",
+      "assertion": "drive three creates + a list through the boundary double; assert the returned records are in strict ascending next_occurrence order",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::6"
+      ]
+    },
+    {
+      "id": "WP014-CREATE-001",
+      "name": "valid_create_produces_durable_normalized_record_and_wakeup_then_advance",
+      "kind": "create_and_advance",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "a valid create commits a durable normalized AlarmRecord (every selected policy, timezone, and tzdb revision materialized from the operation's frozen config revision), computes next_occurrence, requests a wakeup, and the advance pass fires the due occurrence with the exact frozen event content",
+      "assertion": "drive the real premise for the spec-anchored create; run the boundary double; assert frozen record facts (next_occurrence 2026-08-10T15:30:00.000000Z, defaults fire_once/shift_by_gap/earlier, tzdb_revision 2026b, wakeup requested); advance wall to the due instant and assert one exactly-on-time fired event; then require the production artifact in the real store",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::2",
+        "dolly-spec/docs/spec/extensions/alarm.md::5",
+        "dolly-spec/docs/spec/extensions/alarm.md::6"
+      ]
+    },
+    {
+      "id": "WP014-CREATE-002",
+      "name": "create_replay_is_idempotent_by_committed_action_id",
+      "kind": "create_replay",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "create is idempotent by the committed action_id and replay returns the existing created record byte-identically",
+      "assertion": "process the same committed create Action twice through the boundary double; assert the second result is the byte-identical logical record and the store has exactly one record/occurrence lineage",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::2",
+        "dolly-spec/docs/spec/extensions/alarm.md::7"
+      ]
+    },
+    {
+      "id": "WP014-CREATE-003",
+      "name": "enabled_toogle_and_delivery_bounds",
+      "kind": "enabled_delivery_bounds",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "enabled governs whether future occurrences are scheduled (next_occurrence null when disabled); repeat_until_acknowledged requires repeat_interval_seconds within [minimum_repeat_interval, 315576000]; unknown delivery modes are rejected",
+      "assertion": "assert a disabled create yields next_occurrence null; a repeat interval below the configured minimum yields REPEAT_INTERVAL; an unsupported mode yields INVALID_SCHEDULE",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::2",
+        "dolly-spec/schemas/alarm-record.schema.json#/properties/delivery"
+      ]
+    },
+    {
+      "id": "WP014-CREATE-004",
+      "name": "maximum_alarms_limit_enforced",
+      "kind": "alarm_limit",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "maximum alarms is configured; exceeding it yields a distinct ALARM_LIMIT error and no partial record",
+      "assertion": "fill a store to the configured maximum and assert the next create fails with ALARM_LIMIT and result null",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::2",
+        "dolly-spec/docs/spec/extensions/alarm.md::8"
+      ]
+    },
+    {
+      "id": "WP014-CRON-001",
+      "name": "every_cron_field_rule_matches_deterministically",
+      "kind": "cron_field_rules",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "every cron field rule is covered: *, comma lists, numeric ranges, positive steps, dow 0..6 with Sunday 0, and each yields one deterministic next instant",
+      "assertion": "for a fixed boundary assert the exact next occurrence instants of a representative list/ranges/steps/projection set anchored to verified weekdays",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::3",
+        "dolly-spec/docs/spec/extensions/alarm.md::9"
+      ]
+    },
+    {
+      "id": "WP014-CRON-002",
+      "name": "dom_dow_or_semantics_and_restricted_star_rule",
+      "kind": "cron_dom_dow_or",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "if both DOM and DOW are restricted a local time matches when either field matches (Vixie OR); if either field is * the restricted field MUST match",
+      "assertion": "assert the exact next instant for 0 0 13 * 5 from a fixed Saturday (Friday 2026-08-07T07:00:00.000000Z) and for a restricted-field-only pattern",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::3"
+      ]
+    },
+    {
+      "id": "WP014-CRON-003",
+      "name": "month_end_and_leap_day_occurrences",
+      "kind": "cron_month_end_leap_day",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "month-end (January 31) and leap-day (February 29) civil rules resolve deterministically; non-leap years skip Feb 29",
+      "assertion": "assert 0 0 31 1 * from 2026-01-01 yields 2026-01-31T08:00:00.000000Z and 0 0 29 2 * from 2026-03-01 yields 2028-02-29T08:00:00.000000Z",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::3",
+        "dolly-spec/docs/spec/extensions/alarm.md::9"
+      ]
+    },
+    {
+      "id": "WP014-CRON-004",
+      "name": "once_and_interval_occurrence_sets",
+      "kind": "once_and_interval_occurrences",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "once represents exactly its instant; interval occurrences are anchor + n duration in pure UTC and DST has no effect on them",
+      "assertion": "assert once fires exactly at its instant and interval(3600, anchor) yields anchor-derived instants across a DST boundary with no shift",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::3"
+      ]
+    },
+    {
+      "id": "WP014-CRON-005",
+      "name": "iteration_bound_yields_distinct_error",
+      "kind": "iteration_bound",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "schedule evaluation MUST have a configured iteration bound; exceeding it yields a distinct ITERATION_BOUND error and no occurrence is synthesized",
+      "assertion": "evaluate a pattern with no future match (Feb 30) under a tight bound and assert the ITERATION_BOUND envelope",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::3",
+        "dolly-spec/docs/spec/extensions/alarm.md::8"
+      ]
+    },
+    {
+      "id": "WP014-DST-001",
+      "name": "gap_policies_shift_by_gap_and_skip",
+      "kind": "dst_gap_policies",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "for a nonexistent local time shift_by_gap adds the exact DST gap duration and fires at that resolved instant; skip creates no occurrence",
+      "assertion": "assert cron 30 2 * * * on 2026-03-08 LA resolves to 2026-03-08T10:30:00.000000Z under shift_by_gap and to no occurrence under skip",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::3",
+        "dolly-spec/docs/spec/extensions/alarm.md::9"
+      ]
+    },
+    {
+      "id": "WP014-DST-002",
+      "name": "fold_policies_earlier_later_both_with_ordinals",
+      "kind": "dst_fold_policies",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "for an ambiguous folded local time earlier selects the earlier UTC instant (fold_ordinal 0), later the later (fold_ordinal 1), and both creates two distinct occurrences with distinct identities",
+      "assertion": "assert cron 30 1 * * * on 2026-11-01 LA resolves to 2026-11-01T08:30:00.000000Z (earlier), 2026-11-01T09:30:00.000000Z (later), and both ordinals under both; assert distinct identities",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::3",
+        "dolly-spec/docs/spec/extensions/alarm.md::4"
+      ]
+    },
+    {
+      "id": "WP014-DST-003",
+      "name": "dst_defaults_shift_and_earlier_are_materialized",
+      "kind": "dst_gap_fold_defaults",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "the defaults are shift_by_gap and earlier; a create/update omitting the policies materializes exactly those into the durable record",
+      "assertion": "assert the spec-anchored create record carries dst_gap_policy shift_by_gap and dst_fold_policy earlier",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::3"
+      ]
+    },
+    {
+      "id": "WP014-TZDB-001",
+      "name": "tzdb_revision_recorded_and_upgrade_recomputes_future_only",
+      "kind": "tzdb_revision_change",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "all stored instants are UTC and calendar interpretation uses an IANA tzdb revision recorded with the alarm; a tzdb upgrade MUST trigger deterministic recomputation of future (not already-fired) occurrences and an audit event",
+      "assertion": "create an alarm whose record pins tzdb_revision 2026b; fire one occurrence; apply the 2027a upgrade; assert the future next occurrence recomputes deterministically, the fired occurrence keeps its exact instant/identity, an audit event is appended, and the base leaves no production artifact",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::1",
+        "dolly-spec/docs/spec/extensions/alarm.md::2",
+        "dolly-spec/docs/spec/extensions/alarm.md::9"
+      ]
+    },
+    {
+      "id": "WP014-CLOCK-001",
+      "name": "wall_jumps_and_suspend_resume_recompute_future_occurrences",
+      "kind": "wall_and_monotonic_clocks",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "the Alarm MUST use the injected Runtime Clock; tests MUST be able to replace both wall and monotonic time; a wall-clock jump or resume event MUST cause deterministic recomputation of future, not already-fired, occurrences",
+      "assertion": "script forward/backward wall jumps and suspend/resume against the boundary double and assert the future occurrence set recomputes deterministically while fired occurrences keep their instants",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::1",
+        "dolly-spec/docs/spec/extensions/alarm.md::6",
+        "dolly-spec/docs/spec/extensions/alarm.md::9"
+      ]
+    },
+    {
+      "id": "WP014-CLOCK-002",
+      "name": "monotonic_governs_local_repeat_waits",
+      "kind": "monotonic_repeat_waits",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "monotonic time MUST govern local repeat waits between recomputations; wall discontinuities do not retime repeats committed from the first firing",
+      "assertion": "assert a repeat occurrence becomes due only when the injected monotonic crosses first_fired_mono + ordinal*interval despite a wall jump in between",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::1",
+        "dolly-spec/docs/spec/extensions/alarm.md::7"
+      ]
+    },
+    {
+      "id": "WP014-MISFIRE-001",
+      "name": "within_grace_due_occurrences_process_in_scheduled_order",
+      "kind": "within_grace_scheduled_order",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "at recovery or each wakeup, due occurrences are partitioned by now - scheduled_at <= misfire_grace; within grace each due occurrence is processed normally in scheduled order",
+      "assertion": "script several due occurrences within grace and assert they fire in ascending scheduled order with correct lateness/misfire_status",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::5"
+      ]
+    },
+    {
+      "id": "WP014-MISFIRE-002",
+      "name": "skip_policy_marks_older_occurrences_missed",
+      "kind": "misfire_skip",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "skip: older occurrences become MISSED and emit no reminder",
+      "assertion": "create a repeat-interval alarm, let several occurrences pass beyond grace, advance, and assert all older occurrences are MISSED with zero fired events",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::5"
+      ]
+    },
+    {
+      "id": "WP014-MISFIRE-003",
+      "name": "fire_once_fires_most_recent_older_with_original_scheduled_at",
+      "kind": "misfire_fire_once",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "fire_once: the most recent older occurrence fires immediately with original scheduled_at and fired_at=now; all older ones become MISSED",
+      "assertion": "let three older occurrences accumulate and assert exactly the most recent fires with its original scheduled_at while the two older become MISSED",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::5"
+      ]
+    },
+    {
+      "id": "WP014-MISFIRE-004",
+      "name": "catch_up_fires_in_order_up_to_cap_then_diagnostic",
+      "kind": "misfire_catch_up",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "catch_up: older occurrences fire in scheduled order up to max_catch_up; the remainder become MISSED and a bounded diagnostic records their count",
+      "assertion": "let more older occurrences than max_catch_up accumulate and assert the first cap fire in order, the rest are MISSED, and one bounded diagnostic records the count",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::5"
+      ]
+    },
+    {
+      "id": "WP014-MISFIRE-005",
+      "name": "misfire_is_persisted_before_next_schedule_and_never_synthesizes",
+      "kind": "misfire_persistence_and_no_synthesis",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "misfire handling MUST be persisted before scheduling the next future occurrence; it MUST never synthesize an occurrence whose schedule did not match",
+      "assertion": "assert the record's next_occurrence is advanced only after the misfire pass persisted MISSED/FIRED states, and every fired/missed occurrence id is the identity of a real due instant (no synthesis)",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::5"
+      ]
+    },
+    {
+      "id": "WP014-DURABLE-001",
+      "name": "records_occurrences_and_identities_survive_restart",
+      "kind": "durable_restart",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "AlarmRecords/Occurrence identities MUST survive restart; a crash/restart yields the same records, same occurrence identities, and the same next occurrence",
+      "assertion": "drive create + advance, serialize the boundary-double snapshot, restore it into a fresh store, and assert byte-identical records/occurrence identities/next occurrence and one exactly-once firing lineage",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::2",
+        "dolly-spec/docs/spec/extensions/alarm.md::4",
+        "dolly-spec/docs/spec/extensions/alarm.md::9"
+      ]
+    },
+    {
+      "id": "WP014-CLAIM-001",
+      "name": "due_to_claimed_cas_with_finite_lease_converges_exactly_once",
+      "kind": "competing_claims",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "a worker MUST claim a due occurrence through a durable compare-and-set from DUE to CLAIMED with a finite worker lease; only the claim holder may prepare output; multiple workers racing converge on one logical firing",
+      "assertion": "two workers race for the same due occurrence against one boundary-double store; assert one claim wins and the other observes contention, and exactly one firing results",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::4",
+        "dolly-spec/docs/spec/extensions/alarm.md::9"
+      ]
+    },
+    {
+      "id": "WP014-CLAIM-002",
+      "name": "crash_windows_retry_same_identity_after_runtime_outcome_query",
+      "kind": "crash_windows",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "crash before Core commit permits reconciliation and retry with the same occurrence and Activation identity after claim expiry; an expired claim MUST NOT be treated as evidence that no output was committed \u2014 the worker MUST query Runtime Activation outcome before retrying; it MUST not create a new occurrence",
+      "assertion": "simulate crash before claim, after claim, and after Core commit; assert the retried occurrence and Activation identity are identical, the outcome query decides FIRED vs re-claim, and no duplicate occurrence is ever created",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::4",
+        "dolly-spec/docs/spec/extensions/alarm.md::8"
+      ]
+    },
+    {
+      "id": "WP014-WAKEUP-001",
+      "name": "request_wakeup_after_each_state_change_and_no_polling",
+      "kind": "wakeup_no_polling",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "the Extension MUST call request_wakeup(next_utc_instant, wakeup_key) after each state change; duplicate wakeups are harmless; it MUST NOT poll at high frequency",
+      "assertion": "assert a wakeup is requested after each state-changing action, duplicates collapse harmlessly, and the wakeup horizon bounds the requested instant",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::1",
+        "dolly-spec/docs/spec/extensions/alarm.md::6"
+      ]
+    },
+    {
+      "id": "WP014-WAKEUP-002",
+      "name": "simultaneous_due_events_share_one_ordered_block_independently",
+      "kind": "simultaneous_alarms",
+      "base": "product_red",
+      "expected": "pass",
+      "pass_basis": "a due output Block draft MUST include one or more ordered alarm events; simultaneous due events MAY share one Block but each retains independent identity and state",
+      "assertion": "two alarms become due at the same instant and assert one shared ordered block of two events with independent occurrence ids and states",
+      "references": [
+        "dolly-spec/docs/spec/extensions/alarm.md::6"
+      ]
+    }
+  ],
+  "deferred_cases": [
+    "WP014-LIST-001",
+    "WP014-UPDATE-001",
+    "WP014-DELETE-001",
+    "WP014-SNOOZE-001",
+    "WP014-ACK-001",
+    "WP014-REPEAT-001",
+    "WP014-REPEAT-002",
+    "WP014-REPEAT-003",
+    "WP014-ERROR-001",
+    "WP014-ERROR-002",
+    "WP014-ERROR-003",
+    "WP014-ERROR-004",
+    "WP014-ERROR-005",
+    "WP014-CONFIG-001"
+  ]
+}
