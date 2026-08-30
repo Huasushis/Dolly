@@ -772,9 +772,12 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
         // fence refuses the whole pass with zero effect.
         self.revalidate_current_grant()?;
         // Read the authoritative journal-verified Core snapshot and select the
-        // committed targeted Actions — never caller-supplied Blocks.
-        let actions = self.committed_targeted_actions()?;
-        let mut outcomes = Vec::new();
+        // committed targeted Actions — never caller-supplied Blocks. Targeted
+        // channel sends that fail parse/validation/preparation (including
+        // asset premises) surface here as frozen zero-effect Rejected
+        // outcomes; only non-targeted unrelated Actions are skipped.
+        let (actions, mut outcomes) = self.committed_targeted_actions()?;
+        let mut outcomes_for_admission = Vec::new();
         // PHASE 1: durable admission for each selected Action (insert/
         // replay/conflict + rate + caller-deadline gate). Outcomes that need
         // no transport (replay/conflict/pending/refusal) are emitted here.
@@ -782,9 +785,10 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
         for action in &actions {
             match self.admit_one(action, caller_deadline)? {
                 AdmitResult::Admitted(admitted_action) => admitted.push(admitted_action),
-                AdmitResult::Outcome(outcome) => outcomes.push(outcome),
+                AdmitResult::Outcome(outcome) => outcomes_for_admission.push(outcome),
             }
         }
+        outcomes.append(&mut outcomes_for_admission);
         if admitted.is_empty() {
             return Ok(outcomes);
         }
@@ -808,9 +812,11 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
     /// first configured Delivery occurrence supplies the exact durable
     /// occurrence coordinates. No generic Core Block or event collection is
     /// consulted.
-    fn committed_targeted_actions(&mut self) -> Result<Vec<CommittedSendAction>, ChannelError> {
+    fn committed_targeted_actions(
+        &mut self,
+    ) -> Result<(Vec<CommittedSendAction>, Vec<ConsumerOutcome>), ChannelError> {
         let Some(authority) = self.authoritative_manifest()? else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         };
         let ledger = self.store.project_ledger()?;
         let input_items = authority
@@ -826,6 +832,7 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 )
             })?;
         let mut actions = Vec::new();
+        let mut refused = Vec::new();
         for item in input_items {
             let Some((occurrence_index, occurrence)) = item
                 .get("occurrences")
@@ -851,12 +858,23 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                 continue;
             };
             for (action_index, action) in actions_in_block.iter().enumerate() {
+                // Non-targeted unrelated Actions are skipped exactly as the
+                // accepted manifest contract requires: only a
+                // `org.dolly.channel.send` may produce a Channel effect or
+                // rejection envelope here.
                 if action.get("name").and_then(Value::as_str)
                     != Some(crate::config::SEND_ACTION_NAME)
                 {
                     continue;
                 }
-                if let Ok(action) = CommittedSendAction::from_manifest_input(
+                // A targeted channel send that fails to parse, validate, or
+                // prepare (including asset premises) MUST surface as a frozen
+                // zero-effect Rejected outcome, never a silent drop. The
+                // canonical action_id from the committed Action keys the
+                // envelope; a targeted send without a canonical id cannot be
+                // keyed to a closed outcome and stays skipped this pass.
+                let target_action_id = action.get("action_id").and_then(Value::as_str);
+                match CommittedSendAction::from_manifest_input(
                     &authority.manifest,
                     item,
                     occurrence_index,
@@ -867,11 +885,21 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                     &ledger,
                     &mut *self.asset_preparation,
                 ) {
-                    actions.push(action);
+                    Ok(committed) => actions.push(committed),
+                    Err(error) => {
+                        if let Some(action_id) = target_action_id {
+                            if !action_id.is_empty() {
+                                refused.push(ConsumerOutcome::Rejected {
+                                    action_id: action_id.to_string(),
+                                    error,
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
-        Ok(actions)
+        Ok((actions, refused))
     }
 
     /// Status-first restart/lost-response recovery of the durable outbound

@@ -23,9 +23,11 @@ use dolly_channel::error::codes;
 use dolly_channel::transport::{
     ChannelTransport, TransportPieceOutcome, TransportSendRequest, TransportSendResult,
 };
+use dolly_channel::asset::{AssetLeaseProof, AssetPremise, AssetPreparation};
 use dolly_channel::{
-    ChannelPrincipal, InboundReceiver, IngressOutcome, OutboundConsumer, OutboundQueueGate,
-    OutboundState, SqliteChannelStore, create_channel_store_schema, timestamp_plus_seconds,
+    ChannelOutcome, ChannelPrincipal, InboundReceiver, IngressOutcome, OutboundConsumer,
+    OutboundQueueGate, OutboundState, SqliteChannelStore, create_channel_store_schema,
+    timestamp_plus_seconds,
 };
 use dolly_core_reducer::{
     ActivationState, BeginFenceCommand, BuildManifestCommand, CoreCommand, DispatchLeaseCommand,
@@ -1035,15 +1037,27 @@ fn wrong_target_foreign_owner_and_unowned_session_are_rejected_with_zero_effect(
     )
     .expect("consumer");
     let outcomes = consumer.consume(&far_deadline()).expect("consume");
-    // The sealed selection refuses every hostile Block BEFORE enqueue: a
-    // non-targeted send, a foreign-owner action, and an unowned-session send
-    // all yield ZERO outcomes and ZERO durable/transport effect. Generic
-    // Blocks must never become actions.
+    // Each commit fences the previous Activation, so the ONE current
+    // dispatched manifest selects only the last Block (the unowned-session
+    // send). Its failure MUST surface as a frozen zero-effect Rejected
+    // outcome, never a silent drop. The foreign-owner action renamed off the
+    // channel send name is not a targeted channel send and stays skipped.
     assert_eq!(
         outcomes.len(),
-        0,
-        "hostile Blocks are refused before enqueue"
+        1,
+        "the hostile targeted send is refused with one Rejected outcome, never a silent drop"
     );
+    match outcomes.into_iter().next().unwrap() {
+        dolly_channel::ConsumerOutcome::Rejected {
+            action_id, error,
+        } => {
+            assert_eq!(action_id, "0198ab31-6c44-7e8a-b2bb-000000000805");
+            assert_eq!(error.code, codes::SESSION_MISSING);
+            assert!(!error.retryable);
+            assert_eq!(error.outcome, dolly_channel::ChannelOutcome::NotApplied);
+        }
+        other => panic!("expected Rejected, got {other:?}"),
+    }
     assert_eq!(
         transport.calls().len(),
         0,
@@ -2431,4 +2445,246 @@ fn generic_ingress_without_manifest_cannot_mint_send_authority() {
         consumer.pending_outbound().unwrap().is_empty(),
         "zero durable outbound rows"
     );
+}
+
+/// Injected AssetPreparation seam test double for the production consumer.
+/// Shares its recorded premises and refusal via an Arc so the test can
+/// observe exactly what the sealed consumer requested (premise direction).
+#[derive(Clone, Default)]
+struct RefusingAssetPreparation {
+    refuse_code: Option<String>,
+    inner: std::sync::Arc<std::sync::Mutex<RefusingInner>>,
+}
+
+#[derive(Default)]
+struct RefusingInner {
+    prepared: Vec<AssetPremise>,
+}
+
+impl RefusingAssetPreparation {
+    fn refusing(code: &str) -> Self {
+        Self {
+            refuse_code: Some(code.to_string()),
+            ..Self::default()
+        }
+    }
+    fn prepared(&self) -> Vec<AssetPremise> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .prepared
+            .clone()
+    }
+}
+
+impl AssetPreparation for RefusingAssetPreparation {
+    fn prepare_assets(
+        &mut self,
+        premises: &[AssetPremise],
+    ) -> Result<Vec<AssetLeaseProof>, dolly_channel::ChannelError> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .prepared
+            .extend_from_slice(premises);
+        match &self.refuse_code {
+            Some(code) => Err(dolly_channel::ChannelError::new(
+                code.clone(),
+                false,
+                ChannelOutcome::NotApplied,
+                "asset not prepared under the Channel authority",
+            )),
+            None => Ok(premises
+                .iter()
+                .map(|premise| AssetLeaseProof {
+                    value: json!({ "lease_id": format!("lease-{}", premise.ordinal) }),
+                })
+                .collect()),
+        }
+    }
+
+    fn revalidate_leases(
+        &mut self,
+        _proofs: &[AssetLeaseProof],
+    ) -> Result<(), dolly_channel::ChannelError> {
+        Ok(())
+    }
+}
+
+/// A committed send Block whose `arguments.parts` is exactly the given list.
+fn send_block_with_asset_parts(
+    module_id: &str,
+    action_id: &str,
+    session_id: &str,
+    parts: Value,
+) -> Value {
+    let mut block = send_block_for(module_id, action_id, session_id, &["Hello."]);
+    block["body"]["actions"][0]["arguments"]["parts"] = parts;
+    block
+}
+
+fn asset_part(asset_id: &str, media_type: &str) -> Value {
+    json!({
+        "kind": "asset",
+        "asset_id": asset_id,
+        "media_type": media_type
+    })
+}
+
+#[test]
+fn targeted_asset_send_refused_by_injected_seam_yields_frozen_rejected_with_zero_effect() {
+    const ASSET_ID: &str = "ast_b3_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mut fixture = setup("consumer-asset-refuse");
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000840";
+    commit_block(
+        &mut fixture.harness,
+        "consumer-asset-refuse",
+        "ing-1",
+        &format!("{action_id}-block"),
+        send_block_with_asset_parts(
+            MODULE_ID,
+            action_id,
+            &fixture.session,
+            json!([
+                { "kind": "text", "text": "Hello.", "format": "plain" },
+                asset_part(ASSET_ID, "image/png")
+            ]),
+        ),
+        vec!["page-c".to_string()],
+    );
+    let transport = SharedTransport::new(true);
+    let assets = RefusingAssetPreparation::refusing(codes::ASSET_IMPORT_FAILED);
+    let mut module_conn = reopen_module_store(&fixture);
+    let config = channel_config();
+    let gate = OutboundQueueGate::register(
+        &config,
+        &mut module_conn,
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .unwrap();
+    let mut consumer = OutboundConsumer::with_asset_preparation(
+        config,
+        Box::new(channel_clock()),
+        &mut module_conn,
+        &mut fixture.harness.connection,
+        gate,
+        Box::new(transport.clone()),
+        Box::new(assets.clone()),
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .expect("consumer registration");
+
+    let outcomes = consumer.consume(&far_deadline()).expect("consume");
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "one frozen Rejected outcome, never a silent drop"
+    );
+    match outcomes.into_iter().next().unwrap() {
+        dolly_channel::ConsumerOutcome::Rejected {
+            action_id: rejected_id,
+            error,
+        } => {
+            assert_eq!(rejected_id, action_id);
+            assert_eq!(error.code, codes::ASSET_IMPORT_FAILED);
+            assert!(!error.retryable);
+            assert_eq!(error.outcome, ChannelOutcome::NotApplied);
+        }
+        other => panic!("expected Rejected, got {other:?}"),
+    }
+    assert_eq!(transport.calls().len(), 0, "zero transport calls");
+    drop(consumer);
+
+    // No Prepared row, no queue occupancy, no echo marker.
+    let mut reopened = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
+    assert!(
+        reopened.find_outbound(action_id).unwrap().is_none(),
+        "no durable Prepared row"
+    );
+    assert!(
+        reopened.list_pending_outbound().unwrap().is_empty(),
+        "no durable queue occupancy"
+    );
+    drop(reopened);
+
+    // Premise direction intact: the seam received ONLY the committed Action's
+    // AssetId/media_type/view (no raw path, no bytes, no caller-supplied full
+    // AssetRef), in Action part order.
+    let prepared = assets.prepared();
+    assert_eq!(prepared.len(), 1);
+    assert_eq!(prepared[0].ordinal, 1);
+    assert_eq!(prepared[0].asset_id, ASSET_ID);
+    assert_eq!(prepared[0].media_type, "image/png");
+    assert_eq!(prepared[0].view, None);
+}
+
+#[test]
+fn targeted_asset_send_is_never_silently_dropped_by_the_production_consumer() {
+    const ASSET_ID: &str = "ast_b3_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    // A canonical asset part under the accepted default text-only seam used
+    // to vanish without an outcome; it must now surface one frozen
+    // zero-effect Rejected outcome. A noncanonical asset part must surface
+    // the same way (schema/boundary rejection), never a silent drop.
+    for (label, parts, expected_code) in [
+        (
+            "default-deny",
+            json!([asset_part(ASSET_ID, "image/png")]),
+            codes::UNSUPPORTED_MODALITY.to_string(),
+        ),
+        (
+            "noncanonical",
+            json!([asset_part(ASSET_ID, "Image/PNG")]),
+            codes::MALFORMED_EVENT.to_string(),
+        ),
+    ] {
+        let mark = format!("non-silent-{label}");
+        let mut fixture = setup(&mark);
+        let action_id = "0198ab31-6c44-7e8a-b2bb-000000000841";
+        commit_block(
+            &mut fixture.harness,
+            &mark,
+            "ing-1",
+            &format!("{action_id}-block"),
+            send_block_with_asset_parts(MODULE_ID, action_id, &fixture.session, parts),
+            vec!["page-c".to_string()],
+        );
+        let transport = SharedTransport::new(true);
+        let mut module_conn = reopen_module_store(&fixture);
+        let mut consumer = open_consumer(
+            channel_config(),
+            Box::new(channel_clock()),
+            &mut module_conn,
+            &mut fixture.harness.connection,
+            Box::new(transport.clone()),
+            &fixture.harness.authority,
+            &fixture.harness.grant,
+        )
+        .expect("consumer");
+        let outcomes = consumer.consume(&far_deadline()).expect("consume");
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "{label}: exactly one Rejected outcome, never a silent drop"
+        );
+        match outcomes.into_iter().next().unwrap() {
+            dolly_channel::ConsumerOutcome::Rejected {
+                action_id: rejected_id,
+                error,
+            } => {
+                assert_eq!(rejected_id, action_id, "{label}");
+                assert_eq!(error.code, expected_code, "{label}");
+                assert!(!error.retryable, "{label}");
+                assert_eq!(error.outcome, ChannelOutcome::NotApplied, "{label}");
+            }
+            other => panic!("{label}: expected Rejected, got {other:?}"),
+        }
+        assert_eq!(transport.calls().len(), 0, "{label}: zero transport calls");
+        assert!(
+            consumer.pending_outbound().unwrap().is_empty(),
+            "{label}: zero durable outbound rows"
+        );
+        drop(consumer);
+    }
 }
