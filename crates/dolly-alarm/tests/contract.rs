@@ -1560,3 +1560,122 @@ fn tzdb_upgrade_recomputes_future_and_keeps_fired_history() {
     let event = sched.complete(&claims[0]).expect("complete later fold");
     assert_eq!(event.scheduled_at, "2025-11-02T06:45:00.000000Z");
 }
+
+// ---------------------------------------------------------------------------
+// Stable error taxonomy and disabled alarms
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stable_error_codes_distinguish_failures() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("codes.sqlite3");
+    let (mut sched, _clock) = open_shared(&db, 1_762_066_800_000_000);
+
+    // Nonexistent timezone at create => NONEXISTENT_TIMEZONE.
+    let bad_zone = make_action(
+        &uuid_v7(150),
+        "org.dolly.alarm.create",
+        serde_json::json!({
+            "title": "Bad zone",
+            "schedule": {"kind": "cron_v1", "expression": "0 9 * * *", "timezone": "Not/AZone"},
+            "delivery": {"mode": "once"},
+            "enabled": true
+        }),
+    );
+    let err = sched.apply(&bad_zone).expect_err("unknown zone");
+    assert_eq!(err.code, AlarmErrorCode::NonexistentTimezone);
+
+    // Repeat interval below the frozen minimum => REPEAT_INTERVAL.
+    let bad_repeat = make_action(
+        &uuid_v7(151),
+        "org.dolly.alarm.create",
+        serde_json::json!({
+            "title": "Bad repeat",
+            "schedule": {"kind": "once", "at": "2025-12-01T09:00:00.000000Z"},
+            "delivery": {"mode": "repeat_until_acknowledged", "repeat_interval_seconds": 0},
+            "enabled": true
+        }),
+    );
+    let err = sched.apply(&bad_repeat).expect_err("repeat interval");
+    assert_eq!(err.code, AlarmErrorCode::RepeatInterval);
+
+    // Unknown action name => INVALID_SCHEDULE.
+    let unknown = make_action(
+        &uuid_v7(152),
+        "org.dolly.alarm.frobnicate",
+        serde_json::json!({}),
+    );
+    let err = sched.apply(&unknown).expect_err("unknown action");
+    assert_eq!(err.code, AlarmErrorCode::InvalidSchedule);
+
+    // Alarm limit: max_alarms already reached.
+    let mut tight = cfg();
+    tight.max_alarms = 1;
+    let tight_dir = tempfile::tempdir().expect("tempdir");
+    let tight_db = tight_dir.path().join("tight.sqlite3");
+    let clock = SharedFixedClock::new(1_762_066_800_000_000);
+    let mut small_sched =
+        Scheduler::open(&tight_db, Box::new(clock), Box::new(provider()), tight).expect("open");
+    small_sched
+        .apply(&once_action(153, "2025-12-02T09:00:00.000000Z"))
+        .expect("first create");
+    let err = small_sched
+        .apply(&once_action(154, "2025-12-03T09:00:00.000000Z"))
+        .expect_err("alarm limit");
+    assert_eq!(err.code, AlarmErrorCode::AlarmLimit);
+}
+
+#[test]
+fn disabled_alarm_never_claims_but_displays_next() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("disabled.sqlite3");
+    let (mut sched, clock) = open_shared(&db, 1_762_066_800_000_000);
+    let action = make_action(
+        &uuid_v7(160),
+        "org.dolly.alarm.create",
+        serde_json::json!({
+            "title": "Disabled",
+            "schedule": {"kind": "once", "at": "2025-12-05T09:00:00.000000Z"},
+            "delivery": {"mode": "once"},
+            "enabled": false
+        }),
+    );
+    let created = sched.apply(&action).expect("create disabled");
+    assert_eq!(created["record"]["enabled"], serde_json::json!(false));
+    assert_eq!(
+        created["record"]["next_occurrence"],
+        serde_json::json!("2025-12-05T09:00:00.000000Z")
+    );
+    assert!(
+        sched.next_wakeup().expect("wakeup").is_none(),
+        "disabled alarms never produce wakeups"
+    );
+    clock.set(parse_utc_timestamp_us("2025-12-05T09:00:00.000000Z", "n").unwrap() + 1);
+    sched.settle(&|_, _| Outcome::Unknown).expect("settle");
+    assert!(
+        sched.claim_due("w").expect("claim").is_empty(),
+        "disabled alarms never claim"
+    );
+    // Enabling via update restores claimability.
+    let update = make_action(
+        &uuid_v7(1600),
+        "org.dolly.alarm.update",
+        serde_json::json!({
+            "alarm_id": created["record"]["alarm_id"],
+            "expected_revision": 1,
+            "replacement": {
+                "title": "Enabled",
+                "schedule": {"kind": "once", "at": "2025-12-06T09:00:00.000000Z"},
+                "delivery": {"mode": "once"},
+                "enabled": true
+            }
+        }),
+    );
+    let result = sched.apply(&update).expect("enable");
+    assert_eq!(result["record"]["enabled"], serde_json::json!(true));
+    clock.set(parse_utc_timestamp_us("2025-12-06T09:00:00.000000Z", "n").unwrap());
+    sched.settle(&|_, _| Outcome::Unknown).expect("settle");
+    let claims = sched.claim_due("w").expect("claim");
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].scheduled_at, "2025-12-06T09:00:00.000000Z");
+}

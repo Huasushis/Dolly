@@ -308,7 +308,3 @@ pub fn parse_local_date(text: &str) -> Result<(i32, u32, u32), AlarmError> {
     }
     Ok((year, month, day))
 }
-
-pub fn pad_time(value: u32) -> String {
-    format!("{value:02}")
-}

@@ -17,8 +17,8 @@
 use crate::cron::{CronFields, day_matches, field_matches, parse_cron_expression};
 use crate::error::{AlarmError, AlarmErrorCode};
 use crate::time::{
-    CivilTime, US_PER_SECOND, UsInstant, civil_to_us, days_from_civil, format_date_only,
-    format_utc_iso6, parse_local_date, us_to_civil,
+    CivilTime, US_PER_SECOND, UsInstant, days_from_civil, format_utc_iso6, parse_local_date,
+    us_to_civil,
 };
 use crate::tzdb::{FixedZone, ResolvedCivil};
 use dolly_canonical_json::canonicalize;
@@ -519,14 +519,6 @@ fn identity_digest<T: serde::Serialize>(tuple: &T) -> String {
     let (_, digest) =
         canonicalize(tuple).expect("occurrence identity tuples are trivially canonicalizable");
     digest.to_canonical_string()
-}
-
-pub fn civil_to_us_public(civil: &CivilTime) -> UsInstant {
-    civil_to_us(civil)
-}
-
-pub fn format_date_only_public(year: i32, month: u32, day: u32) -> String {
-    format_date_only(year, month, day)
 }
 
 #[cfg(test)]
