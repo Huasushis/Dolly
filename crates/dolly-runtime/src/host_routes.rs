@@ -370,16 +370,50 @@ pub fn open_channel_inbound_route<'connection, 'principal>(
 /// for the same store/account/config identity (production multimodal
 /// registration): authenticated transport attachments are imported through
 /// the accepted Asset façade under the sealed authority, and name-based
-/// status answers `Absent` only when no durable import record exists. The
-/// default [`open_channel_inbound_route`] keeps the same identity but serves
-/// attachments fail-closed (no bound Asset store).
+/// status answers `Absent` only when an authoritative exact-key lookup finds
+/// no durable import record. The bound provider reader is required (never
+/// `None` for a multimodal route) and the Asset content root must be the one
+/// registered by the outbound registration for the same identity. The
+/// default [`open_channel_inbound_route`] stays the fail-closed text-only
+/// route.
 pub fn open_channel_inbound_route_with_assets<'connection, 'principal>(
     runtime_connection: &'connection mut Connection,
     module_store_connection: &'connection mut Connection,
     config: ChannelConfig,
     clock: Box<dyn Clock>,
     asset_config: ResolvedAssetConfig,
-    account: &str,
+    provider: Box<dyn crate::multimodal::ProviderAttachmentReader>,
+    authority: &'principal HostConnectionAuthority,
+    grant: &'principal HostCapabilityGrant,
+) -> Result<
+    InboundReceiver<'connection, 'principal, SqliteHostIngressStore<'connection>>,
+    HostRouteError,
+> {
+    open_bound_inbound_receiver(
+        runtime_connection,
+        module_store_connection,
+        config,
+        clock,
+        asset_config,
+        provider,
+        authority,
+        grant,
+    )
+}
+
+/// The shared production multimodal inbound binding: verifies the exact
+/// current `host.ingress.submit` plus `host.asset.import`/`host.asset.status`
+/// grants under the same extension/module/connection authority, binds the
+/// seam to the sealed Channel principal account with the registered Asset
+/// root (one adapter set per store/account/config lifecycle), and opens the
+/// accepted [`InboundReceiver`] over the durable Host ingress slice.
+fn open_bound_inbound_receiver<'connection, 'principal>(
+    runtime_connection: &'connection mut Connection,
+    module_store_connection: &'connection mut Connection,
+    config: ChannelConfig,
+    clock: Box<dyn Clock>,
+    asset_config: ResolvedAssetConfig,
+    provider: Box<dyn crate::multimodal::ProviderAttachmentReader>,
     authority: &'principal HostConnectionAuthority,
     grant: &'principal HostCapabilityGrant,
 ) -> Result<
@@ -397,7 +431,21 @@ pub fn open_channel_inbound_route_with_assets<'connection, 'principal>(
             "the granted extension is not the built-in Channel extension",
         ));
     }
-    let assets = ChannelAttachmentImport::bind(asset_config, authority, grant, account)?;
+    let account = dolly_channel::ChannelPrincipal::from_authority_grant(authority, grant)
+        .map_err(|error| HostRouteError::Rejected {
+            code: error.code,
+            message: error.message,
+        })?
+        .account()
+        .to_string();
+    let assets = ChannelAttachmentImport::bind(
+        asset_config,
+        config.revision,
+        authority,
+        grant,
+        &account,
+        provider,
+    )?;
     let host = SqliteHostIngressStore::new(runtime_connection)?;
     InboundReceiver::with_asset_import(
         config,
@@ -432,6 +480,38 @@ pub fn reconcile_channel_inbound_route<'connection, 'principal>(
         module_store_connection,
         config,
         clock,
+        authority,
+        grant,
+    )?;
+    receiver.reconcile().map_err(|error| HostRouteError::Rejected {
+        code: error.code,
+        message: error.message,
+    })
+}
+
+/// Restart/activation reconciliation for the multimodal inbound route: opens
+/// (or reuses) the SAME bound provider + Asset adapter set for the same
+/// store/account/config identity — never the unbound text-only seam — and
+/// runs the accepted status-first durable intent path, so a durable
+/// attachment import is settled by an authoritative exact-key status before
+/// any byte-identical resubmit.
+pub fn reconcile_channel_inbound_route_with_assets<'connection, 'principal>(
+    runtime_connection: &'connection mut Connection,
+    module_store_connection: &'connection mut Connection,
+    config: ChannelConfig,
+    clock: Box<dyn Clock>,
+    asset_config: ResolvedAssetConfig,
+    provider: Box<dyn crate::multimodal::ProviderAttachmentReader>,
+    authority: &'principal HostConnectionAuthority,
+    grant: &'principal HostCapabilityGrant,
+) -> Result<usize, HostRouteError> {
+    let mut receiver = open_bound_inbound_receiver(
+        runtime_connection,
+        module_store_connection,
+        config,
+        clock,
+        asset_config,
+        provider,
         authority,
         grant,
     )?;
@@ -538,10 +618,21 @@ impl<'principal> ChannelOutboundRoute<'principal> {
         grant: &'principal HostCapabilityGrant,
         asset_config: ResolvedAssetConfig,
     ) -> Result<Self, HostRouteError> {
+        let revision = config.revision;
         let mut route = Self::register(config, module_connection, authority, grant)?;
         asset_config.validate().map_err(|detail| {
             capability_denied(format!("asset config invalid: {detail}"))
         })?;
+        // Own the one Asset route for this store/account/config identity
+        // (requires the exact current host.asset grants under the same
+        // authority and records the single registered content root shared
+        // with the inbound route).
+        crate::multimodal::asset_route_register(
+            authority,
+            grant,
+            revision,
+            &asset_config.local_root,
+        )?;
         route.asset_config = Some(asset_config);
         Ok(route)
     }

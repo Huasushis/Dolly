@@ -326,6 +326,7 @@ dependencies = [
  "dolly-protocol",
  "dolly-schema",
  "dolly-storage",
+ "parking_lot",
  "rusqlite",
  "serde",
  "serde_json",

@@ -14,6 +14,7 @@ dolly-core-reducer = { path = "../dolly-core-reducer" }
 dolly-schema = { path = "../dolly-schema" }
 dolly-storage = { path = "../dolly-storage" }
 blake3 = "1.7"
+parking_lot = "0.12"
 rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

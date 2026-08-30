@@ -47,6 +47,135 @@ use dolly_storage::{HostCapabilityGrant, HostConnectionAuthority};
 
 use crate::host_routes::HostRouteError;
 
+/// The bounded authenticated provider attachment reader the Runtime owns.
+/// It reads the exact immutable bytes for one authenticated provider key
+/// within a caller-supplied byte bound — never a raw path, ambient network,
+/// or caller authority claim. Acceptance injects a deterministic fake;
+/// production binds the transport's own provider fetch here.
+pub trait ProviderAttachmentReader {
+    /// Read the exact bytes for `provider_key`, refusing when the provider
+    /// cannot authenticate the key, the bytes are unavailable, or the payload
+    /// exceeds `max_bytes`. Errors are closed and must not expose a path,
+    /// capability, account, or network detail.
+    fn read(&mut self, provider_key: &str, max_bytes: u64) -> Result<Vec<u8>, String>;
+}
+
+// ---------------------------------------------------------------------------
+// One registered Asset route per store/account/config identity.
+// ---------------------------------------------------------------------------
+
+/// The sealed identity a registered Asset route belongs to. Both Channel
+/// directions (outbound prepare and inbound import) for the same
+/// store/account/activation must resolve to the exact same Asset store, so
+/// registration records ONE root per identity and every later binding must
+/// match it or fail closed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AssetRouteIdentity {
+    extension_connection_id: String,
+    worker_epoch: String,
+    module_id: String,
+    config_revision: i64,
+}
+
+#[derive(Debug, Clone)]
+struct AssetRouteBinding {
+    root: std::path::PathBuf,
+}
+
+impl AssetRouteBinding {
+    fn root_key(&self) -> String {
+        asset_root_key(&self.root)
+    }
+}
+
+/// Process-wide registry of the registered Asset routes. Only grows with
+/// distinct sealed route identities (bounded by the finite set of
+/// activations) and never stores capabilities, paths beyond the content
+/// root, or caller metadata.
+static ASSET_ROUTE_BINDINGS: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<AssetRouteIdentity, AssetRouteBinding>>,
+> = std::sync::OnceLock::new();
+
+fn asset_route_registry() -> &'static parking_lot::Mutex<std::collections::HashMap<AssetRouteIdentity, AssetRouteBinding>> {
+    ASSET_ROUTE_BINDINGS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn asset_route_identity(
+    authority: &HostConnectionAuthority,
+    grant: &HostCapabilityGrant,
+    config_revision: i64,
+) -> AssetRouteIdentity {
+    AssetRouteIdentity {
+        extension_connection_id: authority.extension_connection_id().to_owned(),
+        worker_epoch: authority.worker_epoch().to_string(),
+        module_id: grant.module_id().to_owned(),
+        config_revision,
+    }
+}
+
+/// A canonical absolute form of the content root used for equality (never a
+/// capability or variable path component).
+fn asset_root_key(root: &std::path::Path) -> String {
+    std::path::absolute(root)
+        .ok()
+        .and_then(|absolute| absolute.canonicalize().ok().or(Some(absolute)))
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.to_string_lossy().into_owned())
+}
+
+/// Register (or verify) the one Asset route for this sealed store/account/
+/// config identity and its exact content root. Requires the current
+/// `host.asset.import` and `host.asset.status` capability under the same
+/// extension/module authority; a different root for the same identity is a
+/// stale/re-placed registration and fails closed.
+pub(crate) fn asset_route_register(
+    authority: &HostConnectionAuthority,
+    grant: &HostCapabilityGrant,
+    config_revision: i64,
+    root: &std::path::Path,
+) -> Result<(), HostRouteError> {
+    if !grant.allows("host.asset.import") || !grant.allows("host.asset.status") {
+        return Err(HostRouteError::CapabilityDenied {
+            detail: "the multimodal Channel route requires host.asset.import and host.asset.status grants under the same authority".into(),
+        });
+    }
+    let key = asset_route_identity(authority, grant, config_revision);
+    let mut registry = asset_route_registry().lock();
+    if let Some(existing) = registry.get(&key) {
+        if existing.root_key() != asset_root_key(root) {
+            return Err(HostRouteError::CapabilityDenied {
+                detail: "a different Asset content root is already registered for this store/account/config identity".into(),
+            });
+        }
+        return Ok(());
+    }
+    registry.insert(
+        key,
+        AssetRouteBinding {
+            root: root.to_path_buf(),
+        },
+    );
+    Ok(())
+}
+
+/// Resolve the exact registered Asset content root for this sealed identity,
+/// failing closed when no route registered it (the outbound registration owns
+/// the Asset store under the authority direction).
+fn asset_route_registered_root(
+    authority: &HostConnectionAuthority,
+    grant: &HostCapabilityGrant,
+    config_revision: i64,
+) -> Result<std::path::PathBuf, HostRouteError> {
+    let key = asset_route_identity(authority, grant, config_revision);
+    let registry = asset_route_registry().lock();
+    registry
+        .get(&key)
+        .map(|binding| binding.root.clone())
+        .ok_or_else(|| HostRouteError::CapabilityDenied {
+            detail: "no Asset route is registered for this store/account/config identity; register the outbound Asset route first".into(),
+        })
+}
+
 /// The finite short Asset lease the outbound adapter holds per prepared
 /// premise (the frozen "short Asset lease" of the multimodal profile).
 const ASSET_LEASE_TTL_MS: u64 = 30_000;
@@ -327,11 +456,14 @@ fn convert_prepared_media(ordinal: u32, prepared: PreparedMedia) -> Result<Asset
 pub struct ChannelAttachmentImport {
     facade: Option<AssetHostFacade>,
     capability: Option<AssetCapability>,
+    /// The sealed Channel principal account this seam serves. Every
+    /// attachment request key must be scoped to exactly this account;
+    /// anything else is refused before any Asset call.
     account: String,
-    /// Deterministic provider-specific byte fetch (bounded; never a raw path
-    /// or ambient network). Acceptance uses an injected fake; production
-    /// binds the transport's provider fetch here.
-    provider: Option<Box<dyn FnMut(&str) -> Result<Vec<u8>, String> + Send>>,
+    /// The bounded authenticated provider attachment reader. The multimodal
+    /// bound construction always injects one; `None` exists only on the
+    /// fail-closed unbound (text-only) seam.
+    provider: Option<Box<dyn ProviderAttachmentReader>>,
 }
 
 impl ChannelAttachmentImport {
@@ -346,18 +478,51 @@ impl ChannelAttachmentImport {
         }
     }
 
-    /// Bind the module's Asset façade, capability, and the authenticated
-    /// Channel account. The provider byte fetch is supplied separately (the
-    /// deterministic acceptance adapter, then the production transport).
+    /// Bind the module's Asset facade, capability, and the sealed principal
+    /// account, with the required bounded provider reader. Fails closed when
+    /// the grant does not authorize `host.asset.import`/`host.asset.status`
+    /// under the same extension/module authority, when the caller account is
+    /// not the sealed Channel principal account, when the Asset content root
+    /// is not the one registered for this store/account/config identity, or
+    /// when the supplied reader is missing.
     pub fn bind(
         config: ResolvedAssetConfig,
+        config_revision: i64,
         authority: &HostConnectionAuthority,
         grant: &HostCapabilityGrant,
         account: &str,
+        provider: Box<dyn ProviderAttachmentReader>,
     ) -> Result<Self, HostRouteError> {
         config.validate().map_err(|detail| HostRouteError::CapabilityDenied {
             detail: format!("asset config invalid: {detail}"),
         })?;
+        if !grant.allows("host.asset.import") || !grant.allows("host.asset.status") {
+            return Err(HostRouteError::CapabilityDenied {
+                detail: "the grant does not authorize host.asset.import/host.asset.status".into(),
+            });
+        }
+        // The account is a sealed fact of the current authority/grant, never
+        // an unchecked caller choice.
+        let principal = dolly_channel::ChannelPrincipal::from_authority_grant(authority, grant)
+            .map_err(|error| HostRouteError::Rejected {
+                code: error.code,
+                message: error.message,
+            })?;
+        if principal.account() != account {
+            return Err(HostRouteError::CapabilityDenied {
+                detail: "caller account does not match the sealed Channel principal account".into(),
+            });
+        }
+        // The exact same Asset store the outbound route registered for this
+        // identity must serve the inbound imports (one adapter set per
+        // store/account/config lifecycle).
+        let registered =
+            asset_route_registered_root(authority, grant, config_revision)?;
+        if asset_root_key(&config.local_root) != asset_root_key(&registered) {
+            return Err(HostRouteError::CapabilityDenied {
+                detail: "inbound Asset content root does not match the registered outbound Asset root for this identity".into(),
+            });
+        }
         let facade = AssetHostFacade::open(config).map_err(|error| {
             let envelope = error.to_envelope();
             HostRouteError::Rejected {
@@ -380,39 +545,47 @@ impl ChannelAttachmentImport {
             facade: Some(facade),
             capability: Some(capability),
             account: account.to_string(),
-            provider: None,
+            provider: Some(provider),
         })
     }
 
-    /// Set the deterministic provider byte fetch. Absent means the provider
-    /// resource cannot be obtained and the import fails closed.
-    pub fn with_provider<F>(mut self, provider: F) -> Self
-    where
-        F: FnMut(&str) -> Result<Vec<u8>, String> + Send + 'static,
-    {
-        self.provider = Some(Box::new(provider));
-        self
+    /// Fail closed unless the attachment key is scoped to exactly this
+    /// seam's bound account. Called before any provider read or Asset call,
+    /// so a foreign or forged key can never import or query under this
+    /// domain.
+    fn check_attachment_ownership(
+        &self,
+        request: &AttachmentImportRequest,
+    ) -> Result<(), ChannelError> {
+        let scoped = format!("{}\u{0}", self.account);
+        if !request.attachment_key.starts_with(&scoped) {
+            return Err(attachment_refused(
+                &request.provider_key,
+                "attachment key is not scoped to the bound Channel account",
+            ));
+        }
+        Ok(())
     }
 
-    /// Test-support: bind a pre-opened façade and capability directly, so the
+    /// Test-support: bind a pre-opened facade and capability directly, so the
     /// adapter's import/status path can be proven without Host scaffolding.
+    /// The provider is required here as well: the multimodal seam never runs
+    /// without a bounded provider reader.
     #[cfg(test)]
     pub(crate) fn for_test(
         facade: AssetHostFacade,
         capability: AssetCapability,
         account: &str,
+        provider: Box<dyn ProviderAttachmentReader>,
     ) -> Self {
         Self {
             facade: Some(facade),
             capability: Some(capability),
             account: account.to_string(),
-            provider: None,
+            provider: Some(provider),
         }
     }
 
-    /// The account-scoped deterministic Asset import id for one attachment
-    /// key. The Asset authority keys imports by this id plus module/domain,
-    /// so replay and status are exactly key-scoped and never cross-owner.
     fn import_id_for(&self, request: &AttachmentImportRequest) -> String {
         // Stable 128-bit UUID-v7-shaped id derived from the sealed account
         // and the Channel account-scoped idempotency key, so a restart
@@ -445,6 +618,7 @@ impl ChannelAttachmentImport {
         &mut self,
         request: &AttachmentImportRequest,
     ) -> Result<AttachmentImportStatus, ChannelError> {
+        self.check_attachment_ownership(request)?;
         let import_id = self.import_id_for(request);
         let Some((facade, capability)) = self.facade.as_mut().zip(self.capability.as_ref())
         else {
@@ -453,15 +627,20 @@ impl ChannelAttachmentImport {
                 "no Asset store/capability is bound to the Channel inbound route",
             ));
         };
-        let Some(fetch) = self.provider.as_mut() else {
+        let Some(reader) = self.provider.as_mut() else {
             return Err(attachment_refused(
                 &request.provider_key,
-                "no deterministic provider source is bound; provider bytes cannot be obtained",
+                "no bounded provider reader is bound; provider bytes cannot be obtained",
             ));
         };
-        let bytes = fetch(&request.provider_key).map_err(|detail| {
-            attachment_refused(&request.provider_key, &format!("provider fetch refused: {detail}"))
-        })?;
+        let bytes = reader
+            .read(&request.provider_key, request.byte_length_hint)
+            .map_err(|detail| {
+                attachment_refused(
+                    &request.provider_key,
+                    &format!("provider fetch refused: {detail}"),
+                )
+            })?;
         if bytes.len() as u64 > request.byte_length_hint {
             return Err(attachment_refused(
                 &request.provider_key,
@@ -504,6 +683,7 @@ impl ChannelAttachmentImport {
         &mut self,
         request: &AttachmentImportRequest,
     ) -> Result<AttachmentImportStatus, ChannelError> {
+        self.check_attachment_ownership(request)?;
         let import_id = self.import_id_for(request);
         let Some((facade, capability)) = self.facade.as_mut().zip(self.capability.as_ref())
         else {
@@ -623,6 +803,34 @@ mod tests {
         bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
         bytes.extend_from_slice(&[0u8; 24]);
         bytes
+    }
+
+    /// Deterministic bounded provider reader for tests: serves a fixed byte
+    /// payload per key and records reads (bounded).
+    #[derive(Default)]
+    struct FakeProvider {
+        payload: Option<Vec<u8>>,
+    }
+
+    impl FakeProvider {
+        fn serving(bytes: Vec<u8>) -> Self {
+            Self {
+                payload: Some(bytes),
+            }
+        }
+    }
+
+    impl ProviderAttachmentReader for FakeProvider {
+        fn read(&mut self, provider_key: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
+            let payload = self.payload.clone().ok_or_else(|| format!("no payload for {provider_key}"))?;
+            if provider_key == "missing" {
+                return Err("no provider object for key".to_string());
+            }
+            if payload.len() as u64 > max_bytes {
+                return Err("provider payload exceeds the bound".to_string());
+            }
+            Ok(payload)
+        }
     }
 
     fn config_at(root: &std::path::Path) -> ResolvedAssetConfig {
@@ -776,9 +984,12 @@ mod tests {
         let png = png_bytes(4, 2);
         let facade = AssetHostFacade::open(config_at(dir.path())).expect("facade");
         let capability = facade.issue_capability("domain-a", "instance-a", "module-a");
-        let mut seam = ChannelAttachmentImport::for_test(facade, capability, "account-a");
-        let png_clone = png.clone();
-        seam = seam.with_provider(move |_key| Ok(png_clone.clone()));
+        let mut seam = ChannelAttachmentImport::for_test(
+            facade,
+            capability.clone(),
+            "account-a",
+            Box::new(FakeProvider::serving(png.clone())),
+        );
 
         let request = AttachmentImportRequest::new("account-a", "evt-1", &dolly_channel::attachment::InboundAttachment {
             ordinal: 0,
@@ -809,6 +1020,62 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn inbound_seam_refuses_foreign_account_and_missing_provider_before_import() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let png = png_bytes(4, 2);
+        let facade = AssetHostFacade::open(config_at(dir.path())).expect("facade");
+        let capability = facade.issue_capability("domain-a", "instance-a", "module-a");
+        let mut seam = ChannelAttachmentImport::for_test(
+            facade,
+            capability.clone(),
+            "account-a",
+            Box::new(FakeProvider::serving(png.clone())),
+        );
+
+        // A key scoped to a different account is refused before any provider
+        // read or Asset call (mismatch rejection, exact-key/domain binding).
+        let foreign = AttachmentImportRequest::new(
+            "account-b",
+            "evt-f",
+            &dolly_channel::attachment::InboundAttachment {
+                ordinal: 0,
+                provider_key: "provider-foreign".to_string(),
+                media_kind: ChannelMediaKind::Image,
+                declared_media_type: ChannelMediaType::parse("image/png").expect("type"),
+                byte_length_hint: png.len() as u64,
+            },
+        );
+        let err = seam.import(&foreign).expect_err("foreign account must refuse");
+        assert_eq!(err.code, codes::ASSET_IMPORT_FAILED);
+        assert_eq!(err.outcome, ChannelOutcome::NotApplied);
+        // No provider read happened and no durable import record exists.
+        let err = seam.status(&foreign).expect_err("foreign account must refuse status");
+        assert_eq!(err.code, codes::ASSET_IMPORT_FAILED);
+
+        // A provider that cannot serve the authenticated key fails closed
+        // before any Asset record, with zero duplicate effect.
+        let mut on_missing = ChannelAttachmentImport::for_test(
+            AssetHostFacade::open(config_at(dir.path())).expect("facade"),
+            capability.clone(),
+            "account-a",
+            Box::new(FakeProvider::default()),
+        );
+        let missing = AttachmentImportRequest::new(
+            "account-a",
+            "evt-m",
+            &dolly_channel::attachment::InboundAttachment {
+                ordinal: 0,
+                provider_key: "missing".to_string(),
+                media_kind: ChannelMediaKind::Image,
+                declared_media_type: ChannelMediaType::parse("image/png").expect("type"),
+                byte_length_hint: png.len() as u64,
+            },
+        );
+        let err = on_missing.import(&missing).expect_err("missing provider object must refuse");
+        assert_eq!(err.code, codes::ASSET_IMPORT_FAILED);
+    }
 
     #[test]
     fn unbound_inbound_seam_fails_closed_with_an_asset_code() {
