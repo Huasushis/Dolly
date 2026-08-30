@@ -141,7 +141,7 @@ fn first_artifact_occurrence_id_is_deterministic_across_schedulers() {
     let alarm_id = created["record"]["alarm_id"].as_str().unwrap().to_string();
     let (_, occ_a, _) = first.store().earliest_due().expect("due").expect("due");
 
-    let mut clock = FixedClock::new(T0_US);
+    let clock = FixedClock::new(T0_US);
     let _ = clock; // same virtual instant for both schedulers
 
     // A fresh scheduler on the same file computes the same canonical id from
@@ -165,12 +165,9 @@ fn first_artifact_occurrence_id_is_deterministic_across_schedulers() {
 fn first_artifact_wakeup_never_creates_action_authority() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("alarm.sqlite3");
-    let mut scheduler = open_scheduler(&db_path, T0_US);
+    let scheduler = open_scheduler(&db_path, T0_US);
     let premise = scheduler.next_wakeup().expect("wakeup");
     assert!(premise.is_none(), "no alarms yet means no wakeup premise");
     // Applying no action leaves no durable state behind.
     assert_eq!(scheduler.store().count_active_alarms().expect("count"), 0);
 }
-
-use dolly_alarm::clock::SharedFixedClock;
-use dolly_alarm::record::MisfirePolicy;

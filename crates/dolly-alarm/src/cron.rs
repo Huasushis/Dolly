@@ -34,40 +34,6 @@ pub struct CronFields {
     pub day_of_week: CronField,
 }
 
-struct FieldSpec {
-    label: &'static str,
-    min: u32,
-    max: u32,
-}
-
-const FIELD_SPECS: [FieldSpec; 5] = [
-    FieldSpec {
-        label: "minute",
-        min: 0,
-        max: 59,
-    },
-    FieldSpec {
-        label: "hour",
-        min: 0,
-        max: 23,
-    },
-    FieldSpec {
-        label: "day_of_month",
-        min: 1,
-        max: 31,
-    },
-    FieldSpec {
-        label: "month",
-        min: 1,
-        max: 12,
-    },
-    FieldSpec {
-        label: "day_of_week",
-        min: 0,
-        max: 6,
-    },
-];
-
 fn schedule_error(message: impl Into<String>, field: &str, value: &str) -> AlarmError {
     let mut details = serde_json::Map::new();
     details.insert(

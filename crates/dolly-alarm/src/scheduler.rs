@@ -163,6 +163,13 @@ impl Scheduler {
         self.failpoint.clone()
     }
 
+    fn alarm_timezone_name<'a>(&self, alarm: &'a AlarmRow) -> Option<&'a str> {
+        match &alarm.schedule_shape {
+            ScheduleShape::CronV1 { timezone, .. } => Some(timezone.as_str()),
+            _ => None,
+        }
+    }
+
     fn build_schedule(&self, alarm: &AlarmRow) -> Result<Schedule, AlarmError> {
         match &alarm.schedule_shape {
             ScheduleShape::Once { at } => {
@@ -1004,9 +1011,34 @@ impl Scheduler {
     /// next_occurrence recompute.
     fn settle_alarm(&mut self, alarm: &AlarmRow, now: UsInstant) -> Result<(), AlarmError> {
         let now_at = format_utc_iso6(now);
-        let schedule = self.build_schedule(alarm)?;
+        let mut schedule = self.build_schedule(alarm)?;
         let tzdb_changed = matches!(schedule, Schedule::Cron { .. })
             && alarm.tzdb_revision != self.config.tzdb_revision;
+        // A tzdb upgrade recomputes future occurrences under the NEW
+        // revision's rules; the roll must evaluate with those rules, not the
+        // alarm's frozen revision.
+        if tzdb_changed {
+            if let Schedule::Cron {
+                expression,
+                zone: Some(_),
+                gap_policy,
+                fold_policy,
+            } = &schedule
+            {
+                let zone_id = zone_rules_id(
+                    self.alarm_timezone_name(alarm)
+                        .unwrap_or("America/New_York"),
+                    &self.config.tzdb_revision,
+                );
+                let zone = self.zones.zone(&zone_id)?;
+                schedule = Schedule::Cron {
+                    expression: expression.clone(),
+                    zone: Some(zone),
+                    gap_policy: *gap_policy,
+                    fold_policy: *fold_policy,
+                };
+            }
+        }
         let rule_revision = alarm.revision;
         let alarm_id = alarm.alarm_id.clone();
 

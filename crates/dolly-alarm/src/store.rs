@@ -421,7 +421,6 @@ pub(crate) fn occurrence_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<O
 /// file and converge via compare-and-set.
 pub struct AlarmStore {
     conn: Connection,
-    busy_timeout_ms: u64,
 }
 
 impl AlarmStore {
@@ -435,29 +434,26 @@ impl AlarmStore {
                 )
             })?;
         }
-        let mut connection = Connection::open(path).map_err(|e| db_unavailable("open", e))?;
+        let connection = Connection::open(path).map_err(|e| db_unavailable("open", e))?;
         connection
             .execute_batch(&format!(
                 "PRAGMA foreign_keys = ON; PRAGMA busy_timeout = {busy_timeout_ms}; PRAGMA synchronous = FULL;"
             ))
             .map_err(|e| db_unavailable("pragmas", e))?;
-        Self::install_schema(connection, busy_timeout_ms)
+        Self::install_schema(connection)
     }
 
     /// An isolated in-memory store for single-scheduler tests.
     pub fn open_in_memory() -> Result<Self, AlarmError> {
-        let mut connection =
+        let connection =
             Connection::open_in_memory().map_err(|e| db_unavailable("open in memory", e))?;
         connection
             .execute_batch("PRAGMA busy_timeout = 5000;")
             .map_err(|e| db_unavailable("pragmas", e))?;
-        Self::install_schema(connection, 5000)
+        Self::install_schema(connection)
     }
 
-    fn install_schema(
-        mut connection: Connection,
-        busy_timeout_ms: u64,
-    ) -> Result<Self, AlarmError> {
+    fn install_schema(mut connection: Connection) -> Result<Self, AlarmError> {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(|e| db_unavailable("schema version", e))?;
@@ -497,10 +493,7 @@ impl AlarmStore {
             .map_err(|e| db_unavailable("schema version write", e))?;
         tx.commit()
             .map_err(|e| db_unavailable("schema commit", e))?;
-        Ok(AlarmStore {
-            conn: connection,
-            busy_timeout_ms,
-        })
+        Ok(AlarmStore { conn: connection })
     }
 
     // ------------------------------------------------------------------
@@ -1189,12 +1182,18 @@ pub(crate) fn insert_occurrence_tx(
     scheduled_at: &str,
     now_at: &str,
 ) -> Result<bool, AlarmError> {
+    // Idempotent by canonical identity. A row previously suppressed by a tzdb
+    // recomputation is resurrected to DUE when the same deterministic
+    // occurrence is still produced by the new rules (never a snooze, ack, or
+    // superseded row).
     let changed = tx
         .execute(
-            "INSERT OR IGNORE INTO occurrences (occurrence_id, alarm_id, alarm_revision, kind,
+            "INSERT INTO occurrences (occurrence_id, alarm_id, alarm_revision, kind,
                 scheduled_at, scheduled_us, fold_ordinal, repeat_ordinal, parent_occurrence_id,
                 state, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'due', ?10)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'due', ?10)
+             ON CONFLICT(occurrence_id) DO UPDATE SET state = 'due', missed_reason = NULL
+             WHERE occurrences.missed_reason = 'tzdb_recomputed'",
             params![
                 occurrence.occurrence_id,
                 alarm_id,
@@ -1209,7 +1208,7 @@ pub(crate) fn insert_occurrence_tx(
             ],
         )
         .map_err(|e| db_unavailable("insert occurrence", e))?;
-    Ok(changed == 1)
+    Ok(changed >= 1)
 }
 
 /// Field update for `update_alarm_row`; SQL is positional.
@@ -1235,10 +1234,10 @@ pub struct AlarmRowUpdate {
 fn build_alarm_update(fields: &AlarmRowUpdate) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
     let mut sets: Vec<String> = Vec::new();
     let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    let mut add = |sets: &mut Vec<String>,
-                   params_vec: &mut Vec<Box<dyn rusqlite::ToSql>>,
-                   column: &str,
-                   value: Box<dyn rusqlite::ToSql>| {
+    let add = |sets: &mut Vec<String>,
+               params_vec: &mut Vec<Box<dyn rusqlite::ToSql>>,
+               column: &str,
+               value: Box<dyn rusqlite::ToSql>| {
         let index = params_vec.len() + 1;
         sets.push(format!("{column} = ?{index}"));
         params_vec.push(value);

@@ -146,10 +146,6 @@ pub fn us_to_civil(us: UsInstant) -> CivilTime {
     }
 }
 
-fn pad(value: i32, width: usize) -> String {
-    format!("{value:0width$}")
-}
-
 /// Canonical Core UTC instant: `YYYY-MM-DDTHH:MM:SS.uuuuuuZ`.
 pub fn format_utc_iso6(us: UsInstant) -> String {
     let whole_seconds = us.div_euclid(US_PER_SECOND);
@@ -266,9 +262,19 @@ pub fn parse_utc_timestamp_us(text: &str, label: &str) -> Result<UsInstant, Alar
 }
 
 fn rfc_error(label: &str, value: &str) -> AlarmError {
-    AlarmError::new(
+    let mut details = serde_json::Map::new();
+    details.insert(
+        "field".to_string(),
+        serde_json::Value::String(label.to_string()),
+    );
+    details.insert(
+        "value".to_string(),
+        serde_json::Value::String(value.to_string()),
+    );
+    AlarmError::with_details(
         AlarmErrorCode::InvalidSchedule,
         format!("{label} must be an RFC3339 timestamp with an explicit Z or numeric offset"),
+        details,
     )
 }
 
