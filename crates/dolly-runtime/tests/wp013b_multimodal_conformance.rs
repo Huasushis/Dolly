@@ -2649,13 +2649,35 @@ fn wp013b_mixed_text_asset_ordering() {
     // authoritative media type), text "last" (ordinal 2)] with contiguous
     // ordinals and a Confirmed terminal result. Mere presence of any send is
     // not green.
+    //
+    // The checked pattern is the exact accepted Channel closed enum API
+    // (TransportPiece::Text/Asset with explicit variants and fields): the
+    // wrong variant or a missing field is rejected, never read permissively.
     let exact_sequence = leg.requests.len() == 1
         && leg.requests[0].pieces.len() == 3
-        && leg.requests[0].pieces.iter().enumerate().all(|(index, piece)| {
-            piece.ordinal == index as u32
-        })
-        && leg.requests[0].pieces[0].text == "first"
-        && leg.requests[0].pieces[2].text == "last";
+        && matches!(
+            leg.requests[0].pieces.get(0),
+            Some(dolly_channel::transport::TransportPiece::Text {
+                ordinal: 0,
+                text,
+            }) if text == "first"
+        )
+        && matches!(
+            leg.requests[0].pieces.get(1),
+            Some(dolly_channel::transport::TransportPiece::Asset {
+                ordinal: 1,
+                payload,
+                ..
+            }) if payload.asset_ref.asset_id.as_str() == asset_id
+                && payload.asset_ref.media_type.as_str() == "image/png"
+        )
+        && matches!(
+            leg.requests[0].pieces.get(2),
+            Some(dolly_channel::transport::TransportPiece::Text {
+                ordinal: 2,
+                text,
+            }) if text == "last"
+        );
     if leg.report.transported == 1 && exact_sequence {
         return;
     }
@@ -2850,9 +2872,24 @@ fn wp013b_view_crop_checked_at_effect_time() {
     // left=1, top=0, right=3, bottom=2 from width=4, height=2, orientation=1)
     // and the materialized rect is carried by the typed transport piece and
     // the Confirmed result. Mere fixture declarations are not green.
+    // The checked pattern is the exact accepted Channel closed enum API: the
+    // materialized crop is the Asset variant's `view` (Option<dolly_schema::
+    // MaterializedBounds>) computed by Channel from the authoritative prepared
+    // width/height/orientation; the wrong variant or a missing/unmatched
+    // bounds value is rejected.
     let materialized = leg.requests.len() == 1
         && leg.requests[0].pieces.len() == 1
-        && leg.requests[0].pieces[0].ordinal == 0;
+        && matches!(
+            leg.requests[0].pieces.get(0),
+            Some(dolly_channel::transport::TransportPiece::Asset {
+                ordinal: 0,
+                view: Some(bounds),
+                ..
+            }) if bounds.left() == 1
+                && bounds.top() == 0
+                && bounds.right() == 3
+                && bounds.bottom() == 2
+        );
     if leg.report.transported == 1 && materialized {
         return;
     }
