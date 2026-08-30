@@ -1640,11 +1640,11 @@ fn prepare_media_returns_only_authoritative_inspected_metadata() {
         byte_length: png.len() as u64,
         declared_media_type: Some("image/png".to_string()),
         detected_media_type: Some("image/png".to_string()),
-        orientation: Some(6),
+        orientation: Some(1),
         encoded_width: Some(12),
         encoded_height: Some(20),
-        display_width: Some(20),
-        display_height: Some(12),
+        display_width: Some(12),
+        display_height: Some(20),
         lifecycle: Lifecycle::Live,
         deletion_generation: 0,
         local_state: LocalState::Present,
@@ -1668,11 +1668,11 @@ fn prepare_media_returns_only_authoritative_inspected_metadata() {
         .unwrap();
     assert_eq!(prepared.asset_ref.media_type.as_str(), "image/png");
     assert_eq!(prepared.asset_ref.byte_length, png.len() as u64);
-    assert_eq!(prepared.asset_ref.orientation, Some(6));
+    assert_eq!(prepared.asset_ref.orientation, Some(1));
     assert_eq!(prepared.asset_ref.encoded_width, Some(12));
     assert_eq!(prepared.asset_ref.encoded_height, Some(20));
-    assert_eq!(prepared.asset_ref.display_width, Some(20));
-    assert_eq!(prepared.asset_ref.display_height, Some(12));
+    assert_eq!(prepared.asset_ref.display_width, Some(12));
+    assert_eq!(prepared.asset_ref.display_height, Some(20));
     assert!(prepared.asset_ref.validate().is_ok());
 }
 
@@ -2169,5 +2169,140 @@ fn prepare_media_revalidation_after_read_revokes_and_returns_no_result() {
         err.code,
         AssetErrorCode::LeaseInvalid,
         "revocation after the read fails the whole preparation before release"
+    );
+}
+
+#[test]
+fn prepare_media_succeeds_for_file_kind_octet_stream_without_claims() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = TestClock::new(T0);
+    let (mut service, mut clock) = service_at(dir.path(), clock);
+    let capability = cap(&service);
+    // Unrecognized binary: no signature the bounded reader can prove, so the
+    // authoritative kind is File and claims are optional.
+    let blob: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
+    let (asset_id, _asset_ref) = seed_live_asset(&mut service, &mut clock, "personal", &blob, None);
+    let lease = service
+        .lease(&capability, asset_id.as_str(), "instance-a", "channel-send", 60_000)
+        .unwrap();
+    let prepared = service
+        .prepare_media(&capability, &prepare_request(asset_id, MediaKind::File, None, lease.lease_id))
+        .unwrap();
+    assert_eq!(prepared.media_kind, MediaKind::File, "unrecognized content is File, never relabeled");
+    assert_eq!(prepared.asset_ref.media_type.as_str(), "application/octet-stream");
+    assert_eq!(prepared.bytes, blob, "exact verified bytes");
+}
+
+#[test]
+fn prepare_media_refuses_content_not_matching_its_recorded_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = TestClock::new(T0);
+    let (mut service, mut clock) = service_at(dir.path(), clock);
+    let capability = cap(&service);
+    // A durable row that claims image/png but whose exact bytes are not a
+    // PNG: malformed content claiming a supported MIME MUST be refused even
+    // though the digest binds and the lease is current.
+    let garbage = b"this is not a png although the record says image/png";
+    let digest = ContentHash::of_bytes(garbage);
+    let asset_id = AssetId::from_digest(digest.digest);
+    let objects = service.config_ro().local_root.join("objects");
+    fs::create_dir_all(&objects).unwrap();
+    fs::write(objects.join(asset_id.as_str()), garbage).unwrap();
+    let now = clock.now();
+    let record = AssetRecord {
+        asset_id: asset_id.as_str().to_string(),
+        security_domain: "personal".to_string(),
+        generation: 0,
+        content_hash: digest,
+        byte_length: garbage.len() as u64,
+        declared_media_type: Some("image/png".to_string()),
+        detected_media_type: Some("image/png".to_string()),
+        orientation: Some(1),
+        encoded_width: Some(4),
+        encoded_height: Some(2),
+        display_width: Some(4),
+        display_height: Some(2),
+        lifecycle: Lifecycle::Live,
+        deletion_generation: 0,
+        local_state: LocalState::Present,
+        replica_state: ReplicaState::Disabled,
+        tombstoned_at: None,
+        created_at: now.iso(),
+        updated_at: now.iso(),
+        updated_at_ms: now.millis,
+    };
+    let tx = service.store_transaction().unwrap();
+    tx.insert_asset(&record, now).unwrap();
+    tx.commit().unwrap();
+    let lease = service
+        .lease(&capability, asset_id.as_str(), "instance-a", "channel-send", 60_000)
+        .unwrap();
+    let err = service
+        .prepare_media(
+            &capability,
+            &prepare_request(asset_id, MediaKind::Image, Some("image/png"), lease.lease_id),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.code,
+        AssetErrorCode::MediaTypeMismatch,
+        "malformed content claiming a supported MIME is refused before release"
+    );
+}
+
+#[test]
+fn prepare_media_refuses_dimension_abuse_at_effect_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = TestClock::new(T0);
+    let (mut service, mut clock) = service_at(dir.path(), clock);
+    let capability = cap(&service);
+    // A syntactically valid PNG header declaring 2000x2000 pixels (4M) while
+    // the configured bound admits at most 1M: dimension abuse must fail
+    // closed at preparation time with no bytes released.
+    let huge = png_bytes(2000, 2000);
+    let digest = ContentHash::of_bytes(&huge);
+    let asset_id = AssetId::from_digest(digest.digest);
+    let objects = service.config_ro().local_root.join("objects");
+    fs::create_dir_all(&objects).unwrap();
+    fs::write(objects.join(asset_id.as_str()), &huge).unwrap();
+    let now = clock.now();
+    let record = AssetRecord {
+        asset_id: asset_id.as_str().to_string(),
+        security_domain: "personal".to_string(),
+        generation: 0,
+        content_hash: digest,
+        byte_length: huge.len() as u64,
+        declared_media_type: Some("image/png".to_string()),
+        detected_media_type: Some("image/png".to_string()),
+        orientation: Some(1),
+        encoded_width: Some(2000),
+        encoded_height: Some(2000),
+        display_width: Some(2000),
+        display_height: Some(2000),
+        lifecycle: Lifecycle::Live,
+        deletion_generation: 0,
+        local_state: LocalState::Present,
+        replica_state: ReplicaState::Disabled,
+        tombstoned_at: None,
+        created_at: now.iso(),
+        updated_at: now.iso(),
+        updated_at_ms: now.millis,
+    };
+    let tx = service.store_transaction().unwrap();
+    tx.insert_asset(&record, now).unwrap();
+    tx.commit().unwrap();
+    let lease = service
+        .lease(&capability, asset_id.as_str(), "instance-a", "channel-send", 60_000)
+        .unwrap();
+    let err = service
+        .prepare_media(
+            &capability,
+            &prepare_request(asset_id, MediaKind::Image, Some("image/png"), lease.lease_id),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.code,
+        AssetErrorCode::UnsafeMedia,
+        "dimension abuse beyond the configured pixel bound fails closed"
     );
 }

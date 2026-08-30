@@ -14,7 +14,8 @@ use crate::error::{AssetError, AssetErrorCode, ErrorPhase};
 use crate::gc::{self, GcReport};
 use crate::pipeline::{ImportPipeline, RecoveryReport, validate_request};
 use crate::prepare::{
-    MediaPrepareRequest, PreparedMedia, PrepareFailpoint, media_kind_of_type, read_and_verify,
+    MediaPrepareRequest, PreparedMedia, PrepareFailpoint, media_kind_of_type,
+    read_and_verify,  verify_content_consistency,
     validate_prepare_authority,
 };
 use crate::record::{
@@ -654,6 +655,15 @@ impl AssetService {
             tx.commit().map_err(store_error_public)?;
             authority
         };
+
+        // Phase 4: re-prove the recorded type, dimensions, and orientation
+        // against the content the bounded reader can check, under the
+        // current configuration bounds, immediately before release.
+        verify_content_consistency(
+            &bytes,
+            &revalidated.asset,
+            self.config.max_image_pixels,
+        )?;
 
         Ok(PreparedMedia {
             asset_ref: revalidated.canonical_ref,

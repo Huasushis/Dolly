@@ -317,6 +317,75 @@ pub(crate) fn read_and_verify(
     Ok(bytes)
 }
 
+
+/// Re-prove the authoritative content metadata against the bytes the
+/// existing bounded reader can check, and apply the current configuration
+/// bounds at effect time. For a row that recorded a supported MIME type, the
+/// content head MUST sniff to exactly that type (malformed content claiming a
+/// supported MIME is refused), the inspected dimensions MUST match the stored
+/// values, and image pixel counts MUST stay inside the configured
+/// `max_image_pixels` bound. Rows recorded as unrecognized octet streams have
+/// no provable signature and pass through.
+pub(crate) fn verify_content_consistency(
+    bytes: &[u8],
+    asset: &AssetRecord,
+    max_pixels: u64,
+) -> Result<(), AssetError> {
+    let Some(recorded) = asset.detected_media_type.as_deref() else {
+        // Unrecognized content: nothing the bounded reader can prove.
+        return Ok(());
+    };
+    let head = &bytes[..bytes.len().min(crate::media::SNIFF_HEAD_BYTES)];
+    let probe = crate::media::probe_media_head(head, max_pixels).map_err(|e| {
+        AssetError::new(
+            AssetErrorCode::UnsafeMedia,
+            ErrorPhase::Verify,
+            format!("content fails bounded metadata bounds: {}", e.message),
+        )
+    })?;
+    let detected = probe.detected.ok_or_else(|| {
+        AssetError::new(
+            AssetErrorCode::MediaTypeMismatch,
+            ErrorPhase::Verify,
+            "content does not match its recorded supported media type".to_string(),
+        )
+    })?;
+    if detected.as_str() != recorded {
+        return Err(AssetError::new(
+            AssetErrorCode::MediaTypeMismatch,
+            ErrorPhase::Verify,
+            format!("content sniffs as {detected} but the durable record says {recorded}"),
+        ));
+    }
+    if let Some(recorded_orientation) = asset.orientation {
+        if probe.orientation != recorded_orientation {
+            return Err(AssetError::new(
+                AssetErrorCode::UnsafeMedia,
+                ErrorPhase::Verify,
+                "content orientation does not match the durable record".to_string(),
+            ));
+        }
+    }
+    if let Some(recorded_width) = asset.encoded_width {
+        if probe.width != Some(recorded_width) {
+            return Err(AssetError::new(
+                AssetErrorCode::UnsafeMedia,
+                ErrorPhase::Verify,
+                "content width does not match the durable record".to_string(),
+            ));
+        }
+    }
+    if let Some(recorded_height) = asset.encoded_height {
+        if probe.height != Some(recorded_height) {
+            return Err(AssetError::new(
+                AssetErrorCode::UnsafeMedia,
+                ErrorPhase::Verify,
+                "content height does not match the durable record".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
 fn store_error(error: crate::store::StoreError) -> AssetError {
     AssetError::new(
         AssetErrorCode::Internal,
