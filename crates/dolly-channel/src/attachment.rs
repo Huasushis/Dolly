@@ -121,6 +121,10 @@ impl AttachmentImportRequest {
 pub enum AttachmentImportStatus {
     /// The import is in progress; the Channel persists `pending`.
     Pending,
+    /// Authoritative Asset status: this exact `attachment_key` has no durable
+    /// import record or effect. Only the Runtime Asset adapter may report
+    /// this; Channel errors are never converted to `Absent`.
+    Absent,
     /// The asset is AVAILABLE under the correct owner/domain.
     Available(AvailableAttachment),
     /// The import was refused; the event fails explicitly.
@@ -139,8 +143,8 @@ pub trait InboundAssetImport {
         request: &AttachmentImportRequest,
     ) -> Result<AttachmentImportStatus, ChannelError>;
 
-    /// The exact status of one previously-requested import (recovery path;
-    /// never re-imports blindly).
+    /// The exact status of one previously-requested import. `Absent` alone
+    /// authorizes Channel to replay this same request/key during recovery.
     fn status(
         &mut self,
         request: &AttachmentImportRequest,

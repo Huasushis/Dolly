@@ -31,6 +31,10 @@ use tempfile::tempdir;
 struct ScriptedAssetImport {
     import_script: Vec<AttachmentImportStatus>,
     status_script: Vec<(String, AttachmentImportStatus)>,
+    /// One-shot transient failures keyed by provider identity. Failures do not
+    /// consume the corresponding result script, modeling no durable effect.
+    import_failures: Vec<String>,
+    status_failures: Vec<String>,
     imports: Arc<Mutex<Vec<AttachmentImportRequest>>>,
     statuses: Arc<Mutex<Vec<AttachmentImportRequest>>>,
 }
@@ -54,6 +58,12 @@ impl ScriptedAssetImport {
     }
     fn imports(&self) -> Vec<AttachmentImportRequest> {
         self.imports
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+    fn statuses(&self) -> Vec<AttachmentImportRequest> {
+        self.statuses
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone()
@@ -95,6 +105,16 @@ impl InboundAssetImport for ScriptedAssetImport {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .push(request.clone());
+        if let Some(index) = self
+            .import_failures
+            .iter()
+            .position(|provider_key| provider_key == &request.provider_key)
+        {
+            self.import_failures.remove(index);
+            return Err(transient_asset_error(
+                "import transport failed before record creation",
+            ));
+        }
         if self.import_script.is_empty() {
             return Err(dolly_channel::ChannelError::new(
                 dolly_channel::error::codes::INTERNAL,
@@ -114,6 +134,16 @@ impl InboundAssetImport for ScriptedAssetImport {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .push(request.clone());
+        if let Some(index) = self
+            .status_failures
+            .iter()
+            .position(|provider_key| provider_key == &request.provider_key)
+        {
+            self.status_failures.remove(index);
+            return Err(transient_asset_error(
+                "Asset status transport is unavailable",
+            ));
+        }
         let pos = self
             .status_script
             .iter()
@@ -128,6 +158,15 @@ impl InboundAssetImport for ScriptedAssetImport {
             )),
         }
     }
+}
+
+fn transient_asset_error(message: &str) -> dolly_channel::ChannelError {
+    dolly_channel::ChannelError::new(
+        dolly_channel::error::codes::INTERNAL,
+        true,
+        dolly_channel::ChannelOutcome::Unknown,
+        message,
+    )
 }
 
 /// The WP-013B multimodal channel config (text + asset accepted) used by the
@@ -901,4 +940,234 @@ fn text_only_events_are_unchanged_under_the_asset_seam() {
     assert_eq!(parts.len(), 1);
     assert_eq!(parts[0]["kind"], "text");
     assert_eq!(parts[0]["text"], "Hi");
+}
+
+#[test]
+fn absent_status_replays_exact_key_once_and_duplicate_recovery_does_not_reimport() {
+    let mut harness = RuntimeHarness::new("multi-absent-replay");
+    let dir = tempdir().unwrap();
+    let (mut conn, _path) = channel_store_connection(dir.path());
+    let principal = principal_of(&harness);
+    let event = sealed_attachments(
+        &harness.authority,
+        &harness.grant,
+        "conv-1",
+        "msg-absent",
+        "Recovered:",
+        vec![attachment(0, "pk-absent", "image/png")],
+    );
+    let seam = ScriptedAssetImport {
+        import_script: vec![available(
+            "image/png",
+            "ast_b3_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )],
+        status_script: vec![("pk-absent".to_string(), AttachmentImportStatus::Absent)],
+        import_failures: vec!["pk-absent".to_string()],
+        ..Default::default()
+    };
+    let store = SqliteChannelStore::new(&mut conn, &principal, 1).unwrap();
+    let inner = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+    let mut receiver = InboundReceiver::with_asset_import_on_store(
+        multimodal_channel_config(),
+        Box::new(channel_clock()),
+        store,
+        inner,
+        Box::new(seam.clone()),
+        &harness.authority,
+        &harness.grant,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        receiver.ingest_event(&event),
+        IngressOutcome::SubmissionPending
+    ));
+    assert_eq!(receiver.reconcile().unwrap(), 0);
+    let calls_after_success = (seam.imports(), seam.statuses());
+    assert_eq!(receiver.reconcile().unwrap(), 0);
+    assert_eq!(seam.imports(), calls_after_success.0);
+    assert_eq!(seam.statuses(), calls_after_success.1);
+    assert_eq!(calls_after_success.0.len(), 2);
+    assert_eq!(calls_after_success.1.len(), 1);
+    assert_eq!(
+        calls_after_success.0[0], calls_after_success.0[1],
+        "Absent replays the byte-identical request and exact idempotency key"
+    );
+    assert_eq!(calls_after_success.1[0], calls_after_success.0[0]);
+    drop(receiver);
+    assert_eq!(harness.operation_count(), 1, "one Core effect");
+}
+
+#[test]
+fn absent_replay_refusal_is_durable_terminal_rejection() {
+    let mut harness = RuntimeHarness::new("multi-absent-refusal");
+    let dir = tempdir().unwrap();
+    let (mut conn, _path) = channel_store_connection(dir.path());
+    let principal = principal_of(&harness);
+    let event = sealed_attachments(
+        &harness.authority,
+        &harness.grant,
+        "conv-1",
+        "msg-absent-refused",
+        "Refused:",
+        vec![attachment(0, "pk-refused-replay", "image/png")],
+    );
+    let seam = ScriptedAssetImport {
+        import_script: vec![AttachmentImportStatus::Refused {
+            code: "CHANNEL_ASSET_IMPORT_FAILED".to_string(),
+        }],
+        status_script: vec![(
+            "pk-refused-replay".to_string(),
+            AttachmentImportStatus::Absent,
+        )],
+        import_failures: vec!["pk-refused-replay".to_string()],
+        ..Default::default()
+    };
+    let store = SqliteChannelStore::new(&mut conn, &principal, 1).unwrap();
+    let inner = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+    let mut receiver = InboundReceiver::with_asset_import_on_store(
+        multimodal_channel_config(),
+        Box::new(channel_clock()),
+        store,
+        inner,
+        Box::new(seam.clone()),
+        &harness.authority,
+        &harness.grant,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        receiver.ingest_event(&event),
+        IngressOutcome::SubmissionPending
+    ));
+    assert_eq!(receiver.reconcile().unwrap(), 0);
+    drop(receiver);
+    let account = account(&harness.authority, &harness.grant);
+    let mut store = SqliteChannelStore::new(&mut conn, &principal, 1).unwrap();
+    let intent = store
+        .find_intent(&dolly_channel::ids::inbound_ingress_key(
+            &account,
+            "msg-absent-refused",
+        ))
+        .unwrap()
+        .expect("durable refusal");
+    assert_eq!(intent.state, dolly_channel::IntentState::Rejected);
+    assert_eq!(
+        intent.rejected_code.as_deref(),
+        Some("CHANNEL_ASSET_IMPORT_FAILED")
+    );
+    assert_eq!(seam.imports().len(), 2);
+    assert_eq!(seam.imports()[0], seam.imports()[1]);
+    assert_eq!(harness.operation_count(), 0);
+}
+
+#[test]
+fn transient_status_error_retries_later_without_truncating_ordered_records() {
+    let mut harness = RuntimeHarness::new("multi-transient-status");
+    let dir = tempdir().unwrap();
+    let (mut conn, path) = channel_store_connection(dir.path());
+    let principal = principal_of(&harness);
+    let event = sealed_attachments(
+        &harness.authority,
+        &harness.grant,
+        "conv-1",
+        "msg-transient-status",
+        "Ordered:",
+        vec![
+            attachment(0, "pk-first", "image/png"),
+            attachment(1, "pk-later", "audio/mpeg"),
+        ],
+    );
+    let seam = ScriptedAssetImport {
+        // First import fails without consuming. The later record succeeds,
+        // then the exact-key replay consumes the remaining first result.
+        import_script: vec![
+            available(
+                "audio/mpeg",
+                "ast_b3_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbq",
+            ),
+            available(
+                "image/png",
+                "ast_b3_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        ],
+        status_script: vec![("pk-first".to_string(), AttachmentImportStatus::Absent)],
+        import_failures: vec!["pk-first".to_string()],
+        status_failures: vec!["pk-first".to_string()],
+        ..Default::default()
+    };
+    let store = SqliteChannelStore::new(&mut conn, &principal, 1).unwrap();
+    let inner = SqliteHostIngressStore::new(&mut harness.connection).unwrap();
+    let mut receiver = InboundReceiver::with_asset_import_on_store(
+        multimodal_channel_config(),
+        Box::new(channel_clock()),
+        store,
+        inner,
+        Box::new(seam.clone()),
+        &harness.authority,
+        &harness.grant,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        receiver.ingest_event(&event),
+        IngressOutcome::SubmissionPending
+    ));
+    assert_eq!(receiver.reconcile().unwrap(), 1);
+    let account = account(&harness.authority, &harness.grant);
+    let mut inspect_connection = Connection::open(&path).unwrap();
+    let mut inspect_store =
+        SqliteChannelStore::new(&mut inspect_connection, &principal, 1).unwrap();
+    let intent = inspect_store
+        .find_intent(&dolly_channel::ids::inbound_ingress_key(
+            &account,
+            "msg-transient-status",
+        ))
+        .unwrap()
+        .expect("durable pending intent");
+    assert_eq!(
+        intent
+            .attachments
+            .iter()
+            .map(|record| record.state)
+            .collect::<Vec<_>>(),
+        vec![AttachmentState::Pending, AttachmentState::Available],
+        "transient first status never truncates the later available record"
+    );
+    drop(inspect_store);
+    drop(inspect_connection);
+    assert_eq!(receiver.reconcile().unwrap(), 0);
+    let calls_after_success = (seam.imports(), seam.statuses());
+    assert_eq!(receiver.reconcile().unwrap(), 0);
+    assert_eq!(seam.imports(), calls_after_success.0);
+    assert_eq!(seam.statuses(), calls_after_success.1);
+    assert_eq!(
+        calls_after_success
+            .0
+            .iter()
+            .map(|request| request.provider_key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["pk-first", "pk-later", "pk-first"]
+    );
+    assert_eq!(calls_after_success.0[0], calls_after_success.0[2]);
+    assert_eq!(
+        calls_after_success
+            .1
+            .iter()
+            .map(|request| request.provider_key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["pk-first", "pk-first"]
+    );
+    drop(receiver);
+    let parts = committed_parts(&mut harness, "msg-transient-status");
+    assert_eq!(parts.len(), 3);
+    assert_eq!(
+        parts[1]["asset_id"],
+        "ast_b3_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    assert_eq!(
+        parts[2]["asset_id"],
+        "ast_b3_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbq"
+    );
+    assert_eq!(harness.operation_count(), 1);
 }

@@ -689,8 +689,8 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
     }
 
     /// Durably persist one `assets_pending` event as a `prepared` intent
-    /// carrying its attachment import records, so recovery (never a blind
-    /// re-import) can resume through the injected seam's status.
+    /// carrying its attachment import records, so recovery status-queries the
+    /// exact key and replays import only after authoritative `Absent`.
     fn persist_attachment_prepared_intent(
         &mut self,
         principal: &ChannelPrincipal,
@@ -760,7 +760,7 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
 
     /// Reconcile every durable `prepared` intent through status first with no
     /// event redelivery. Attachment intents use the same state machine as
-    /// initial import, switched to Asset status calls only.
+    /// initial import; only authoritative `Absent` permits exact-key replay.
     pub fn reconcile(&mut self) -> Result<usize, ChannelError> {
         let pending_keys: Vec<String> = self
             .store
@@ -776,9 +776,9 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
             };
             // WP-013B attachment recovery: a `prepared` intent carrying
             // attachment import records resumes through the injected seam's
-            // STATUS (never a blind re-import). A refusal is durable and
-            // explicit; when every required asset is AVAILABLE the final
-            // Asset-bearing draft is submitted and committed exactly once.
+            // STATUS. Only authoritative Absent permits an exact-key replay;
+            // refusal is durable and explicit. When every required asset is
+            // AVAILABLE the final Asset-bearing draft is committed once.
             if !intent.attachments.is_empty() {
                 if matches!(
                     self.resume_attachment_intent(intent, false)?,
@@ -896,12 +896,19 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
                         &intent.external_event_id,
                         &record.attachment,
                     );
-                    let status = if start_imports {
+                    // One status query and, only after authoritative Absent,
+                    // one exact-key import replay per attachment per
+                    // reconciliation pass. This bounds each retry pass and
+                    // never converts an adapter error into Absent.
+                    let result = if start_imports {
                         self.assets.import(&request)
                     } else {
-                        self.assets.status(&request)
+                        match self.assets.status(&request) {
+                            Ok(AttachmentImportStatus::Absent) => self.assets.import(&request),
+                            status => status,
+                        }
                     };
-                    match status {
+                    match result {
                         Ok(AttachmentImportStatus::Available(available)) => {
                             match crate::attachment::validate_available_attachment(
                                 &record.attachment,
@@ -926,7 +933,11 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
                                 }
                             }
                         }
-                        Ok(AttachmentImportStatus::Pending) | Err(_) => {
+                        Ok(AttachmentImportStatus::Pending)
+                        | Ok(AttachmentImportStatus::Absent)
+                        | Err(ChannelError {
+                            retryable: true, ..
+                        }) => {
                             resolved_records.push(record.clone());
                         }
                         Ok(AttachmentImportStatus::Refused { code }) => {
@@ -935,6 +946,16 @@ impl<'conn, 'principal, H: HostIngress> InboundReceiver<'conn, 'principal, H> {
                             } else {
                                 code
                             };
+                            first_refusal.get_or_insert_with(|| code.clone());
+                            resolved_records.push(AttachmentRecord {
+                                attachment: record.attachment.clone(),
+                                state: AttachmentState::Refused,
+                                available: None,
+                                refused_code: Some(code),
+                            });
+                        }
+                        Err(error) => {
+                            let code = error.code;
                             first_refusal.get_or_insert_with(|| code.clone());
                             resolved_records.push(AttachmentRecord {
                                 attachment: record.attachment.clone(),
