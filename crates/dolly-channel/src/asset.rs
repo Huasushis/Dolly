@@ -73,14 +73,55 @@ pub struct AssetPremise {
     pub view: Option<CropRect>,
 }
 
-/// An opaque short-lease proof minted by the injected [`AssetPreparation`]
-/// seam. The Channel persists it with the durable outbound record and hands
-/// it to the injected transport seam, and never interprets its content.
+/// A typed short-lease proof minted by the injected [`AssetPreparation`]
+/// seam. It carries only the canonical metadata the Channel may enforce —
+/// the authoritative detected media type and byte length for the configured
+/// outbound media bounds — plus an opaque adapter-owned proof value. It
+/// never carries a raw path, store identity, or caller authority. The
+/// Channel persists it with the durable outbound record and hands it to the
+/// injected transport seam, and never reads asset bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssetLeaseProof {
-    /// Integrator-owned opaque proof value (for example a lease id and
-    /// generation). The Channel never reads its fields.
+    /// Integrator-minted short-lease identifier.
+    pub lease_id: String,
+    /// The authoritative detected media type from the Asset record. It MUST
+    /// equal the committed Action's declared `media_type`; a mismatch is a
+    /// forged media label and fails the whole send before dispatch.
+    pub media_type: String,
+    /// The authoritative byte length of the asset, enforced against the
+    /// configured outbound media size bound.
+    pub byte_length: u64,
+    /// Opaque adapter-owned proof value (for example an access/read handle
+    /// for the transport seam). The Channel never interprets its fields.
     pub value: serde_json::Value,
+}
+
+/// Verify one injected lease proof against its frozen premise and the
+/// configured outbound media bounds. A mismatched authoritative detected
+/// media type (forged media label), an empty lease identifier, or an
+/// over-bounds byte length fails the whole send before any durable or
+/// transport effect.
+pub(crate) fn validate_prepared_asset(
+    premise: &AssetPremise,
+    proof: &AssetLeaseProof,
+    max_asset_bytes: usize,
+) -> Result<(), String> {
+    if premise.media_type != proof.media_type {
+        return Err(format!(
+            "the authoritative detected media type is {} but the committed Action declares {}",
+            proof.media_type, premise.media_type
+        ));
+    }
+    if proof.lease_id.is_empty() {
+        return Err("the prepared lease has no identifier".to_string());
+    }
+    if proof.byte_length > max_asset_bytes as u64 {
+        return Err(format!(
+            "the authoritative byte length {} exceeds the configured maximum {} bytes",
+            proof.byte_length, max_asset_bytes
+        ));
+    }
+    Ok(())
 }
 
 /// The asset part of one authorized send: the frozen premise plus the lease

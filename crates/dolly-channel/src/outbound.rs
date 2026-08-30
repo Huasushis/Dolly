@@ -411,14 +411,26 @@ pub(crate) fn authorize_send(
                 });
             }
             "asset" => {
-                // WP-013B: ordered multimodal premise. Only this committed
-                // targeted-Action path may build an asset premise; the frozen
-                // schema already validated a canonical `asset_id`/`media_type`
-                // and the crop range, and this boundary additionally enforces
-                // the canonical forms and the crop invariants (`x0 < x1`,
-                // `y0 < y1`) the JSON Schema cannot express. The premise is
-                // prepared (lease-proofed) below by the injected seam before
-                // any durable prepared row or transport effect.
+                // WP-013B modality policy: asset parts are admitted only
+                // when the configured accepted modalities include "asset";
+                // otherwise they are refused fail-closed before any durable
+                // or transport effect. The premise remains an ordered
+                // multimodal premise of this committed targeted-Action path;
+                // the frozen schema already validated a canonical
+                // `asset_id`/`media_type` and the crop range, and this
+                // boundary additionally enforces the canonical forms and the
+                // crop invariants (`x0 < x1`, `y0 < y1`) the JSON Schema
+                // cannot express. The premise is prepared (lease-proofed)
+                // below by the injected seam before any durable prepared row
+                // or transport effect.
+                if !config.accepted_modalities.contains("asset") {
+                    return Err(ChannelError::new(
+                        codes::UNSUPPORTED_MODALITY,
+                        false,
+                        ChannelOutcome::NotApplied,
+                        "asset parts require the 'asset' accepted modality (WP-013B channel multimodal profile)",
+                    ));
+                }
                 premises.push(crate::asset::parse_asset_premise(
                     ordinal as u32,
                     part,
@@ -465,6 +477,18 @@ pub(crate) fn authorize_send(
             ));
         }
         for (premise, proof) in premises.into_iter().zip(proofs) {
+            crate::asset::validate_prepared_asset(&premise, &proof, config.max_asset_bytes)
+                .map_err(|message| {
+                    ChannelError::new(
+                        codes::MALFORMED_EVENT,
+                        false,
+                        ChannelOutcome::NotApplied,
+                        format!(
+                            "asset part at ordinal {} is refused: {message}",
+                            premise.ordinal
+                        ),
+                    )
+                })?;
             let piece = pieces
                 .iter_mut()
                 .find(|piece| piece.ordinal == premise.ordinal)

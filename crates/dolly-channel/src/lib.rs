@@ -1,10 +1,15 @@
-//! `org.dolly.channel` v1 — text ingress and outbound effect ledger.
+//! `org.dolly.channel` v1 — text ingress and outbound effect ledger, plus the
+//! WP-013B ordered multimodal asset-premise profile.
 //!
 //! This crate is the production module for the built-in Channel package. It
 //! owns the account-scoped inbound ledger (transport event -> Block draft ->
 //! durable Core ingress premise), the outbound effect ledger for
 //! `org.dolly.channel.send` (prepared/dispatched/confirmed/partial/failed/
-//! unknown), and the frozen semantic result validator. The decision pipeline
+//! unknown), and the frozen semantic result validator. Ordered multimodal
+//! sends parse ordered Core `Part` asset premises from the committed targeted
+//! Action, require the injected [`asset::AssetPreparation`] seam to prove
+//! each asset under the Channel authority and mint a typed short-lease proof,
+//! and revalidate those leases at every blocking fence. The decision pipeline
 //! performs no transport, network, or storage I/O: those enter through the
 //! injected [`CoreIngress`], [`ChannelTransport`], and storage-agnostic
 //! [`ChannelLedger`] boundaries, so every decision is deterministic and
@@ -13,9 +18,10 @@
 //! pipeline to the accepted `HostIngress` / storage seams.
 //!
 //! The Channel never appends directly to a Page, never mints a Block or Asset
-//! ID, never exposes management privileges to conversation users, and never
-//! lets a send re-enter Dolly as an inbound user message (echoed outbound IDs
-//! are suppressed by the inbound ledger).
+//! ID, never reimplements Asset authority, never accepts a raw path or byte
+//! buffer as authority, never exposes management privileges to conversation
+//! users, and never lets a send re-enter Dolly as an inbound user message
+//! (echoed outbound IDs are suppressed by the inbound ledger).
 
 pub mod clock;
 pub mod asset;

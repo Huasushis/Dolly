@@ -2448,23 +2448,35 @@ fn generic_ingress_without_manifest_cannot_mint_send_authority() {
 }
 
 /// Injected AssetPreparation seam test double for the production consumer.
-/// Shares its recorded premises and refusal via an Arc so the test can
-/// observe exactly what the sealed consumer requested (premise direction).
+/// Shares its recorded premises, revalidation calls, and refusal via an Arc
+/// so the test can observe exactly what the sealed consumer requested
+/// (premise direction) and race lease invalidation at each fence.
 #[derive(Clone, Default)]
 struct RefusingAssetPreparation {
     refuse_code: Option<String>,
+    /// Fail lease revalidation (deterministically): after the given call
+    /// number when non-zero, or on every call when zero.
+    fail_revalidate_at_call: usize,
     inner: std::sync::Arc<std::sync::Mutex<RefusingInner>>,
 }
 
 #[derive(Default)]
 struct RefusingInner {
     prepared: Vec<AssetPremise>,
+    revalidated: Vec<AssetLeaseProof>,
+    revalidate_calls: usize,
 }
 
 impl RefusingAssetPreparation {
     fn refusing(code: &str) -> Self {
         Self {
             refuse_code: Some(code.to_string()),
+            ..Self::default()
+        }
+    }
+    fn failing_revalidation(at_call: usize) -> Self {
+        Self {
+            fail_revalidate_at_call: at_call,
             ..Self::default()
         }
     }
@@ -2497,7 +2509,10 @@ impl AssetPreparation for RefusingAssetPreparation {
             None => Ok(premises
                 .iter()
                 .map(|premise| AssetLeaseProof {
-                    value: json!({ "lease_id": format!("lease-{}", premise.ordinal) }),
+                    lease_id: format!("lease-{}", premise.ordinal),
+                    media_type: premise.media_type.clone(),
+                    byte_length: 1000,
+                    value: json!({ "grant": format!("grant-{}", premise.ordinal) }),
                 })
                 .collect()),
         }
@@ -2505,8 +2520,26 @@ impl AssetPreparation for RefusingAssetPreparation {
 
     fn revalidate_leases(
         &mut self,
-        _proofs: &[AssetLeaseProof],
+        proofs: &[AssetLeaseProof],
     ) -> Result<(), dolly_channel::ChannelError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        inner.revalidated.extend_from_slice(proofs);
+        inner.revalidate_calls += 1;
+        // 0 = never fail (default accepting seam); a positive value fails
+        // from that call onward, deterministically.
+        if self.fail_revalidate_at_call > 0
+            && inner.revalidate_calls >= self.fail_revalidate_at_call
+        {
+            return Err(dolly_channel::ChannelError::new(
+                codes::AUTHORIZATION_FAILED,
+                false,
+                ChannelOutcome::NotApplied,
+                "asset lease invalidated after blocking work",
+            ));
+        }
         Ok(())
     }
 }
@@ -2536,7 +2569,8 @@ fn targeted_asset_send_refused_by_injected_seam_yields_frozen_rejected_with_zero
     const ASSET_ID: &str = "ast_b3_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let mut fixture = setup("consumer-asset-refuse");
     let action_id = "0198ab31-6c44-7e8a-b2bb-000000000840";
-    commit_block(
+    let config = multimodal_channel_config();
+    commit_block_with_config(
         &mut fixture.harness,
         "consumer-asset-refuse",
         "ing-1",
@@ -2551,11 +2585,11 @@ fn targeted_asset_send_refused_by_injected_seam_yields_frozen_rejected_with_zero
             ]),
         ),
         vec!["page-c".to_string()],
+        config.clone(),
     );
     let transport = SharedTransport::new(true);
     let assets = RefusingAssetPreparation::refusing(codes::ASSET_IMPORT_FAILED);
     let mut module_conn = reopen_module_store(&fixture);
-    let config = channel_config();
     let gate = OutboundQueueGate::register(
         &config,
         &mut module_conn,
@@ -2564,7 +2598,7 @@ fn targeted_asset_send_refused_by_injected_seam_yields_frozen_rejected_with_zero
     )
     .unwrap();
     let mut consumer = OutboundConsumer::with_asset_preparation(
-        config,
+        config.clone(),
         Box::new(channel_clock()),
         &mut module_conn,
         &mut fixture.harness.connection,
@@ -2687,4 +2721,410 @@ fn targeted_asset_send_is_never_silently_dropped_by_the_production_consumer() {
         );
         drop(consumer);
     }
+}
+
+/// The WP-013B multimodal channel config used to commit and consume
+/// asset-part sends through the real harness (the manifest effective_config
+/// and the consumer config must be byte-equal).
+fn multimodal_channel_config() -> dolly_channel::ChannelConfig {
+    dolly_channel::ChannelConfigBuilder::new("web", "account-a", MODULE_ID, 1)
+        .accepted_modalities(&["text", "asset"])
+        .target_pages(&["page-a"])
+        .build()
+}
+
+fn multimodal_send_block(
+    action_id: &str,
+    session_id: &str,
+    texts: &[&str],
+) -> (Value, &'static str) {
+    let parts = json!([
+        { "kind": "text", "text": texts[0], "format": "plain" },
+        {
+            "kind": "asset",
+            "asset_id": "ast_b3_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "media_type": "image/png"
+        }
+    ]);
+    let block = send_block_with_asset_parts(MODULE_ID, action_id, session_id, parts);
+    (block, "ast_b3_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+}
+
+#[test]
+fn multimodal_dispatched_row_settles_status_first_with_durable_echo() {
+    let mut fixture = setup("multimodal-status-first");
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000842";
+    let config = multimodal_channel_config();
+    let (block, asset_id) = multimodal_send_block(action_id, &fixture.session, &["Look."]);
+    commit_block_with_config(
+        &mut fixture.harness,
+        "multimodal-status-first",
+        "ing-1",
+        &format!("{action_id}-block"),
+        block,
+        vec!["page-c".to_string()],
+        config.clone(),
+    );
+    // Phase A: the transport response is lost -> durable Dispatched, no
+    // fabricated terminal, no fabricated failure, ordered multimodal pieces
+    // persisted.
+    let transport = SharedTransport::new(true);
+    transport.push(TransportSendResult::Timeout);
+    let mut module_conn = reopen_module_store(&fixture);
+    let gate = OutboundQueueGate::register(
+        &config,
+        &mut module_conn,
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .unwrap();
+    let mut consumer = OutboundConsumer::with_asset_preparation(
+        config.clone(),
+        Box::new(channel_clock()),
+        &mut module_conn,
+        &mut fixture.harness.connection,
+        gate.clone(),
+        Box::new(transport.clone()),
+        Box::new(RefusingAssetPreparation::default()),
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .expect("consumer");
+    let outcomes = consumer.consume(&far_deadline()).expect("consume");
+    assert_eq!(outcomes.len(), 1);
+    assert!(matches!(
+        outcomes[0],
+        dolly_channel::ConsumerOutcome::Pending { .. }
+    ));
+    assert_eq!(transport.calls().len(), 1, "one send attempt");
+    drop(consumer);
+    let mut store = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
+    let record = store.find_outbound(action_id).unwrap().expect("durable row");
+    assert_eq!(record.entry.state, OutboundState::Dispatched);
+    assert_eq!(record.entry.pieces.len(), 2);
+    assert_eq!(
+        record.entry.pieces[1].asset.as_ref().unwrap().premise.asset_id,
+        asset_id,
+        "ordered asset premise persisted"
+    );
+    assert_eq!(
+        record.entry.pieces[1].asset.as_ref().unwrap().lease_proof.lease_id,
+        "lease-1"
+    );
+    drop(store);
+
+    // Phase B: status-first recovery calls the transport status (never a
+    // blind resend) and settles terminal + echo in the single Channel DB
+    // transaction.
+    transport.push_status(
+        action_id,
+        dolly_channel::transport::TransportStatusResult::Confirmed {
+            message_ids: vec!["ms-0".to_string(), "ms-1".to_string()],
+        },
+    );
+    let mut recover = OutboundConsumer::with_asset_preparation(
+        config.clone(),
+        Box::new(channel_clock()),
+        &mut module_conn,
+        &mut fixture.harness.connection,
+        gate,
+        Box::new(transport.clone()),
+        Box::new(RefusingAssetPreparation::default()),
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .expect("recovery consumer");
+    let remaining = recover.reconcile().expect("reconcile");
+    assert_eq!(remaining, 0, "status settled the row");
+    drop(recover);
+    assert_eq!(transport.status_calls().len(), 1);
+    assert_eq!(transport.status_calls()[0].action_id, action_id);
+    assert_eq!(transport.calls().len(), 1, "never a blind resend");
+    let mut settled = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
+    let terminal = settled.find_outbound(action_id).unwrap().expect("settled row");
+    assert_eq!(terminal.entry.state, OutboundState::Confirmed);
+    assert!(terminal.entry.result_jcs.is_some());
+    assert!(
+        settled
+            .is_echo(&fixture.account, "ms-1")
+            .expect("echo check"),
+        "echo marker atomic with the terminal result"
+    );
+}
+
+#[test]
+fn multimodal_lease_invalidation_after_queue_wait_fails_closed() {
+    let mut fixture = setup("multimodal-lease-queue");
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000843";
+    let config = multimodal_channel_config();
+    let (block, _) = multimodal_send_block(action_id, &fixture.session, &["Look."]);
+    commit_block_with_config(
+        &mut fixture.harness,
+        "multimodal-lease-queue",
+        "ing-1",
+        &format!("{action_id}-block"),
+        block,
+        vec!["page-c".to_string()],
+        config.clone(),
+    );
+    let transport = SharedTransport::new(true);
+    transport.push(TransportSendResult::AllConfirmed {
+        message_ids: vec!["must-not-send-0".to_string(), "must-not-send-1".to_string()],
+    });
+    let mut module_conn = reopen_module_store(&fixture);
+    let gate = OutboundQueueGate::register(
+        &config,
+        &mut module_conn,
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .unwrap();
+    // Lease revalidation fails at the first fence: immediately after the
+    // queue wait, before any send.
+    let mut consumer = OutboundConsumer::with_asset_preparation(
+        config.clone(),
+        Box::new(channel_clock()),
+        &mut module_conn,
+        &mut fixture.harness.connection,
+        gate,
+        Box::new(transport.clone()),
+        Box::new(RefusingAssetPreparation::failing_revalidation(1)),
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .expect("consumer");
+    let error = consumer.consume(&far_deadline()).expect_err("lease fence");
+    assert_eq!(error.code, codes::AUTHORIZATION_FAILED);
+    assert_eq!(transport.calls().len(), 0, "zero transport effect");
+    drop(consumer);
+    let mut store = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
+    let record = store.find_outbound(action_id).unwrap().expect("durable row");
+    assert_eq!(
+        record.entry.state,
+        OutboundState::Queued,
+        "admitted but never dispatched"
+    );
+    assert!(
+        store.list_pending_outbound().unwrap().len() == 1,
+        "the row stays pending for a later pass with refreshed leases"
+    );
+}
+
+#[test]
+fn multimodal_lease_invalidation_after_dispatch_cas_fails_closed() {
+    let mut fixture = setup("multimodal-lease-cas");
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000844";
+    let config = multimodal_channel_config();
+    let (block, _) = multimodal_send_block(action_id, &fixture.session, &["Look."]);
+    commit_block_with_config(
+        &mut fixture.harness,
+        "multimodal-lease-cas",
+        "ing-1",
+        &format!("{action_id}-block"),
+        block,
+        vec!["page-c".to_string()],
+        config.clone(),
+    );
+    let transport = SharedTransport::new(true);
+    transport.push(TransportSendResult::AllConfirmed {
+        message_ids: vec!["must-not-send-0".to_string(), "must-not-send-1".to_string()],
+    });
+    let mut module_conn = reopen_module_store(&fixture);
+    let gate = OutboundQueueGate::register(
+        &config,
+        &mut module_conn,
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .unwrap();
+    // The queue-wait fence passes (call 1); the dispatch-CAS fence (call 2)
+    // fails immediately before the transport send.
+    let mut consumer = OutboundConsumer::with_asset_preparation(
+        config.clone(),
+        Box::new(channel_clock()),
+        &mut module_conn,
+        &mut fixture.harness.connection,
+        gate,
+        Box::new(transport.clone()),
+        Box::new(RefusingAssetPreparation::failing_revalidation(2)),
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .expect("consumer");
+    let error = consumer.consume(&far_deadline()).expect_err("lease fence");
+    assert_eq!(error.code, codes::AUTHORIZATION_FAILED);
+    assert_eq!(transport.calls().len(), 0, "zero transport effect");
+    drop(consumer);
+    let mut store = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
+    let record = store.find_outbound(action_id).unwrap().expect("durable row");
+    assert_eq!(
+        record.entry.state,
+        OutboundState::Dispatched,
+        "the dispatch CAS marked the row Dispatched; status-first recovery owns it"
+    );
+}
+
+#[test]
+fn multimodal_lease_invalidation_skips_status_recovery_with_no_effect() {
+    let mut fixture = setup("multimodal-lease-recover");
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000845";
+    let config = multimodal_channel_config();
+    let (block, _) = multimodal_send_block(action_id, &fixture.session, &["Look."]);
+    commit_block_with_config(
+        &mut fixture.harness,
+        "multimodal-lease-recover",
+        "ing-1",
+        &format!("{action_id}-block"),
+        block,
+        vec!["page-c".to_string()],
+        config.clone(),
+    );
+    // Phase A: lost response -> durable Dispatched multimodal row.
+    let transport = SharedTransport::new(true);
+    transport.push(TransportSendResult::Timeout);
+    let mut module_conn = reopen_module_store(&fixture);
+    let gate = OutboundQueueGate::register(
+        &config,
+        &mut module_conn,
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .unwrap();
+    let mut consumer = OutboundConsumer::with_asset_preparation(
+        config.clone(),
+        Box::new(channel_clock()),
+        &mut module_conn,
+        &mut fixture.harness.connection,
+        gate.clone(),
+        Box::new(transport.clone()),
+        Box::new(RefusingAssetPreparation::default()),
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .expect("consumer");
+    let outcomes = consumer.consume(&far_deadline()).expect("consume");
+    assert!(matches!(
+        outcomes[0],
+        dolly_channel::ConsumerOutcome::Pending { .. }
+    ));
+    drop(consumer);
+    // Phase B: the prepared leases are no longer live, so recovery must NOT
+    // status-query, settle, or mutate the row (fail closed, no fabricated
+    // outcome, no blind resend).
+    let mut recover = OutboundConsumer::with_asset_preparation(
+        config.clone(),
+        Box::new(channel_clock()),
+        &mut module_conn,
+        &mut fixture.harness.connection,
+        gate,
+        Box::new(transport.clone()),
+        Box::new(RefusingAssetPreparation::failing_revalidation(1)),
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .expect("recovery consumer");
+    let remaining = recover.reconcile().expect("reconcile");
+    assert!(remaining >= 1, "the row stays unresolved");
+    drop(recover);
+    assert_eq!(
+        transport.status_calls().len(),
+        0,
+        "no status query when the lease is invalidated"
+    );
+    let mut store = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
+    let record = store.find_outbound(action_id).unwrap().expect("durable row");
+    assert_eq!(record.entry.state, OutboundState::Dispatched);
+}
+
+#[test]
+fn multimodal_lease_invalidation_before_terminal_commit_leaves_row_for_status_recovery() {
+    let mut fixture = setup("multimodal-lease-terminal");
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000846";
+    let config = multimodal_channel_config();
+    let (block, _) = multimodal_send_block(action_id, &fixture.session, &["Look."]);
+    commit_block_with_config(
+        &mut fixture.harness,
+        "multimodal-lease-terminal",
+        "ing-1",
+        &format!("{action_id}-block"),
+        block,
+        vec!["page-c".to_string()],
+        config.clone(),
+    );
+    // Phase A: queue-wait (call 1) and dispatch-CAS (call 2) fences pass and
+    // the transport confirms, but the terminal-commit fence (call 3) fails:
+    // the settled row stays durably Dispatched instead of committing a
+    // terminal-without-authority result or a (wrong) echo.
+    let transport = SharedTransport::new(true);
+    transport.push(TransportSendResult::AllConfirmed {
+        message_ids: vec!["tc-0".to_string(), "tc-1".to_string()],
+    });
+    let mut module_conn = reopen_module_store(&fixture);
+    let gate = OutboundQueueGate::register(
+        &config,
+        &mut module_conn,
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .unwrap();
+    let mut consumer = OutboundConsumer::with_asset_preparation(
+        config.clone(),
+        Box::new(channel_clock()),
+        &mut module_conn,
+        &mut fixture.harness.connection,
+        gate.clone(),
+        Box::new(transport.clone()),
+        Box::new(RefusingAssetPreparation::failing_revalidation(3)),
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .expect("consumer");
+    let outcomes = consumer.consume(&far_deadline()).expect("consume");
+    assert_eq!(outcomes.len(), 1);
+    assert!(
+        matches!(outcomes[0], dolly_channel::ConsumerOutcome::Pending { .. }),
+        "no fabricated terminal after the terminal-commit lease fence"
+    );
+    assert_eq!(transport.calls().len(), 1, "the transport did send");
+    drop(consumer);
+    let mut store = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
+    let record = store.find_outbound(action_id).unwrap().expect("durable row");
+    assert_eq!(
+        record.entry.state,
+        OutboundState::Dispatched,
+        "terminal withheld; no echo committed"
+    );
+    drop(store);
+    // Phase B: with refreshed leases, status-first recovery settles the row
+    // and commits terminal + echo deterministically.
+    transport.push_status(
+        action_id,
+        dolly_channel::transport::TransportStatusResult::Confirmed {
+            message_ids: vec!["tc-0".to_string(), "tc-1".to_string()],
+        },
+    );
+    let mut recover = OutboundConsumer::with_asset_preparation(
+        config.clone(),
+        Box::new(channel_clock()),
+        &mut module_conn,
+        &mut fixture.harness.connection,
+        gate,
+        Box::new(transport.clone()),
+        Box::new(RefusingAssetPreparation::default()),
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .expect("recovery consumer");
+    let remaining = recover.reconcile().expect("reconcile");
+    assert_eq!(remaining, 0);
+    drop(recover);
+    let mut settled = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
+    let terminal = settled.find_outbound(action_id).unwrap().expect("settled row");
+    assert_eq!(terminal.entry.state, OutboundState::Confirmed);
+    assert!(
+        settled
+            .is_echo(&fixture.account, "tc-1")
+            .expect("echo check"),
+        "echo marker atomic with the recovered terminal result"
+    );
 }

@@ -25,6 +25,9 @@ pub const SEND_ACTION_NAME: &str = "org.dolly.channel.send";
 /// permits at most 262144 octets per text part.
 pub const MAX_PARTS: usize = 32;
 pub const MAX_TEXT_BYTES: usize = 262_144;
+/// Largest outbound asset byte length a Channel send may carry (mirrors the
+/// default Asset Service encoded-byte bound).
+pub const MAX_ASSET_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_EXTERNAL_ID_BYTES: usize = 512;
 pub const MAX_SEND_RESULT_MESSAGES: usize = 32;
 pub const MAX_CONCURRENT_ATTEMPTS: usize = 64;
@@ -116,12 +119,18 @@ pub struct ChannelConfig {
     pub transport_account: String,
     /// Whether external events are accepted at all.
     pub ingress_enabled: bool,
-    /// Accepted input modalities; v1 accepts only `text`.
+    /// Accepted input modalities: the frozen v1 default is exactly `{text}`;
+    /// the WP-013B multimodal profile adds `asset`. The set gates asset
+    /// parts fail-closed at the committed-Action boundary.
     pub accepted_modalities: BTreeSet<String>,
     /// Maximum text octets per inbound event text part.
     pub max_text_bytes: usize,
     /// Maximum parts per inbound event.
     pub max_parts: usize,
+    /// Maximum outbound asset byte length one prepared Asset may carry
+    /// (WP-013B media size bound).
+    #[serde(default = "default_max_asset_bytes")]
+    pub max_asset_bytes: usize,
     /// Session mapping policy for new conversations.
     pub session_mapping_policy: SessionMappingPolicy,
     /// If present, the only senders permitted to deliver inbound events.
@@ -143,6 +152,12 @@ pub struct ChannelConfig {
     pub target_page_ids: Vec<String>,
     /// Deadlines for `host.ingress.*` and outbound calls, relative seconds.
     pub operation_deadline_seconds: u64,
+}
+
+/// The default outbound asset byte bound (serde default for config documents
+/// that predate the WP-013B profile).
+fn default_max_asset_bytes() -> usize {
+    MAX_ASSET_BYTES
 }
 
 impl ChannelConfig {
@@ -186,12 +201,29 @@ impl ChannelConfig {
                 self.max_text_bytes
             )));
         }
-        // Lock v1 modality set to exactly {text}; asset ground is a WP-013B
-        // capability and is rejected before dispatch.
+        if self.max_asset_bytes == 0 || self.max_asset_bytes > MAX_ASSET_BYTES {
+            return Err(invalid(&format!(
+                "channel config max_asset_bytes must be in 1..={MAX_ASSET_BYTES}, got {}",
+                self.max_asset_bytes
+            )));
+        }
+        // Modality policy: `text` is always required and the only optional
+        // addition is `asset` (the WP-013B multimodal profile). The frozen
+        // v1 default is exactly {text}; unknown modalities are rejected.
+        // The accepted set gates asset parts fail-closed at the committed
+        // Action boundary (never at Config time alone).
         let modalities = std::mem::take(&mut self.accepted_modalities);
-        if modalities != BTreeSet::from(["text".to_string()]) {
+        if !modalities.contains("text")
+            || modalities
+                .difference(&BTreeSet::from([
+                    "text".to_string(),
+                    "asset".to_string(),
+                ]))
+                .next()
+                .is_some()
+        {
             return Err(invalid(
-                "channel v1 accepted_modalities must be exactly {\"text\"}",
+                "channel accepted_modalities must contain {\"text\"} and may add only {\"asset\"}",
             ));
         }
         self.accepted_modalities = modalities;
@@ -283,6 +315,7 @@ impl ChannelConfigBuilder {
                 accepted_modalities: BTreeSet::from(["text".to_string()]),
                 max_text_bytes: 64 * 1024,
                 max_parts: MAX_PARTS,
+                max_asset_bytes: MAX_ASSET_BYTES,
                 session_mapping_policy: SessionMappingPolicy::CreateOnFirstMessage,
                 allowed_senders: None,
                 allowed_conversations: None,
@@ -314,6 +347,18 @@ impl ChannelConfigBuilder {
 
     pub fn ingress_enabled(mut self, enabled: bool) -> Self {
         self.config.ingress_enabled = enabled;
+        self
+    }
+    pub fn accepted_modalities(mut self, modalities: &[&str]) -> Self {
+        self.config.accepted_modalities = modalities
+            .iter()
+            .map(|modality| modality.to_string())
+            .collect::<BTreeSet<_>>();
+        self
+    }
+
+    pub fn max_asset_bytes(mut self, bytes: usize) -> Self {
+        self.config.max_asset_bytes = bytes;
         self
     }
 
@@ -418,5 +463,54 @@ mod tests {
             ChannelConfigBuilder::new("web", "account-a", "web-channel", 1).build();
         config.accepted_modalities = BTreeSet::from(["asset".to_string()]);
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn multimodal_modality_policy() {
+        // The frozen v1 default is exactly {text}; the multimodal profile
+        // adds {asset}; text is always required and unknown modalities are
+        // rejected (build validates).
+        assert_eq!(
+            ChannelConfigBuilder::new("web", "account-a", "web-channel", 1)
+                .build()
+                .accepted_modalities,
+            BTreeSet::from(["text".to_string()])
+        );
+        let multimodal = ChannelConfigBuilder::new("web", "account-a", "web-channel", 1)
+            .accepted_modalities(&["text", "asset"])
+            .build();
+        assert_eq!(
+            multimodal.accepted_modalities,
+            BTreeSet::from(["text".to_string(), "asset".to_string()])
+        );
+        // An unknown modality (outside {text, asset}) is rejected by
+        // validation, even with text present.
+        let builder = ChannelConfigBuilder::new("web", "account-a", "web-channel", 1);
+        let mut unknown = builder.build();
+        unknown.accepted_modalities = BTreeSet::from(["text".to_string(), "image".to_string()]);
+        assert!(unknown.validate().is_err());
+    }
+
+    #[test]
+    fn asset_byte_bound_has_default_and_range() {
+        assert_eq!(
+            ChannelConfigBuilder::new("web", "account-a", "web-channel", 1)
+                .build()
+                .max_asset_bytes,
+            MAX_ASSET_BYTES
+        );
+        let mut too_small =
+            ChannelConfigBuilder::new("web", "account-a", "web-channel", 1).build();
+        too_small.max_asset_bytes = 0;
+        assert!(too_small.validate().is_err());
+        let mut too_large =
+            ChannelConfigBuilder::new("web", "account-a", "web-channel", 1).build();
+        too_large.max_asset_bytes = MAX_ASSET_BYTES + 1;
+        assert!(too_large.validate().is_err());
+        let bounded =
+            ChannelConfigBuilder::new("web", "account-a", "web-channel", 1)
+                .max_asset_bytes(100)
+                .build();
+        assert_eq!(bounded.max_asset_bytes, 100);
     }
 }
