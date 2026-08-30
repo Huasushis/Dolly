@@ -250,9 +250,9 @@
       "kind": "channel_multimodal_effect_authority",
       "expected": "pass",
       "baseline_observed": "product_red",
-      "target_behavior": "green is exactly the zero-effect authority refusal: the consumer reports a Rejected outcome with an asset-authority code (lease/availability/domain; never CHANNEL_UNSUPPORTED_MODALITY) while the transport sees zero calls and no durable outbound row or envelope is produced; a dispatch is NEVER green",
-      "seam": "the committed-Action consumer route (ChannelOutboundRoute::consume_once over the sealed OutboundConsumer) must, at effect time under the current ActivationManifest authority, consult the current AssetService authority (lease, ownership, availability, domain) for every asset part of a committed org.dolly.channel.send Action and refuse a stale/revoked/tombstoned AssetRef with a fail-closed asset code before any transport effect, durable outbound row, or success envelope",
-      "causal_red": "the frozen channel-send arguments schema already admits an {\"kind\":\"asset\"} Part (embedded-schema-catalog.json channel-send.schema.json over the common Part def), but dolly-channel outbound.rs authorize_send rejects every asset part with CHANNEL_UNSUPPORTED_MODALITY and outbound_committed.rs CommittedSendAction::from_manifest_input propagates that error into committed_targeted_actions' if-let-Ok silent skip, so a committed Action carrying a tombstoned (stale/revoked) AssetRef is dropped with NO asset-authority refusal outcome, NO durable outbound row, and ZERO transport calls",
+      "target_behavior": "the committed send is settled as the ONE durable pre-provider-effect terminal Failed ActionResult: result:null, code CHANNEL_ASSET_IMPORT_FAILED, retryable:false, outcome:not_applied, delivery_outcome:not_sent, with no Dispatched marker, zero transport requests, and runtime transported 0 (rejected/failed accounting per contract). Green exactly when one Terminal Failed ActionResult with those fields is observed, the transport saw zero requests, and the runtime reported transported 0; any dispatch or untracked row is not green.",
+      "seam": "effect-time AssetPart authority over the route-owned Asset store/lease: a stale/unavailable/revoked AssetRef is prepared-fail-closed as a durable pre-provider-effect terminal Failed ActionResult before any transport effect, durable Dispatched marker, or success envelope.",
+      "causal_red": "on the accepted base before integration the outbound asset preparation seam was absent (asset parts were dropped at the profile boundary), so the exact pre-provider-effect terminal Failed envelope could not be produced; the integrated seam now freezes it.",
       "references": [
         "crates/dolly-channel/src/outbound.rs::authorize_send asset-part WP-013B seam",
         "crates/dolly-channel/src/outbound_committed.rs::CommittedSendAction::from_manifest_input",
@@ -260,8 +260,9 @@
         "crates/dolly-runtime/src/host_routes.rs::ChannelOutboundRoute::consume_once",
         "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_stale_assetref_refused_at_effect_time"
       ],
-      "pass_basis": "a committed org.dolly.channel.send Action whose AssetRef is stale/revoked/tombstoned is refused at effect time by a fail-closed asset-authority code (lease/availability/domain) before any transport effect, durable outbound row, or success envelope",
-      "assertion": "commit a send Action whose AssetRef is tombstoned (stale/revoked), drive it through the committed-Action consumer route, and require the observed result to be a fail-closed asset-authority refusal before any transport effect (pass when such an authoritative outcome is observed)"
+      "pass_basis": "the committed send is settled as the ONE durable pre-provider-effect terminal Failed ActionResult: result:null, code CHANNEL_ASSET_IMPORT_FAILED, retryable:false, outcome:not_applied, delivery_outcome:not_sent, with no Dispatched marker, zero transport requests, and runtime transported 0 (rejected/failed accounting per contract) for an AssetRef that is not AVAILABLE under the route authority (unavailable/stale/revoked); a dispatch is never the target.",
+      "assertion": "commit a send Action whose AssetRef is not AVAILABLE under the route authority, drive it through the with-assets consumer route, and require exactly the durable pre-provider-effect terminal Failed envelope with no transport effect.",
+      "setup": "setup: ChannelConfig accepted_modalities exactly {text,asset} with the byte-identical canonical effective_config/config_revision persisted in the active ActivationManifest and the same config used in ChannelOutboundRoute registration/consumer; the exact register_with_assets / open_channel_inbound_route_with_assets / ProviderAttachmentReader seams over ONE shared Asset root/service/capability under the same extension/module/connection/account authority; every test Asset is created/imported/leased through that same registered route (route-owned Asset IDs/leases, no separate AssetService or manual foreign lease)"
     },
     {
       "id": "WP013B-MIXED-ORDER-001",
@@ -278,7 +279,8 @@
         "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_mixed_text_asset_ordering"
       ],
       "pass_basis": "mixed text and asset Parts of a committed org.dolly.channel.send Action reach the transport as one ordered piece array with contiguous ordinals preserving the committed order, each asset piece authorized under a current lease",
-      "assertion": "commit a send Action with mixed text/asset/text Parts, drive it through the consumer route, and require the observed result to dispatch the ordered piece array with contiguous ordinals to the transport (pass when any dispatch is observed)"
+      "assertion": "commit a send Action with mixed text/asset/text Parts, drive it through the consumer route, and require the observed result to dispatch the ordered piece array with contiguous ordinals to the transport (pass when any dispatch is observed)",
+      "setup": "setup: ChannelConfig accepted_modalities exactly {text,asset} with the byte-identical canonical effective_config/config_revision persisted in the active ActivationManifest and the same config used in ChannelOutboundRoute registration/consumer; the exact register_with_assets / open_channel_inbound_route_with_assets / ProviderAttachmentReader seams over ONE shared Asset root/service/capability under the same extension/module/connection/account authority; every test Asset is created/imported/leased through that same registered route (route-owned Asset IDs/leases, no separate AssetService or manual foreign lease)"
     },
     {
       "id": "WP013B-MEDIA-ABUSE-SEND-001",
@@ -286,16 +288,17 @@
       "kind": "channel_multimodal_media_abuse",
       "expected": "pass",
       "baseline_observed": "product_red",
-      "target_behavior": "green is the exact fail-closed detected-type refusal: a Rejected outcome whose code is the asset media-authority code (MEDIA_TYPE_MISMATCH class) with outcome not_applied, zero transport effect, and the size/type bounds intact; a dispatch is NEVER green",
-      "seam": "before dispatch the Channel MUST apply the Core AssetPart authorization with the authoritative detected media type: an action-declared media_type that overrides or contradicts the detected type of the AVAILABLE asset (or unsafe active content) is refused with a fail-closed asset code, never re-labeled, never trusted as an override",
-      "causal_red": "the send path has no detected-type/safe-view authority: authorize_send rejects every asset part at the profile seam and the Action is silently dropped, so an action declaring image/jpeg for a detected image/png AssetRef is neither refused by a media authority nor corrected to the authoritative type — the abuse gate is absent",
+      "target_behavior": "the committed send is settled as the ONE durable pre-provider-effect terminal Failed ActionResult: result:null, code CHANNEL_ASSET_IMPORT_FAILED, retryable:false, outcome:not_applied, delivery_outcome:not_sent, with no Dispatched marker, zero transport requests, and runtime transported 0 (rejected/failed accounting per contract). Green exactly when one Terminal Failed ActionResult with those fields is observed for the forged/overriding media claim, zero transport requests, runtime transported 0; a dispatch is never green. Structural/noncanonical input (pre-admission) stays a distinct Rejected and is never conflated.",
+      "seam": "authoritative detected-media-type authority at effect time: the asset preparation seam treats the action media_type as a check, not a label; an image/jpeg claim over detected image/png content is refused fail-closed with the exact pre-provider-effect terminal envelope.",
+      "causal_red": "on the accepted base before integration the send path had no detected-type authority and asset parts were dropped at the profile boundary, so the override could neither be refused by a media authority nor frozen as the exact pre-provider-effect terminal envelope; the integrated seam now freezes it.",
       "references": [
         "crates/dolly-channel/src/outbound.rs::authorize_send asset-part WP-013B seam",
         "crates/dolly-asset/src/media.rs::validate_declared_media authoritative detection",
         "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_media_abuse_refused_at_effect_time"
       ],
-      "pass_basis": "the effect-time asset authority applies the authoritative detected media type: a forged or overriding action media_type (or unsafe active content) is refused before dispatch and never re-labels content",
-      "assertion": "commit a send Action declaring image/jpeg over a detected image/png AssetRef, drive it through the consumer route, and require an authoritative asset/media outcome (refusal by detected type or dispatch; pass when observed)"
+      "pass_basis": "the committed send is settled as the ONE durable pre-provider-effect terminal Failed ActionResult: result:null, code CHANNEL_ASSET_IMPORT_FAILED, retryable:false, outcome:not_applied, delivery_outcome:not_sent, with no Dispatched marker, zero transport requests, and runtime transported 0 (rejected/failed accounting per contract) when the action-declared media type contradicts the asset's authoritative detected type (canonical image/jpeg claim over detected image/png content): the asset authority refuses before any provider effect, never relabels, and applies the configured size/type bounds.",
+      "assertion": "commit a send Action declaring image/jpeg whose authoritative Asset content/type is image/png, drive it through the with-assets consumer route, and require exactly the durable pre-provider-effect terminal Failed envelope with zero transport effect.",
+      "setup": "setup: ChannelConfig accepted_modalities exactly {text,asset} with the byte-identical canonical effective_config/config_revision persisted in the active ActivationManifest and the same config used in ChannelOutboundRoute registration/consumer; the exact register_with_assets / open_channel_inbound_route_with_assets / ProviderAttachmentReader seams over ONE shared Asset root/service/capability under the same extension/module/connection/account authority; every test Asset is created/imported/leased through that same registered route (route-owned Asset IDs/leases, no separate AssetService or manual foreign lease)"
     },
     {
       "id": "WP013B-CROP-VIEW-001",
@@ -312,7 +315,8 @@
         "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_view_crop_checked_at_effect_time"
       ],
       "pass_basis": "a schema-valid normalized view/crop of an AVAILABLE asset is materialized at dispatch against the authoritative prepared display width/height/orientation with the frozen rounding; an empty or out-of-range crop is refused by a geometry authority",
-      "assertion": "assert the shared schema crop rules and the frozen floor/ceil materialization against the authoritative 4x2 geometry, then drive a schema-valid-crop send and require an authoritative asset/media outcome at dispatch (pass when observed)"
+      "assertion": "assert the shared schema crop rules and the frozen floor/ceil materialization against the authoritative 4x2 geometry, then drive a schema-valid-crop send and require an authoritative asset/media outcome at dispatch (pass when observed)",
+      "setup": "setup: ChannelConfig accepted_modalities exactly {text,asset} with the byte-identical canonical effective_config/config_revision persisted in the active ActivationManifest and the same config used in ChannelOutboundRoute registration/consumer; the exact register_with_assets / open_channel_inbound_route_with_assets / ProviderAttachmentReader seams over ONE shared Asset root/service/capability under the same extension/module/connection/account authority; every test Asset is created/imported/leased through that same registered route (route-owned Asset IDs/leases, no separate AssetService or manual foreign lease)"
     },
     {
       "id": "WP013B-INBOUND-ATTACHMENT-001",
@@ -330,7 +334,8 @@
         "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_inbound_attachment_import"
       ],
       "pass_basis": "a Channel transport event carrying an attachment imports it through the Asset Service (host.asset import) and gates the inbound Block draft on every referenced asset being AVAILABLE (assets_pending) or represents failed attachments explicitly without a fabricated reference",
-      "assertion": "deliver a transport event through the inbound route and require an attachment-import / assets_pending gated outcome (pass when the committed draft is no longer a plain single text part)"
+      "assertion": "deliver a transport event through the inbound route and require an attachment-import / assets_pending gated outcome (pass when the committed draft is no longer a plain single text part)",
+      "setup": "setup: ChannelConfig accepted_modalities exactly {text,asset} with the byte-identical canonical effective_config/config_revision persisted in the active ActivationManifest and the same config used in ChannelOutboundRoute registration/consumer; the exact register_with_assets / open_channel_inbound_route_with_assets / ProviderAttachmentReader seams over ONE shared Asset root/service/capability under the same extension/module/connection/account authority; every test Asset is created/imported/leased through that same registered route (route-owned Asset IDs/leases, no separate AssetService or manual foreign lease)"
     },
     {
       "id": "WP013B-LEASE-RESTART-001",
@@ -347,7 +352,8 @@
         "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_lease_restart_recovery_absent"
       ],
       "pass_basis": "a dispatched multimodal send is recoverable across crash/restart status-first under its original ImportId and Asset lease — never re-minted, never blind-resent, never reported success while the outcome may be unknown",
-      "assertion": "commit an AssetRef send, run a crash-window pass and a status-first restart pass, and require a durable multimodal row recoverable under the original ImportId/lease (pass when a dispatch, status query, or recovered row is observed)"
+      "assertion": "commit an AssetRef send, run a crash-window pass and a status-first restart pass, and require a durable multimodal row recoverable under the original ImportId/lease (pass when a dispatch, status query, or recovered row is observed)",
+      "setup": "setup: ChannelConfig accepted_modalities exactly {text,asset} with the byte-identical canonical effective_config/config_revision persisted in the active ActivationManifest and the same config used in ChannelOutboundRoute registration/consumer; the exact register_with_assets / open_channel_inbound_route_with_assets / ProviderAttachmentReader seams over ONE shared Asset root/service/capability under the same extension/module/connection/account authority; every test Asset is created/imported/leased through that same registered route (route-owned Asset IDs/leases, no separate AssetService or manual foreign lease)"
     }
   ]
 }
