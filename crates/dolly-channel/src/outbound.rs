@@ -489,6 +489,21 @@ pub(crate) fn authorize_send(
                         ),
                     )
                 })?;
+            // Materialize the premised crop against the authoritative
+            // prepared display (shared crop module): an unsafe or
+            // out-of-bounds view fails the whole send before any durable or
+            // transport effect.
+            crate::asset::materialized_view(&premise, &proof).map_err(|message| {
+                ChannelError::new(
+                    codes::MALFORMED_EVENT,
+                    false,
+                    ChannelOutcome::NotApplied,
+                    format!(
+                        "asset part at ordinal {} is refused: {message}",
+                        premise.ordinal
+                    ),
+                )
+            })?;
             let piece = pieces
                 .iter_mut()
                 .find(|piece| piece.ordinal == premise.ordinal)
@@ -599,7 +614,15 @@ pub fn dispatch_send(
     // 6. Dispatch. When the transport has no idempotency key support the
     // `dispatched` marker MUST be durable before or atomically with send
     // initiation.
-    transport_and_settle(config, ledger, transport, &action.action_id, &now, idempotency_supported)
+    transport_and_settle(
+        config,
+        ledger,
+        transport,
+        assets,
+        &action.action_id,
+        &now,
+        idempotency_supported,
+    )
 }
 
 /// Crate-internal: build the durable ledger `Prepared` entry for one
@@ -648,6 +671,7 @@ pub(crate) fn transport_and_settle(
     config: &ChannelConfig,
     ledger: &mut ChannelLedger,
     transport: &mut dyn ChannelTransport,
+    assets: &mut dyn crate::asset::AssetPreparation,
     action_id: &str,
     now: &str,
     idempotency_supported: bool,
@@ -663,6 +687,47 @@ pub(crate) fn transport_and_settle(
             });
         }
     }
+    // Build the ordered transport pieces immediately before the send. Asset
+    // pieces fetch their EPHEMERAL, non-durable payload from the injected
+    // adapter at this exact boundary; the payload is never persisted and a
+    // lease/payload failure has zero transport effect.
+    let request_pieces = match ledger.outbound_entry(action_id) {
+        Some(entry) => {
+            let mut pieces = Vec::with_capacity(entry.pieces.len());
+            for piece in &entry.pieces {
+                let asset_payload = match &piece.asset {
+                    Some(prepared) => match assets.asset_payload(&prepared.lease_proof) {
+                        Ok(payload)
+                            if payload.bytes.len() as u64 <= config.max_asset_bytes as u64 =>
+                        {
+                            Some(payload)
+                        }
+                        Ok(_) => {
+                            return SendDispatchResult::Rejected(ChannelError::new(
+                                codes::MALFORMED_EVENT,
+                                false,
+                                ChannelOutcome::NotApplied,
+                                format!(
+                                    "asset payload at ordinal {} exceeds the configured maximum {} bytes",
+                                    piece.ordinal, config.max_asset_bytes
+                                ),
+                            ))
+                        }
+                        Err(error) => return SendDispatchResult::Rejected(error),
+                    },
+                    None => None,
+                };
+                pieces.push(TransportPiece {
+                    ordinal: piece.ordinal,
+                    text: piece.text.clone(),
+                    asset: piece.asset.clone(),
+                    asset_payload,
+                });
+            }
+            pieces
+        }
+        None => Vec::new(),
+    };
     let request = TransportSendRequest {
         action_id: action_id.to_string(),
         idempotency_key: ledger
@@ -672,19 +737,7 @@ pub(crate) fn transport_and_settle(
             .outbound_entry(action_id)
             .map(|e| e.session_id.clone())
             .unwrap_or_default(),
-        pieces: ledger
-            .outbound_entry(action_id)
-            .map(|e| {
-                e.pieces
-                    .iter()
-                    .map(|p| TransportPiece {
-                        ordinal: p.ordinal,
-                        text: p.text.clone(),
-                        asset: p.asset.clone(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
+        pieces: request_pieces,
     };
     let result = transport.send(&request);
     if idempotency_supported {

@@ -602,24 +602,6 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
         }
         Ok(())
     }
-    /// Re-validate the durable record's prepared asset leases (recovery
-    /// path). A row whose leases are no longer live fails closed: no status
-    /// query, no settle, and no terminal mutation on this pass.
-    fn revalidate_record_asset_leases(
-        &mut self,
-        record: &DurableOutboundRecord,
-    ) -> Result<(), ChannelError> {
-        let proofs: Vec<crate::asset::AssetLeaseProof> = record
-            .entry
-            .pieces
-            .iter()
-            .filter_map(|piece| piece.asset.as_ref().map(|asset| asset.lease_proof.clone()))
-            .collect();
-        if !proofs.is_empty() {
-            self.asset_preparation.revalidate_leases(&proofs)?;
-        }
-        Ok(())
-    }
 
     fn revalidate_durable_record(
         &mut self,
@@ -943,15 +925,11 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
             };
             self.effect_ts("before_status");
             self.revalidate_durable_record(&record)?;
-            // Lease fence at the status/recovery boundary: a multimodal row
-            // whose prepared leases are no longer live is NOT status-queried
-            // or settled this pass; it stays durably Dispatched (fail
-            // closed, zero status/terminal effect, never a fabricated
-            // outcome or blind resend).
-            if self.revalidate_record_asset_leases(&record).is_err() {
-                remaining += 1;
-                continue;
-            }
+            // Once a send may have occurred (the row is durably Dispatched),
+            // status query and terminal settlement MUST resolve the observed
+            // effect and NEVER block on Asset lease validity: status-first
+            // recovery does not reread or resend media and never leaves a
+            // row Dispatched indefinitely over a lease.
             let status = self.transport.status(&request);
             self.effect_ts("after_status");
             self.revalidate_durable_record(&record)?;
@@ -962,14 +940,6 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
             let terminal_record = self.build_terminal_record_from_entry(&record, &entry);
             self.effect_ts("before_terminal_commit");
             self.revalidate_durable_record(&record)?;
-            // Lease fence at the terminal-commit boundary: an invalidated
-            // lease leaves the settled row durably Dispatched for a later
-            // status-first pass instead of a terminal-without-authority
-            // commit.
-            if self.revalidate_record_asset_leases(&record).is_err() {
-                remaining += 1;
-                continue;
-            }
             self.store.commit_outbound_terminal(&terminal_record)?;
             self.gate.wake_all();
         }
@@ -1166,11 +1136,17 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                     &self.config,
                     ledger,
                     &mut *self.transport,
+                    &mut *self.asset_preparation,
                     &committed.action.action_id,
                     &now,
                     true,
                 );
                 match result {
+                    // A confirmed send has already had a transport effect; the
+                    // terminal result MUST resolve from the observed outcome.
+                    // Lease validity is NOT consulted here: status-first
+                    // recovery settles the row regardless, so no row ever
+                    // remains Dispatched indefinitely over a lease.
                     SendDispatchResult::Terminal { state, result } => {
                         let entry = ledger
                             .outbound_entry(&committed.action.action_id)
@@ -1179,15 +1155,6 @@ impl<'store, 'core, 'principal> OutboundConsumer<'store, 'core, 'principal> {
                         let record = self.build_terminal_record(committed, &entry);
                         self.effect_ts("before_terminal_commit");
                         self.revalidate_committed_action(committed)?;
-                        // Lease fence at the terminal-commit boundary: an
-                        // invalidated lease leaves the settled row durably
-                        // Dispatched for status-first recovery instead of
-                        // committing a terminal-without-authority result.
-                        if self.revalidate_asset_leases(committed).is_err() {
-                            return Ok(ConsumerOutcome::Pending {
-                                action_id: committed.action.action_id.clone(),
-                            });
-                        }
                         self.store.commit_outbound_terminal(&record)?;
                         // Terminal release frees durable occupancy; wake every
                         // waiting admission.

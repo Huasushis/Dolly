@@ -2510,12 +2510,26 @@ impl AssetPreparation for RefusingAssetPreparation {
                 .iter()
                 .map(|premise| AssetLeaseProof {
                     lease_id: format!("lease-{}", premise.ordinal),
+                    lease_expires_at: "2026-08-29T00:00:00.000000Z".to_string(),
+                    lease_generation: 1,
                     media_type: premise.media_type.clone(),
                     byte_length: 1000,
-                    value: json!({ "grant": format!("grant-{}", premise.ordinal) }),
+                    encoded_width: 1000,
+                    encoded_height: 500,
+                    orientation: 1,
+                    content_digest: format!("sha256:{:064}", premise.ordinal),
                 })
                 .collect()),
         }
+    }
+
+    fn asset_payload(
+        &mut self,
+        proof: &AssetLeaseProof,
+    ) -> Result<dolly_channel::asset::AssetPayload, dolly_channel::ChannelError> {
+        Ok(dolly_channel::asset::AssetPayload {
+            bytes: vec![0x55; proof.byte_length as usize],
+        })
     }
 
     fn revalidate_leases(
@@ -2964,22 +2978,27 @@ fn multimodal_lease_invalidation_after_dispatch_cas_fails_closed() {
     );
 }
 
+
 #[test]
-fn multimodal_lease_invalidation_skips_status_recovery_with_no_effect() {
-    let mut fixture = setup("multimodal-lease-recover");
-    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000845";
+fn multimodal_status_recovery_settles_despite_stale_lease() {
+    // Once a send may have occurred the row is durably Dispatched; status-
+    // first recovery and terminal+echo MUST resolve the observed effect and
+    // NEVER block on Asset lease validity. There is no indefinite Dispatched
+    // row and no reread/resend of media.
+    let mut fixture = setup("multimodal-status-stale");
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000847";
     let config = multimodal_channel_config();
     let (block, _) = multimodal_send_block(action_id, &fixture.session, &["Look."]);
     commit_block_with_config(
         &mut fixture.harness,
-        "multimodal-lease-recover",
+        "multimodal-status-stale",
         "ing-1",
         &format!("{action_id}-block"),
         block,
         vec!["page-c".to_string()],
         config.clone(),
     );
-    // Phase A: lost response -> durable Dispatched multimodal row.
+    // Phase A: the transport response is lost -> durable Dispatched.
     let transport = SharedTransport::new(true);
     transport.push(TransportSendResult::Timeout);
     let mut module_conn = reopen_module_store(&fixture);
@@ -3008,9 +3027,14 @@ fn multimodal_lease_invalidation_skips_status_recovery_with_no_effect() {
         dolly_channel::ConsumerOutcome::Pending { .. }
     ));
     drop(consumer);
-    // Phase B: the prepared leases are no longer live, so recovery must NOT
-    // status-query, settle, or mutate the row (fail closed, no fabricated
-    // outcome, no blind resend).
+    // Phase B: the prepared lease is now STALE (the seam fails revalidation),
+    // but recovery must still settle through the transport status.
+    transport.push_status(
+        action_id,
+        dolly_channel::transport::TransportStatusResult::Confirmed {
+            message_ids: vec!["stale-0".to_string(), "stale-1".to_string()],
+        },
+    );
     let mut recover = OutboundConsumer::with_asset_preparation(
         config.clone(),
         Box::new(channel_clock()),
@@ -3024,40 +3048,43 @@ fn multimodal_lease_invalidation_skips_status_recovery_with_no_effect() {
     )
     .expect("recovery consumer");
     let remaining = recover.reconcile().expect("reconcile");
-    assert!(remaining >= 1, "the row stays unresolved");
+    assert_eq!(remaining, 0, "no indefinite Dispatched row");
     drop(recover);
-    assert_eq!(
-        transport.status_calls().len(),
-        0,
-        "no status query when the lease is invalidated"
-    );
+    assert_eq!(transport.status_calls().len(), 1, "status is always queried");
+    assert_eq!(transport.calls().len(), 1, "no reread and no resend");
     let mut store = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
-    let record = store.find_outbound(action_id).unwrap().expect("durable row");
-    assert_eq!(record.entry.state, OutboundState::Dispatched);
+    let terminal = store.find_outbound(action_id).unwrap().expect("settled row");
+    assert_eq!(terminal.entry.state, OutboundState::Confirmed);
+    assert!(
+        store
+            .is_echo(&fixture.account, "stale-1")
+            .expect("echo check"),
+        "terminal+echo resolve regardless of lease validity"
+    );
 }
 
 #[test]
-fn multimodal_lease_invalidation_before_terminal_commit_leaves_row_for_status_recovery() {
-    let mut fixture = setup("multimodal-lease-terminal");
-    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000846";
+fn multimodal_confirmed_send_commits_terminal_after_lease_change() {
+    // A confirmed send already had its transport effect; the terminal result
+    // and echo MUST commit from the observed outcome even though the lease
+    // would fail on any later revalidation (no fabricated terminal, no second
+    // dispatcher, no indefinite Dispatched row).
+    let mut fixture = setup("multimodal-terminal-lease");
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000848";
     let config = multimodal_channel_config();
     let (block, _) = multimodal_send_block(action_id, &fixture.session, &["Look."]);
     commit_block_with_config(
         &mut fixture.harness,
-        "multimodal-lease-terminal",
+        "multimodal-terminal-lease",
         "ing-1",
         &format!("{action_id}-block"),
         block,
         vec!["page-c".to_string()],
         config.clone(),
     );
-    // Phase A: queue-wait (call 1) and dispatch-CAS (call 2) fences pass and
-    // the transport confirms, but the terminal-commit fence (call 3) fails:
-    // the settled row stays durably Dispatched instead of committing a
-    // terminal-without-authority result or a (wrong) echo.
     let transport = SharedTransport::new(true);
     transport.push(TransportSendResult::AllConfirmed {
-        message_ids: vec!["tc-0".to_string(), "tc-1".to_string()],
+        message_ids: vec!["tl-0".to_string(), "tl-1".to_string()],
     });
     let mut module_conn = reopen_module_store(&fixture);
     let gate = OutboundQueueGate::register(
@@ -3067,6 +3094,9 @@ fn multimodal_lease_invalidation_before_terminal_commit_leaves_row_for_status_re
         &fixture.harness.grant,
     )
     .unwrap();
+    // The seam fails ALL lease revalidation from its first call: the
+    // queue-wait fence refuses the pass with zero effect, proving the pre-
+    // send gate holds even when the terminal path would no longer consult it.
     let mut consumer = OutboundConsumer::with_asset_preparation(
         config.clone(),
         Box::new(channel_clock()),
@@ -3074,57 +3104,46 @@ fn multimodal_lease_invalidation_before_terminal_commit_leaves_row_for_status_re
         &mut fixture.harness.connection,
         gate.clone(),
         Box::new(transport.clone()),
-        Box::new(RefusingAssetPreparation::failing_revalidation(3)),
+        Box::new(RefusingAssetPreparation::failing_revalidation(1)),
         &fixture.harness.authority,
         &fixture.harness.grant,
     )
     .expect("consumer");
-    let outcomes = consumer.consume(&far_deadline()).expect("consume");
-    assert_eq!(outcomes.len(), 1);
-    assert!(
-        matches!(outcomes[0], dolly_channel::ConsumerOutcome::Pending { .. }),
-        "no fabricated terminal after the terminal-commit lease fence"
-    );
-    assert_eq!(transport.calls().len(), 1, "the transport did send");
+    let error = consumer.consume(&far_deadline()).expect_err("pre-send lease fence");
+    assert_eq!(error.code, codes::AUTHORIZATION_FAILED);
+    assert_eq!(transport.calls().len(), 0, "zero transport effect");
     drop(consumer);
-    let mut store = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
-    let record = store.find_outbound(action_id).unwrap().expect("durable row");
-    assert_eq!(
-        record.entry.state,
-        OutboundState::Dispatched,
-        "terminal withheld; no echo committed"
-    );
-    drop(store);
-    // Phase B: with refreshed leases, status-first recovery settles the row
-    // and commits terminal + echo deterministically.
-    transport.push_status(
-        action_id,
-        dolly_channel::transport::TransportStatusResult::Confirmed {
-            message_ids: vec!["tc-0".to_string(), "tc-1".to_string()],
-        },
-    );
-    let mut recover = OutboundConsumer::with_asset_preparation(
+
+    // With a healthy lease the send confirms and its terminal+echo commit
+    // atomically; a later pass never leaves the row Dispatched.
+    let mut healthy = OutboundConsumer::with_asset_preparation(
         config.clone(),
         Box::new(channel_clock()),
         &mut module_conn,
         &mut fixture.harness.connection,
-        gate,
+        gate.clone(),
         Box::new(transport.clone()),
         Box::new(RefusingAssetPreparation::default()),
         &fixture.harness.authority,
         &fixture.harness.grant,
     )
-    .expect("recovery consumer");
-    let remaining = recover.reconcile().expect("reconcile");
-    assert_eq!(remaining, 0);
-    drop(recover);
-    let mut settled = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
-    let terminal = settled.find_outbound(action_id).unwrap().expect("settled row");
+    .expect("healthy consumer");
+    let outcomes = healthy.consume(&far_deadline()).expect("consume");
+    assert!(matches!(
+        outcomes[0],
+        dolly_channel::ConsumerOutcome::Terminal { state: OutboundState::Confirmed, .. }
+    ));
+    assert_eq!(transport.calls().len(), 1, "one send");
+    let remaining = healthy.reconcile().expect("reconcile");
+    assert_eq!(remaining, 0, "no Indefinite Dispatched row");
+    drop(healthy);
+    let mut store = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
+    let terminal = store.find_outbound(action_id).unwrap().expect("settled row");
     assert_eq!(terminal.entry.state, OutboundState::Confirmed);
     assert!(
-        settled
-            .is_echo(&fixture.account, "tc-1")
+        store
+            .is_echo(&fixture.account, "tl-1")
             .expect("echo check"),
-        "echo marker atomic with the recovered terminal result"
+        "terminal+echo atomic from the observed outcome"
     );
 }

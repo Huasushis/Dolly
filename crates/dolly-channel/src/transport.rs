@@ -12,15 +12,19 @@
 //! never a blind resend or an age-to-unknown guess.
 
 /// One outbound piece handed to the transport: text, or a prepared asset
-/// (frozen premise plus the opaque short-lease proof minted by the injected
-/// Asset authority). The transport seam resolves asset bytes through that
-/// proof; the Channel never reads asset bytes and never re-encodes parts.
+/// (frozen premise plus the typed short-lease proof minted by the injected
+/// Asset authority and the EPHEMERAL, non-durable payload fetched immediately
+/// before this send). The Channel persists only the premise/proof; the
+/// payload exists solely for this transport call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportPiece {
     pub ordinal: u32,
     pub text: String,
     /// The prepared asset (asset pieces only). Absent for v1 text pieces.
     pub asset: Option<crate::asset::PreparedAsset>,
+    /// Ephemeral non-durable payload (asset pieces only), minted by the
+    /// injected adapter immediately before the transport effect.
+    pub asset_payload: Option<crate::asset::AssetPayload>,
 }
 
 /// The transport-facing send request.
