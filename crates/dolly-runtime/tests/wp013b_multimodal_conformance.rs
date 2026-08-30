@@ -53,7 +53,8 @@ use dolly_runtime::{
 };
 use dolly_channel::{
     ChannelConfig, ChannelConfigBuilder, ChannelEventContent, ConsumerOutcome, EventKind,
-    IngressOutcome, OutboundState, TransportSendResult, VirtualClock, parse_event,
+    IngressOutcome, OutboundState, SqliteChannelStore, TransportSendResult, VirtualClock,
+    parse_event,
 };
 use dolly_channel::asset::{MediaKind as ChannelMediaKind, MediaType as ChannelMediaType};
 use dolly_channel::attachment::InboundAttachment;
@@ -1236,6 +1237,61 @@ fn is_pre_effect_failed_not_sent(leg: &AssetLegReport) -> bool {
         && envelope["error"]["retryable"] == false
         && envelope["error"]["outcome"] == "not_applied"
         && envelope["error"]["details"]["delivery_outcome"] == "not_sent"
+}
+
+/// Durable-dispatch proof: read the exact route-owned Channel outbound row
+/// through the accepted test-support store seam bound to the same sealed
+/// module/account/store, and assert the row is terminal Failed and has NEVER
+/// durably entered Dispatched — no `dispatched_at`, no dispatch attempt/
+/// transition marker, and no transport status marker. A missing, ambiguous,
+/// or non-compliant row fails closed.
+fn prove_terminal_failed_never_dispatched(
+    module_store: &mut Connection,
+    authority: &HostConnectionAuthority,
+    grant: &HostCapabilityGrant,
+    config_revision: i64,
+    action_id: &str,
+) -> Result<(), String> {
+    let principal = dolly_channel::ChannelPrincipal::from_authority_grant(authority, grant)
+        .map_err(|error| format!("principal derivation failed: {}", error.code))?;
+    let mut store = SqliteChannelStore::new(module_store, &principal, config_revision)
+        .map_err(|error| format!("channel store open failed: {}", error.code))?;
+    let record = store
+        .find_outbound(action_id)
+        .map_err(|error| format!("outbound row lookup failed: {}", error.code))?
+        .ok_or_else(|| "no durable outbound row exists for the action".to_string())?;
+    if record.outbound_key != action_id {
+        return Err(format!(
+            "the durable outbound row key {} does not match the action {action_id}",
+            record.outbound_key
+        ));
+    }
+    let entry = &record.entry;
+    if entry.state != OutboundState::Failed {
+        return Err(format!(
+            "the durable outbound row state is {:?}, expected terminal Failed",
+            entry.state
+        ));
+    }
+    if entry.dispatched_at.is_some() {
+        return Err(format!(
+            "the durable outbound row carries a dispatch timestamp {:?}",
+            entry.dispatched_at
+        ));
+    }
+    let kinds: Vec<&str> = entry.attempts.iter().map(|attempt| attempt.kind.as_str()).collect();
+    if kinds.iter().any(|kind| *kind == "dispatch" || *kind == "dispatched") {
+        return Err(format!("the durable row records a dispatch attempt marker: {kinds:?}"));
+    }
+    if kinds.iter().any(|kind| *kind == "status" || *kind == "reconcile") {
+        return Err(format!("the durable row records a transport status marker: {kinds:?}"));
+    }
+    if !kinds.contains(&"pre-effect-rejection") {
+        return Err(format!(
+            "the durable row lacks the authoritative pre-effect-rejection record: {kinds:?}"
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2704,6 +2760,20 @@ fn wp013b_stale_assetref_refused_at_effect_time() {
         &clock,
     );
     if is_pre_effect_failed_not_sent(&leg) {
+        if let Err(evidence) = prove_terminal_failed_never_dispatched(
+            &mut module_store,
+            &authority,
+            &grant,
+            config.revision,
+            "0198ab31-6c44-7e8a-b2bb-000000000802",
+        ) {
+            product_red(
+                "WP013B-STALE-REF-EFFECT-001",
+                "durable dispatch-history proof (route-owned terminal Failed row)",
+                &evidence,
+                "channel_multimodal_effect_authority",
+            );
+        }
         return;
     }
     product_red(
@@ -2869,6 +2939,20 @@ fn wp013b_media_abuse_refused_at_effect_time() {
         &clock,
     );
     if is_pre_effect_failed_not_sent(&leg) {
+        if let Err(evidence) = prove_terminal_failed_never_dispatched(
+            &mut module_store,
+            &authority,
+            &grant,
+            config.revision,
+            "0198ab31-6c44-7e8a-b2bb-000000000814",
+        ) {
+            product_red(
+                "WP013B-MEDIA-ABUSE-SEND-001",
+                "durable dispatch-history proof (route-owned terminal Failed row)",
+                &evidence,
+                "channel_multimodal_effect_authority",
+            );
+        }
         return;
     }
     product_red(
