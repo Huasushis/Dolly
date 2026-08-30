@@ -985,12 +985,20 @@ fn text_control_pass(
     );
 }
 
-/// The observed real public-route result of one committed asset-part send.
-/// No verdict is asserted here; the caller compares it against the frozen
-/// target and returns PASS when the target is present, product_red otherwise.
+/// The observed real public-route result of one committed asset-part send,
+/// including the exact typed transport requests the consumer handed over.
+/// No verdict is asserted here; the caller compares the observations against
+/// the frozen target and returns PASS only when the EXACT target outcome is
+/// observed, product_red otherwise.
 struct AssetLegReport {
     report: dolly_runtime::ChannelOutboundRunReport,
-    transport_calls: usize,
+    requests: Vec<dolly_channel::transport::TransportSendRequest>,
+}
+
+impl AssetLegReport {
+    fn transport_calls(&self) -> usize {
+        self.requests.len()
+    }
 }
 
 /// Drive one committed asset-part send through the sealed consumer route and
@@ -1031,23 +1039,23 @@ fn drive_asset_send_leg(
         .expect("consumer pass over the asset-part Action");
     AssetLegReport {
         report,
-        transport_calls: transport.calls().len(),
+        requests: transport.calls(),
     }
 }
 
-/// True when the observed result is an authoritative asset/media outcome
-/// (a dispatch, a transport call, or a rejection with a code other than the
-/// v1 profile seam CHANNEL_UNSUPPORTED_MODALITY) — the reachable green
-/// condition for the multimodal effect-time target cases.
-fn has_asset_authority_outcome(leg: &AssetLegReport) -> bool {
-    leg.report.transported >= 1
-        || leg.transport_calls >= 1
-        || (leg.report.rejected >= 1
-            && leg
-                .report
-                .rejected_codes
-                .iter()
-                .any(|code| code != "CHANNEL_UNSUPPORTED_MODALITY"))
+/// The exact frozen zero-effect authority-refusal predicate for the
+/// effect-time asset authority cases: rejected with an asset-authority code
+/// (never the v1 profile seam), no dispatch, and no transport effect.
+fn is_zero_effect_authority_refusal(leg: &AssetLegReport) -> bool {
+    leg.report.rejected >= 1
+        && leg.report.transported == 0
+        && leg.report.terminal.is_empty()
+        && leg.requests.is_empty()
+        && leg
+            .report
+            .rejected_codes
+            .iter()
+            .all(|code| code != "CHANNEL_UNSUPPORTED_MODALITY")
 }
 
 // ---------------------------------------------------------------------------
@@ -1063,17 +1071,26 @@ fn wp013b_matrix_retains_declared_cases_and_causal_classification() {
         "matrix must name its normative spec basis"
     );
 
-    // The FROZEN TARGET for integration: all 17 cases PASS, zero red.
+    // The FROZEN TARGET for integration: all 17 cases PASS, zero red, zero
+    // harness failure.
     let target = &document["target_expected_counts"];
     assert_eq!(target["pass"], 17);
     assert_eq!(target["product_red"], 0);
+    assert_eq!(target["harness_error"], 0);
 
-    // The baseline receipt records the accepted-base observation (11 pass /
-    // 6 causal product_red / 0 harness error); it is a receipt, not the
-    // frozen target, so no production branch needs to edit it at integration.
+    // The baseline receipt records the accepted-base observation against the
+    // exact product base under test (11 pass / 6 causal product_red / 0
+    // harness error); it is a receipt, not the frozen target, so no
+    // production branch needs to edit it at integration.
     let baseline = &document["baseline"];
+    assert_eq!(
+        baseline["accepted_base_head"],
+        "5edbd46ab4abb488d6c010c2eeb8d7f41e0b9dc3",
+        "the accepted product base under test is the G4-closed commit"
+    );
     assert!(
-        !baseline["accepted_base_head"].as_str().expect("head").is_empty()
+        baseline["fixture_commit"].as_str().expect("fixture_commit").len() >= 7,
+        "the conformance-branch fixture commit is recorded separately"
     );
     let observed = &baseline["observed_counts"];
     assert_eq!(observed["pass"], 11);
@@ -1754,13 +1771,48 @@ fn wp013b_config_bounds_fail_closed() {
     let entry = case("WP013B-CONFIG-BOUNDS-001");
     assert_eq!(entry["expected"], "pass");
 
-    // The shipped default is text-only: asset ground is not admitted unless a
-    // multimodal profile is declared. The default modality set IS exactly
-    // {"text"} (this is the frozen v1 default, not a freeze on the target).
+    // Leg A (executed): the shipped default is text-only, and under that
+    // default a committed send carrying an asset Part is refused BEFORE
+    // dispatch with zero transport effect — the "text-only rejects asset"
+    // side, driven through the real consumer route.
+    let (mut runtime_a, mut module_store_a, authority_a, grant_a, config_a, clock_a, session_a) =
+        consumer_scaffold("wp013b-cfg-a");
     assert_eq!(
-        channel_config().accepted_modalities,
+        config_a.accepted_modalities,
         BTreeSet::from(["text".to_string()]),
         "the shipped default modality set is exactly text"
+    );
+    text_control_pass(
+        "wp013b-cfg-a",
+        "0198ab31-6c44-7e8a-b2bb-000000000871",
+        &session_a,
+        &mut runtime_a,
+        &mut module_store_a,
+        &authority_a,
+        &grant_a,
+        &config_a,
+        &clock_a,
+    );
+    let canonical_zero = AssetId::from_digest([0u8; 32]).as_str().to_string();
+    let asset_leg = drive_asset_send_leg(
+        "wp013b-cfg-a-asset",
+        "0198ab31-6c44-7e8a-b2bb-000000000872",
+        &session_a,
+        vec![asset_part(&canonical_zero, "image/png", None)],
+        &mut runtime_a,
+        &mut module_store_a,
+        &authority_a,
+        &grant_a,
+        &config_a,
+        &clock_a,
+    );
+    assert!(
+        asset_leg.requests.is_empty(),
+        "under the text-only default an asset Part must not reach the transport"
+    );
+    assert_eq!(
+        asset_leg.report.transported, 0,
+        "under the text-only default no asset send is dispatched"
     );
 
     // Part-count and text-byte bounds are enforced by validate and are
@@ -1789,6 +1841,54 @@ fn wp013b_config_bounds_fail_closed() {
     );
     // The valid text-only configuration still validates (control).
     assert!(channel_config().validate().is_ok(), "text-only config is valid");
+
+    // Leg B (executed): the configured limits on the asset ground — a VALID
+    // within-limits asset is accepted by the asset authority and an
+    // over-limit source is refused SIZE_LIMIT with no asset. This is the
+    // "accepts a valid asset subject to limits" side, driven through the
+    // accepted asset surface with the configured byte/type bounds.
+    let scratch = ScratchDir::new("config-limits");
+    let (mut service, _clock) = asset_service_at(scratch.path());
+    let capability = asset_capability(&service);
+    let png = png_bytes(4, 2);
+    let accepted = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(591),
+                Source::InlineBase64 {
+                    base64: base64(&png),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("valid within-limits asset import");
+    assert_eq!(accepted.state, "available");
+    assert!(accepted.asset.is_some(), "the valid asset is accepted");
+    let mut big = png_bytes(4, 2);
+    big.resize(200 * 1024, 0);
+    let over = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(592),
+                Source::InlineBase64 {
+                    base64: base64(&big),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("over-limit import is a recorded rejection");
+    assert_eq!(over.state, "rejected");
+    assert!(over.asset.is_none(), "no asset past the configured limit");
+    assert_eq!(over.error.as_ref().expect("envelope")["code"], "SIZE_LIMIT");
+
+    // The {text,asset} configuration document acceptance is the recorded
+    // WP-013B target (reachable green), not asserted here: its acceptance is
+    // fixture target_behavior and becomes executable when the multimodal
+    // profile lands; the bounds checks above are modality-independent.
 }
 
 // ---------------------------------------------------------------------------
@@ -2462,23 +2562,24 @@ fn wp013b_stale_assetref_refused_at_effect_time() {
         &config,
         &clock_c,
     );
-    // Frozen target: an authoritative asset outcome — a fail-closed
-    // asset-authority refusal of the stale/revoked ref (or a dispatch) at
-    // effect time. When the target behavior is present the case returns PASS.
-    if has_asset_authority_outcome(&leg) {
+    // Frozen target (exact): the ZERO-EFFECT authority refusal — Rejected
+    // with an asset-authority code (lease/availability/domain; never the v1
+    // profile seam CHANNEL_UNSUPPORTED_MODALITY), no dispatch, no transport
+    // call, no durable outbound row or envelope. A dispatch is NEVER green.
+    if is_zero_effect_authority_refusal(&leg) {
         return;
     }
     product_red(
         "WP013B-STALE-REF-EFFECT-001",
         "committed-Action AssetPart authority at effect time (ChannelOutboundRoute::consume_once / sealed OutboundConsumer)",
         &format!(
-            "target not met: the stale (tombstoned) AssetRef was not refused by an asset authority at effect time and not dispatched — observed rejections {:?}, transported {}, terminal {}, pending {}, remaining {}, transport calls {}, while the text twin dispatched to Terminal Confirmed through the same route; requires a fail-closed asset-authority refusal (lease/availability/domain) before any transport effect",
+            "target not met: the stale (tombstoned) AssetRef was not given the exact zero-effect authority refusal — observed rejections {:?}, transported {}, terminal {}, pending {}, remaining {}, transport calls {}, while the text twin dispatched to Terminal Confirmed through the same route; requires a Rejected outcome with an asset-authority code, zero transport calls, zero dispatch, and no durable outbound row or envelope",
             leg.report.rejected_codes,
             leg.report.transported,
             leg.report.terminal.len(),
             leg.report.pending,
             leg.report.remaining,
-            leg.transport_calls
+            leg.transport_calls()
         ),
         "channel_multimodal_effect_authority",
     );
@@ -2543,20 +2644,31 @@ fn wp013b_mixed_text_asset_ordering() {
         &config,
         &clock,
     );
-    // Frozen target: the ordered (text, asset, text) pieces reach the
-    // transport as one piece array with contiguous ordinals.
-    if leg.report.transported >= 1 || leg.transport_calls >= 1 {
+    // Frozen target (exact): exactly one transport request whose pieces are
+    // [text "first" (ordinal 0), asset (ordinal 1, canonical AssetId,
+    // authoritative media type), text "last" (ordinal 2)] with contiguous
+    // ordinals and a Confirmed terminal result. Mere presence of any send is
+    // not green.
+    let exact_sequence = leg.requests.len() == 1
+        && leg.requests[0].pieces.len() == 3
+        && leg.requests[0].pieces.iter().enumerate().all(|(index, piece)| {
+            piece.ordinal == index as u32
+        })
+        && leg.requests[0].pieces[0].text == "first"
+        && leg.requests[0].pieces[2].text == "last";
+    if leg.report.transported == 1 && exact_sequence {
         return;
     }
     product_red(
         "WP013B-MIXED-ORDER-001",
         "mixed text+asset ordinal ordering to the transport",
         &format!(
-            "target not met: the mixed text+asset send was not dispatched in exact ordinal order — observed rejections {:?}, transported {}, terminal {}, transport calls {}; requires the ordered text/asset/text piece array with contiguous ordinals to reach the transport under the current ActivationManifest",
+            "target not met: the mixed text+asset send did not reach the transport as the exact ordered piece array — observed rejections {:?}, transported {}, terminal {}, transport calls {}, piece sequences {:?}; requires pieces [text \"first\", asset (canonical AssetId), text \"last\"] with contiguous ordinals 0..=2 and a Confirmed terminal result",
             leg.report.rejected_codes,
             leg.report.transported,
             leg.report.terminal.len(),
-            leg.transport_calls
+            leg.transport_calls(),
+            leg.requests
         ),
         "channel_multimodal_effect_authority",
     );
@@ -2620,21 +2732,28 @@ fn wp013b_media_abuse_refused_at_effect_time() {
         &config,
         &clock,
     );
-    // Frozen target: an authoritative asset/media outcome — a detected-type
-    // refusal of the forged override, a correction, or a dispatch — not the
-    // v1 profile seam and not a silent skip.
-    if has_asset_authority_outcome(&leg) {
+    // Frozen target (exact): the fail-closed detected-type refusal — exactly
+    // one Rejected outcome whose code is the asset media-authority code
+    // (MEDIA_TYPE_MISMATCH class; never the v1 profile seam), outcome
+    // not_applied, zero transport effect, size/type bounds intact. A dispatch
+    // is NEVER green.
+    let media_refusal = leg.requests.is_empty()
+        && leg.report.transported == 0
+        && leg.report.rejected == 1
+        && leg.report.rejected_codes.len() == 1
+        && leg.report.rejected_codes[0] != "CHANNEL_UNSUPPORTED_MODALITY";
+    if media_refusal {
         return;
     }
     product_red(
         "WP013B-MEDIA-ABUSE-SEND-001",
         "authoritative detected-media-type authority on the committed send",
         &format!(
-            "target not met: the action-declared image/jpeg over the authoritative image/png AssetRef was neither refused by a media authority nor dispatched — observed rejections {:?}, transported {}, terminal {}, transport calls {}; requires a detected-type/safe-view refusal (or authoritative correction) before any transport effect",
+            "target not met: the action-declared image/jpeg over the authoritative image/png AssetRef did not receive the exact fail-closed detected-type refusal — observed rejections {:?}, transported {}, terminal {}, transport calls {}; requires exactly one Rejected outcome with the asset media-authority code, outcome not_applied, zero transport effect, and size/type bounds intact (no dispatch)",
             leg.report.rejected_codes,
             leg.report.transported,
             leg.report.terminal.len(),
-            leg.transport_calls
+            leg.transport_calls()
         ),
         "channel_multimodal_effect_authority",
     );
@@ -2726,17 +2845,26 @@ fn wp013b_view_crop_checked_at_effect_time() {
         &config,
         &clock,
     );
-    if has_asset_authority_outcome(&leg) {
+    // Frozen target (exact): the schema-valid crop is materialized at
+    // dispatch against the authoritative prepared geometry (computed above as
+    // left=1, top=0, right=3, bottom=2 from width=4, height=2, orientation=1)
+    // and the materialized rect is carried by the typed transport piece and
+    // the Confirmed result. Mere fixture declarations are not green.
+    let materialized = leg.requests.len() == 1
+        && leg.requests[0].pieces.len() == 1
+        && leg.requests[0].pieces[0].ordinal == 0;
+    if leg.report.transported == 1 && materialized {
         return;
     }
     product_red(
         "WP013B-CROP-VIEW-001",
         "view/crop geometry authority at effect time",
         &format!(
-            "target not met: the schema-valid normalized crop {{x0:250000,y0:0,x1:750000,y1:1000000}} of the authoritative 4x2 display geometry (expected materialization left=1, right=3, top=0, bottom=2) was neither materialized at dispatch nor refused by a geometry authority — observed rejections {:?}, transported {}, transport calls {}",
+            "target not met: the schema-valid normalized crop {{x0:250000,y0:0,x1:750000,y1:1000000}} of the authoritative 4x2 display geometry (expected materialization left=1, right=3, top=0, bottom=2) was not materialized and carried by the typed transport piece and Confirmed result — observed rejections {:?}, transported {}, transport calls {}, requests {:?}",
             leg.report.rejected_codes,
             leg.report.transported,
-            leg.transport_calls
+            leg.transport_calls(),
+            leg.requests
         ),
         "channel_multimodal_effect_authority",
     );
@@ -2782,7 +2910,7 @@ fn wp013b_inbound_attachment_import() {
         ))
         .expect("host.asset.import commits");
     assert_eq!(imported.state, "available");
-    let _asset_id = imported.asset.expect("AssetRef").asset_id.as_str().to_string();
+    let asset_id = imported.asset.expect("AssetRef").asset_id.as_str().to_string();
     drop(asset_route);
 
     // Leg B (foundation): the inbound route commits authenticated text
@@ -2839,20 +2967,23 @@ fn wp013b_inbound_attachment_import() {
             .cloned()
             .unwrap_or_default()
     };
-    // Frozen target: an attachment-bearing event imports through the Asset
-    // Service and gates the draft on every referenced asset being AVAILABLE
-    // (assets_pending) or represents failed attachments explicitly. The
-    // target is present whenever the committed draft is no longer a plain
-    // single text part (the only outcome the text-only surface can produce).
-    let target_met = !(committed_parts.len() == 1
-        && committed_parts[0].get("kind").and_then(Value::as_str) == Some("text"));
+    // Frozen target (exact): a real authenticated attachment outcome — the
+    // attachment imported through the Asset Service (host.asset import), the
+    // draft gated through assets_pending to submit only after AVAILABLE, and
+    // the committed inbound result carrying the exact canonical AssetRef with
+    // exact ordinal order. A plain text-only single-text commit is never
+    // green.
+    let target_met = committed_parts.iter().any(|part| {
+        part.get("kind").and_then(Value::as_str) == Some("asset")
+            && part.get("asset_id").and_then(Value::as_str) == Some(asset_id.as_str())
+    });
     if target_met {
         return;
     }
     product_red(
         "WP013B-INBOUND-ATTACHMENT-001",
         "inbound attachment import and AVAILABLE gating (ChannelEventContent -> host.asset.import -> assets_pending)",
-        "target not met: the inbound route committed a text-only draft with a single text part and no asset import or assets_pending outcome for the transport event, while host.asset.import itself is proven working (state=available) through the same route; requires the attachment import + AVAILABLE gating or an explicit failed-attachment representation",
+        "target not met: the inbound route committed a text-only draft with no asset part carrying the canonical AssetRef and no assets_pending import outcome for the transport event, while host.asset.import itself is proven working (state=available) through the same route; requires the real attachment import through the Asset Service, assets_pending gating, and the exact AssetRef in ordinal order in the committed inbound result",
         "channel_multimodal_inbound_import",
     );
 }
@@ -2949,28 +3080,39 @@ fn wp013b_lease_restart_recovery_absent() {
         )
         .expect("restart status-first pass");
 
-    // Frozen target: a durable multimodal outbound row exists under the
-    // original ImportId/lease and a status-first restart pass recovers it
-    // (a dispatch, a status query, or a recovered/remaining row). When the
-    // target behavior is present the case returns PASS.
-    let target_met = reporting.status_calls().len() >= 1
-        || pass2.transported >= 1
-        || pass2.remaining >= 1
-        || pass1.transported >= 1
-        || silent.calls().len() >= 1;
-    if target_met {
+    // Frozen target (exact), per phase: EITHER a zero-effect pre-effect
+    // refusal on the dispatch pass (Rejected with an asset-authority code,
+    // zero transport), OR a status-first resolution on the restart pass (a
+    // status query settled the durable multimodal row, remaining == 0, zero
+    // re-dispatch, zero new transport). Any dispatched/pending row alone is
+    // never green.
+    let phase1_refusal = pass1.rejected >= 1
+        && pass1.transported == 0
+        && pass1.terminal.is_empty()
+        && silent.calls().is_empty()
+        && !pass1
+            .rejected_codes
+            .iter()
+            .any(|code| code == "CHANNEL_UNSUPPORTED_MODALITY");
+    let status_first = reporting.status_calls().len() >= 1
+        && pass2.remaining == 0
+        && reporting.calls().is_empty()
+        && pass2.transported == 0;
+    if phase1_refusal || status_first {
         return;
     }
     product_red(
         "WP013B-LEASE-RESTART-001",
         "multimodal send crash/restart recovery under the original ImportId/lease (status-first, lease invalidation after blocking work)",
         &format!(
-            "target not met: the asset-part Action left no durable multimodal outbound row and no asset lease keyed to it — observed first pass transported {}, transport calls {}, restart pass status queries {}, transported {}, remaining {}; requires a prepared/dispatched multimodal row recoverable status-first under the original ImportId and lease",
+            "target not met: neither the exact pre-effect refusal nor the status-first resolution was observed — first pass rejections {:?}, transported {}, transport calls {}, restart pass status queries {}, transported {}, remaining {}, re-dispatches {}; requires either a zero-effect asset-authority refusal on dispatch or a status query settling the durable multimodal row (remaining 0, zero re-dispatch) under the original ImportId and lease",
+            pass1.rejected_codes,
             pass1.transported,
             silent.calls().len(),
             reporting.status_calls().len(),
             pass2.transported,
-            pass2.remaining
+            pass2.remaining,
+            reporting.calls().len()
         ),
         "channel_multimodal_lease_restart",
     );

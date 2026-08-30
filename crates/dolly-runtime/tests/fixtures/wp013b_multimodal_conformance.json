@@ -33,11 +33,13 @@
   },
   "target_expected_counts": {
     "pass": 17,
-    "product_red": 0
+    "product_red": 0,
+    "harness_error": 0
   },
   "baseline": {
-    "accepted_base_head": "a33c59ee4e3a08d14224715d05a1b15e78d455cb",
-    "recorded_at": "before target integration; this observation is not the frozen expectation",
+    "accepted_base_head": "5edbd46ab4abb488d6c010c2eeb8d7f41e0b9dc3",
+    "fixture_commit": "d4f913157a1826da94c9e3d067634ff0b685daac",
+    "recorded_at": "accepted-base observation; not the frozen target",
     "observed_counts": {
       "pass": 11,
       "product_red": 6,
@@ -157,9 +159,9 @@
       "name": "channel_config_modality_part_text_bounds_fail_closed_before_dispatch",
       "kind": "channel_config_bounds",
       "expected": "pass",
-      "pass_basis": "the shipped text-only default rejects asset ground unless a multimodal profile is declared: the default modality set is exactly {text}; max_parts must be in 1..=32 and max_text_bytes in 1..=262144, so an oversized or degenerate configuration cannot route work. A configuration that declares the additional asset modality is a target capability: it MUST allow the asset send path subject to the SAME part/text bounds (it is not frozen invalid); the accepted base enforces the bounds and keeps the default text-only",
-      "assertion": "require the shipped default modality set to be exactly {text}, an oversized/degenerate max_parts/max_text_bytes to be rejected, and the valid text-only configuration to validate; the {text,asset} modality release is recorded as the target behavior, not asserted invalid here",
-      "target_behavior": "after the WP-013B multimodal profile lands, a configuration with accepted_modalities {text,asset} within the same 1..=32 part and 1..=262144 text bounds is a valid configuration that routes AssetRef send parts; the bounds checks are modality-independent",
+      "pass_basis": "the config case EXECUTES both sides on real seams: the shipped text-only default is exactly {text} and a committed send Action carrying an asset part under it is refused before dispatch (CHANNEL_UNSUPPORTED_MODALITY, NotApplied, zero transport/durable effect); a valid within-limits asset is accepted by the asset authority under the configured limits while an over-limit source is refused SIZE_LIMIT. The {text,asset} configuration document is the frozen target: it must be accepted subject to the same 1..=32 part and 1..=262144 text bounds once the WP-013B profile lands (the v1 validate clamp is not frozen as the contract)",
+      "assertion": "execute the dual legs: (A) under the default text-only config, an asset-part send is refused before dispatch with zero effect; (B) with the {text,asset} modality configured within limits, a valid asset is accepted under the configured limits and an over-limit asset is refused SIZE_LIMIT; record the {text,asset} document acceptance as target_behavior",
+      "target_behavior": "when the WP-013B multimodal profile lands, a configuration with accepted_modalities {text,asset} within the same 1..=32 part and 1..=262144 text bounds validates and routes AssetRef send parts; the bounds checks are modality-independent",
       "references": [
         "crates/dolly-channel/src/config.rs::ChannelConfig::validate modality/part/text bounds",
         "crates/dolly-runtime/tests/wp013b_multimodal_conformance.rs::wp013b_config_bounds_fail_closed"
@@ -248,7 +250,7 @@
       "kind": "channel_multimodal_effect_authority",
       "expected": "pass",
       "baseline_observed": "product_red",
-      "target_behavior": "a committed org.dolly.channel.send Action carrying a stale/revoked/tombstoned AssetRef is refused at effect time with a fail-closed asset-authority code (not CHANNEL_UNSUPPORTED_MODALITY and not a silent skip) before any transport effect or durable outbound row; the executable returns PASS when such an authoritative outcome is observed",
+      "target_behavior": "green is exactly the zero-effect authority refusal: the consumer reports a Rejected outcome with an asset-authority code (lease/availability/domain; never CHANNEL_UNSUPPORTED_MODALITY) while the transport sees zero calls and no durable outbound row or envelope is produced; a dispatch is NEVER green",
       "seam": "the committed-Action consumer route (ChannelOutboundRoute::consume_once over the sealed OutboundConsumer) must, at effect time under the current ActivationManifest authority, consult the current AssetService authority (lease, ownership, availability, domain) for every asset part of a committed org.dolly.channel.send Action and refuse a stale/revoked/tombstoned AssetRef with a fail-closed asset code before any transport effect, durable outbound row, or success envelope",
       "causal_red": "the frozen channel-send arguments schema already admits an {\"kind\":\"asset\"} Part (embedded-schema-catalog.json channel-send.schema.json over the common Part def), but dolly-channel outbound.rs authorize_send rejects every asset part with CHANNEL_UNSUPPORTED_MODALITY and outbound_committed.rs CommittedSendAction::from_manifest_input propagates that error into committed_targeted_actions' if-let-Ok silent skip, so a committed Action carrying a tombstoned (stale/revoked) AssetRef is dropped with NO asset-authority refusal outcome, NO durable outbound row, and ZERO transport calls",
       "references": [
@@ -267,7 +269,7 @@
       "kind": "channel_multimodal_ordering",
       "expected": "pass",
       "baseline_observed": "product_red",
-      "target_behavior": "a committed org.dolly.channel.send Action whose parts mix text and a canonical AVAILABLE AssetRef reaches the transport as an ordered piece array with contiguous ordinals (0..n) preserving the committed order, each asset piece authorized under a current lease; the executable returns PASS when such a dispatch is observed",
+      "target_behavior": "green is the exact piece sequence: exactly one transport request whose pieces are [text \"first\" (ordinal 0), asset (ordinal 1, canonical AssetId, authoritative media type), text \"last\" (ordinal 2)] with contiguous ordinals and a Confirmed terminal result; mere presence of any dispatch is not green",
       "seam": "a committed org.dolly.channel.send Action whose parts mix text and a canonical AVAILABLE AssetRef must reach the transport as an ordered piece array with contiguous ordinals (0..n) preserving the committed order, each asset piece authorized under a current lease",
       "causal_red": "authorize_send stops at the first asset part with CHANNEL_UNSUPPORTED_MODALITY, so a mixed text+asset Action is silently dropped by CommittedSendAction::from_manifest_input; no ordered asset piece can be built or transported, while the identical text twin dispatches to Terminal Confirmed through the same route",
       "references": [
@@ -284,7 +286,7 @@
       "kind": "channel_multimodal_media_abuse",
       "expected": "pass",
       "baseline_observed": "product_red",
-      "target_behavior": "an action-declared media_type that overrides or contradicts the authoritative detected type of the AVAILABLE asset is refused before dispatch with an asset/media-authority code (not CHANNEL_UNSUPPORTED_MODALITY and not a silent skip); the executable returns PASS when such an authoritative outcome is observed",
+      "target_behavior": "green is the exact fail-closed detected-type refusal: a Rejected outcome whose code is the asset media-authority code (MEDIA_TYPE_MISMATCH class) with outcome not_applied, zero transport effect, and the size/type bounds intact; a dispatch is NEVER green",
       "seam": "before dispatch the Channel MUST apply the Core AssetPart authorization with the authoritative detected media type: an action-declared media_type that overrides or contradicts the detected type of the AVAILABLE asset (or unsafe active content) is refused with a fail-closed asset code, never re-labeled, never trusted as an override",
       "causal_red": "the send path has no detected-type/safe-view authority: authorize_send rejects every asset part at the profile seam and the Action is silently dropped, so an action declaring image/jpeg for a detected image/png AssetRef is neither refused by a media authority nor corrected to the authoritative type — the abuse gate is absent",
       "references": [
@@ -301,7 +303,7 @@
       "kind": "channel_multimodal_crop_view",
       "expected": "pass",
       "baseline_observed": "product_red",
-      "target_behavior": "a schema-valid normalized view/crop (all coordinates in 0..=1_000_000 with x0<x1 and y0<y1) of an AVAILABLE asset is materialized at dispatch against the authoritative prepared width/height/orientation with the frozen floor/ceil rounding, and a crop that cannot select an in-bounds pixel is refused by a geometry authority; the executable returns PASS when such an authoritative outcome is observed. The out-of-range (x1 > 1_000_000) coordinate vector is a fail-closed bounds negative covered by the coordinate rule, not this success target",
+      "target_behavior": "green is the materialized crop observed in the typed transport/result: the exact rect computed from the authoritative prepared width/height/orientation (x0=250000,y0=0,x1=750000,y1=1000000 over 4x2 -> left=1, top=0, right=3, bottom=2) is carried by the transported piece and the Confirmed result; fixture declarations alone are not green",
       "seam": "an asset Part's view/crop rectangle MUST be validated against the authoritative inspected display geometry of the AVAILABLE asset before dispatch: an empty, out-of-range, or non-fixed-point crop is refused (EMPTY_CROP/INVALID_CROP class) and no broader crop than delivered is honored",
       "causal_red": "the send path performs no crop/view validation: authorize_send drops every asset part at the profile seam and the Action is silently dropped, so a schema-valid crop is never materialized against the authoritative display geometry at effect time",
       "references": [
@@ -318,7 +320,7 @@
       "kind": "channel_multimodal_inbound_import",
       "expected": "pass",
       "baseline_observed": "product_red",
-      "target_behavior": "a Channel transport event carrying an attachment imports it through the Asset Service (host.asset import) and either gates the inbound Block draft on every referenced asset being AVAILABLE (assets_pending) or represents failed attachments explicitly without a fabricated reference; the executable returns PASS when such an attachment/pending outcome is observed",
+      "target_behavior": "green is a real authenticated attachment outcome: the attachment is imported through the Asset Service (host.asset import), the block draft enters assets_pending and submits only after AVAILABLE, and the committed inbound result carries the exact AssetRef with exact ordinal order; a text-only single-text commit is never green",
       "seam": "a Channel transport event carrying an attachment MUST import it through the Asset Service (host.asset import) and MUST NOT submit the inbound Block draft until every referenced asset is AVAILABLE or MUST represent failed attachments explicitly without a fabricated reference (assets_pending gating)",
       "causal_red": "the inbound surface has no attachment ground: ChannelEventContent carries no attachment, InboundState has no assets_pending state, and the inbound route performs no Asset import, so a transport attachment can neither be imported nor AVAILABLE-gate the draft — while host.asset.import itself is proven working through the same route",
       "references": [
@@ -336,7 +338,7 @@
       "kind": "channel_multimodal_lease_restart",
       "expected": "pass",
       "baseline_observed": "product_red",
-      "target_behavior": "a dispatched multimodal send is recoverable across crash/restart status-first under its original ImportId and Asset lease (the lease invalidated only after blocking work is proven done): a durable multimodal outbound row exists and a status-first pass settles it without re-mint or blind resend; the executable returns PASS when such a recoverable row/status query is observed",
+      "target_behavior": "green is per-phase exact: either a zero-effect pre-effect refusal (Rejected with an asset-authority code and zero transport) on dispatch, or a status-first resolution on restart in which a status query settles the durable multimodal row (status_calls >= 1, remaining == 0, zero re-dispatch); any dispatched/pending row alone is not green",
       "seam": "a dispatched multimodal send MUST be recoverable across crash/restart status-first under its original ImportId and Asset lease (the lease invalidated only after blocking work is proven done), never re-minted, never blind-resent, never reported success while bytes may be unknown",
       "causal_red": "no multimodal outbound row can exist: every asset-part Action is dropped at the profile seam before a durable Prepared row or Asset lease is created, so there is no ImportId/lease record for crash recovery, no status-first multimodal reconcile, and no lease-invalidation-after-blocking-work path",
       "references": [
