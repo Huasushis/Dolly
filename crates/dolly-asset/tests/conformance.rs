@@ -7,12 +7,17 @@ use dolly_asset::clock::{Clock, ClockTime};
 use dolly_asset::config::{ReplicaConfig, ResolvedAssetConfig};
 use dolly_asset::error::{AssetErrorCode, ErrorPhase};
 use dolly_asset::identity::{AssetId, AssetRef, ContentHash};
-use dolly_asset::record::{ImportRequest, ImportState, MediaKind, Source};
+use dolly_asset::prepare::{MediaPrepareRequest, PrepareFailpoint};
+use dolly_asset::record::{
+    AssetRecord, ImportRequest, ImportState, Lifecycle, LocalState, MediaKind, Source,
+};
 use dolly_asset::remote::DeniedFetcher;
 use dolly_asset::replica::{DisabledReplica, InMemoryReplica};
 use dolly_asset::service::AssetService;
+use dolly_asset::store::AssetStore;
 use dolly_asset::{AssetCapability, ReplicaState};
 use parking_lot::Mutex;
+use std::fs;
 use std::sync::Arc;
 
 const T0: u64 = 1_800_000_000_000;
@@ -1479,4 +1484,549 @@ fn same_domain_cross_owner_and_different_parameter_replays_are_neutral_conflicts
     let replayed = service.import(&owner, &replay).unwrap();
     assert_eq!(replayed.state, "available");
     assert_eq!(replayed.asset, available.asset, "true replay returns the authoritative AssetRef");
+}
+// ---------------------------------------------------------------------------
+// 10. WP-013B Asset-side media preparation seam: a canonical AVAILABLE
+//    `AssetRef` under the exact current lease succeeds; stale, revoked,
+//    expired, foreign, non-AVAILABLE, and non-canonical references fail
+//    closed before any bytes are released. Races are driven by the clock,
+//    durable-row barriers, and the deterministic post-read failpoint — no
+//    sleeps.
+// ---------------------------------------------------------------------------
+
+fn prepare_request(
+    asset_ref: AssetRef,
+    expected_media_kind: MediaKind,
+    claimed: Option<&str>,
+    lease_id: String,
+) -> MediaPrepareRequest {
+    MediaPrepareRequest {
+        asset_ref,
+        expected_media_kind,
+        claimed_media_type: claimed.map(|m| m.parse().unwrap()),
+        lease_id,
+    }
+}
+
+/// Seed a live asset row with its bytes already in the content-addressed
+/// store (same authority the import pipeline uses), so tests can construct
+/// non-importable durable states deterministically.
+fn seed_live_asset(
+    service: &mut AssetService,
+    clock: &mut TestClock,
+    domain: &str,
+    bytes: &[u8],
+    detected: Option<&str>,
+) -> (AssetId, AssetRef) {
+    let digest = ContentHash::of_bytes(bytes);
+    let asset_id = AssetId::from_digest(digest.digest);
+    let objects = service.config_ro().local_root.join("objects");
+    fs::create_dir_all(&objects).unwrap();
+    fs::write(objects.join(asset_id.as_str()), bytes).unwrap();
+    let now = clock.now();
+    let record = AssetRecord {
+        asset_id: asset_id.as_str().to_string(),
+        security_domain: domain.to_string(),
+        generation: 0,
+        content_hash: digest,
+        byte_length: bytes.len() as u64,
+        declared_media_type: detected.map(|d| d.to_string()),
+        detected_media_type: detected.map(|d| d.to_string()),
+        orientation: None,
+        encoded_width: None,
+        encoded_height: None,
+        display_width: None,
+        display_height: None,
+        lifecycle: Lifecycle::Live,
+        deletion_generation: 0,
+        local_state: LocalState::Present,
+        replica_state: ReplicaState::Disabled,
+        tombstoned_at: None,
+        created_at: now.iso(),
+        updated_at: now.iso(),
+        updated_at_ms: now.millis,
+    };
+    let tx = service.store_transaction().unwrap();
+    tx.insert_asset(&record, now).unwrap();
+    tx.commit().unwrap();
+    let media_type = detected.unwrap_or("application/octet-stream").parse().unwrap();
+    let asset_ref = AssetRef {
+        asset_id: asset_id.clone(),
+        media_type,
+        byte_length: bytes.len() as u64,
+        orientation: None,
+        encoded_width: None,
+        encoded_height: None,
+        display_width: None,
+        display_height: None,
+    };
+    assert!(asset_ref.validate().is_ok());
+    (asset_id, asset_ref)
+}
+
+#[test]
+fn prepare_media_succeeds_for_available_asset_with_current_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut service, _clock) = service_at(dir.path(), TestClock::new(T0));
+    let capability = cap(&service);
+    let png = png_bytes(4, 2);
+    let available = service
+        .import(
+            &capability,
+            &request(
+                440,
+                Source::InlineBase64 {
+                    base64: base64(&png),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .unwrap();
+    let asset_ref = available.asset.clone().unwrap();
+    let asset_id = asset_ref.asset_id.as_str().to_string();
+    let lease = service
+        .lease(&capability, &asset_id, "instance-a", "channel-send", 60_000)
+        .unwrap();
+
+    let prepared = service
+        .prepare_media(
+            &capability,
+            &prepare_request(asset_ref.clone(), MediaKind::Image, Some("image/png"), lease.lease_id.clone()),
+        )
+        .unwrap();
+    assert_eq!(prepared.asset_ref, asset_ref, "echoes the canonical reference");
+    assert_eq!(prepared.media_type.as_str(), "image/png", "authoritative detected type");
+    assert_eq!(prepared.media_kind, MediaKind::Image, "kind derived from the detected type");
+    assert_eq!(prepared.generation, 1, "exact current generation");
+    assert_eq!(prepared.digest, ContentHash::of_bytes(&png), "verified canonical digest");
+    assert_eq!(prepared.lease_id, lease.lease_id);
+    assert_eq!(prepared.bytes, png, "exact immutable bytes");
+
+    // The lease is not consumed: a repeated preparation is idempotent.
+    let again = service
+        .prepare_media(
+            &capability,
+            &prepare_request(asset_ref, MediaKind::Image, Some("image/png"), lease.lease_id),
+        )
+        .unwrap();
+    assert_eq!(again.bytes, png);
+}
+
+#[test]
+fn prepare_media_refuses_revoked_lease_before_reading_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut service, _clock) = service_at(dir.path(), TestClock::new(T0));
+    let capability = cap(&service);
+    let png = png_bytes(4, 2);
+    let available = service
+        .import(
+            &capability,
+            &request(
+                441,
+                Source::InlineBase64 {
+                    base64: base64(&png),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .unwrap();
+    let asset_ref = available.asset.unwrap();
+    let asset_id = asset_ref.asset_id.as_str().to_string();
+    let lease = service
+        .lease(&capability, &asset_id, "instance-a", "channel-send", 60_000)
+        .unwrap();
+    assert!(service.release_lease(&lease.lease_id).unwrap());
+
+    // Corrupt the object so a read would fail digest verification; the
+    // refusal must still be the revoked-lease error, proving no read ran.
+    fs::write(dir.path().join("objects").join(&asset_id), b"tampered").unwrap();
+    let err = service
+        .prepare_media(
+            &capability,
+            &prepare_request(asset_ref, MediaKind::Image, Some("image/png"), lease.lease_id),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.code,
+        AssetErrorCode::LeaseInvalid,
+        "a revoked lease fails before any byte read"
+    );
+}
+
+#[test]
+fn prepare_media_refuses_expired_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = TestClock::new(T0);
+    let (mut service, clock) = service_at(dir.path(), clock);
+    let capability = cap(&service);
+    let png = png_bytes(4, 2);
+    let available = service
+        .import(
+            &capability,
+            &request(
+                442,
+                Source::InlineBase64 {
+                    base64: base64(&png),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .unwrap();
+    let asset_ref = available.asset.unwrap();
+    let asset_id = asset_ref.asset_id.as_str().to_string();
+    let lease = service
+        .lease(&capability, &asset_id, "instance-a", "channel-send", 1_000)
+        .unwrap();
+    clock.advance(2_000);
+    let err = service
+        .prepare_media(
+            &capability,
+            &prepare_request(asset_ref, MediaKind::Image, Some("image/png"), lease.lease_id),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, AssetErrorCode::LeaseInvalid, "an expired lease is refused");
+}
+
+#[test]
+fn prepare_media_refuses_stale_generation_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = TestClock::new(T0);
+    let (mut service, mut clock) = service_at(dir.path(), clock);
+    let capability = cap(&service);
+    let png = png_bytes(4, 2);
+    let available = service
+        .import(
+            &capability,
+            &request(
+                443,
+                Source::InlineBase64 {
+                    base64: base64(&png),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .unwrap();
+    let asset_ref = available.asset.unwrap();
+    let asset_id = asset_ref.asset_id.clone();
+    let lease = service
+        .lease(&capability, asset_id.as_str(), "instance-a", "channel-send", 60_000)
+        .unwrap();
+    assert_eq!(lease.generation, 1);
+
+    // A tombstone+resurrect racing the held lease makes generation 2 the
+    // current live row; the generation-1 lease must fail closed.
+    let now = clock.now();
+    let resurrected = AssetRecord {
+        asset_id: asset_id.as_str().to_string(),
+        security_domain: "personal".to_string(),
+        generation: 2,
+        content_hash: ContentHash::of_bytes(&png),
+        byte_length: png.len() as u64,
+        declared_media_type: Some("image/png".to_string()),
+        detected_media_type: Some("image/png".to_string()),
+        orientation: Some(1),
+        encoded_width: Some(4),
+        encoded_height: Some(2),
+        display_width: Some(4),
+        display_height: Some(2),
+        lifecycle: Lifecycle::Live,
+        deletion_generation: 0,
+        local_state: LocalState::Present,
+        replica_state: ReplicaState::Disabled,
+        tombstoned_at: None,
+        created_at: now.iso(),
+        updated_at: now.iso(),
+        updated_at_ms: now.millis,
+    };
+    let tx = service.store_transaction().unwrap();
+    tx.insert_asset(&resurrected, now).unwrap();
+    tx.commit().unwrap();
+
+    let err = service
+        .prepare_media(
+            &capability,
+            &prepare_request(asset_ref, MediaKind::Image, Some("image/png"), lease.lease_id),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.code,
+        AssetErrorCode::LeaseInvalid,
+        "a lease bound to a stale generation is refused"
+    );
+}
+
+#[test]
+fn prepare_media_refuses_foreign_domain_and_owner_leases() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut service, _clock) = service_at(dir.path(), TestClock::new(T0));
+    let owner = service.issue_capability("personal", "instance-a", "module-a");
+    let foreign_domain = service.issue_capability("work", "instance-a", "module-a");
+    let foreign_instance = service.issue_capability("personal", "instance-b", "module-a");
+    let png = png_bytes(4, 2);
+    let available = service
+        .import(
+            &owner,
+            &request(
+                444,
+                Source::InlineBase64 {
+                    base64: base64(&png),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .unwrap();
+    let asset_ref = available.asset.unwrap();
+    let asset_id = asset_ref.asset_id.as_str().to_string();
+    let lease = service
+        .lease(&owner, &asset_id, "instance-a", "channel-send", 60_000)
+        .unwrap();
+
+    let err = service
+        .prepare_media(
+            &foreign_domain,
+            &prepare_request(asset_ref.clone(), MediaKind::Image, Some("image/png"), lease.lease_id.clone()),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, AssetErrorCode::Unauthorized, "a foreign security-domain lease is refused");
+
+    let err = service
+        .prepare_media(
+            &foreign_instance,
+            &prepare_request(asset_ref, MediaKind::Image, Some("image/png"), lease.lease_id),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, AssetErrorCode::Unauthorized, "a foreign-owner lease is refused");
+}
+
+#[test]
+fn prepare_media_refuses_noncanonical_and_mismatched_references() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut service, _clock) = service_at(dir.path(), TestClock::new(T0));
+    let capability = cap(&service);
+    let png = png_bytes(4, 2);
+    let available = service
+        .import(
+            &capability,
+            &request(
+                445,
+                Source::InlineBase64 {
+                    base64: base64(&png),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .unwrap();
+    let asset_ref = available.asset.unwrap();
+    let asset_id = asset_ref.asset_id.as_str().to_string();
+    let lease = service
+        .lease(&capability, &asset_id, "instance-a", "channel-send", 60_000)
+        .unwrap();
+
+    // A non-canonical wire form (orientation outside 1..=8) is refused
+    // before any store access.
+    let mut noncanonical = asset_ref.clone();
+    noncanonical.orientation = Some(9);
+    let err = service
+        .prepare_media(
+            &capability,
+            &prepare_request(noncanonical, MediaKind::Image, Some("image/png"), lease.lease_id.clone()),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, AssetErrorCode::InvalidRequest, "a non-canonical reference is refused");
+
+    // A stale reference whose recorded byte length no longer matches the
+    // durable record is refused without releasing bytes.
+    let mut stale = asset_ref.clone();
+    stale.byte_length += 1;
+    let err = service
+        .prepare_media(
+            &capability,
+            &prepare_request(stale, MediaKind::Image, Some("image/png"), lease.lease_id.clone()),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, AssetErrorCode::NotFound, "a reference not matching the durable record is refused");
+
+    // A forged media-type claim (action override) is refused.
+    let err = service
+        .prepare_media(
+            &capability,
+            &prepare_request(asset_ref.clone(), MediaKind::Image, Some("image/jpeg"), lease.lease_id.clone()),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, AssetErrorCode::Unauthorized, "a forged claimed media type is refused");
+
+    // A forged media-kind claim is refused.
+    let err = service
+        .prepare_media(
+            &capability,
+            &prepare_request(asset_ref, MediaKind::Audio, Some("image/png"), lease.lease_id),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, AssetErrorCode::Unauthorized, "a forged expected media kind is refused");
+}
+
+#[test]
+fn prepare_media_refuses_active_document_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = TestClock::new(T0);
+    let (mut service, mut clock) = service_at(dir.path(), clock);
+    let capability = cap(&service);
+    let pdf = b"%PDF-1.4 fake pdf bytes exercising the active-content gate";
+    let (asset_id, asset_ref) =
+        seed_live_asset(&mut service, &mut clock, "personal", pdf, Some("application/pdf"));
+    let lease = service
+        .lease(&capability, asset_id.as_str(), "instance-a", "channel-send", 60_000)
+        .unwrap();
+    let err = service
+        .prepare_media(
+            &capability,
+            &prepare_request(asset_ref, MediaKind::File, Some("application/pdf"), lease.lease_id),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.code,
+        AssetErrorCode::UnsafeMedia,
+        "active document content is never relabeled into transportable media"
+    );
+}
+
+#[test]
+fn prepare_media_refuses_missing_bytes_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut service, _clock) = service_at(dir.path(), TestClock::new(T0));
+    let capability = cap(&service);
+    let png = png_bytes(4, 2);
+    let available = service
+        .import(
+            &capability,
+            &request(
+                446,
+                Source::InlineBase64 {
+                    base64: base64(&png),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .unwrap();
+    let asset_ref = available.asset.unwrap();
+    let asset_id = asset_ref.asset_id.as_str().to_string();
+    let lease = service
+        .lease(&capability, &asset_id, "instance-a", "channel-send", 60_000)
+        .unwrap();
+    fs::remove_file(dir.path().join("objects").join(&asset_id)).unwrap();
+    let err = service
+        .prepare_media(
+            &capability,
+            &prepare_request(asset_ref, MediaKind::Image, Some("image/png"), lease.lease_id),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.code,
+        AssetErrorCode::NotFound,
+        "deleted local bytes fail closed, never releasing bytes"
+    );
+}
+
+#[test]
+fn prepare_media_enforces_the_current_decoded_byte_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = TestClock::new(T0);
+    let (mut service, mut clock) = service_at(dir.path(), clock);
+    let big: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+    let (asset_id, asset_ref) = seed_live_asset(&mut service, &mut clock, "personal", &big, None);
+
+    // Reopen the same durable store under a lowered decoded bound: the
+    // current configuration authority must fail closed at preparation time.
+    let mut lowered = config_at(dir.path());
+    lowered.max_decoded_bytes = 1024;
+    let mut service2 = AssetService::open_with(
+        lowered,
+        clock.clone(),
+        DeniedFetcher,
+        DisabledReplica::new("assets"),
+    )
+    .expect("second service opens the same store");
+    let capability2 = service2.issue_capability("personal", "instance-a", "module-a");
+    let lease = service2
+        .lease(&capability2, asset_id.as_str(), "instance-a", "channel-send", 60_000)
+        .unwrap();
+    let err = service2
+        .prepare_media(
+            &capability2,
+            &prepare_request(asset_ref, MediaKind::File, None, lease.lease_id),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.code,
+        AssetErrorCode::SizeLimit,
+        "a lowered decoded bound fails closed at preparation time"
+    );
+}
+
+#[test]
+fn prepare_media_revalidation_after_read_revokes_and_returns_no_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut service, _clock) = service_at(dir.path(), TestClock::new(T0));
+    let capability = cap(&service);
+    let png = png_bytes(4, 2);
+    let available = service
+        .import(
+            &capability,
+            &request(
+                449,
+                Source::InlineBase64 {
+                    base64: base64(&png),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .unwrap();
+    let asset_ref = available.asset.unwrap();
+    let asset_id = asset_ref.asset_id.as_str().to_string();
+    let lease = service
+        .lease(&capability, &asset_id, "instance-a", "channel-send", 60_000)
+        .unwrap();
+
+    // Positive control: before the failpoint is armed the same request
+    // succeeds, so the failpoint is the only variable.
+    service
+        .prepare_media(
+            &capability,
+            &prepare_request(asset_ref.clone(), MediaKind::Image, Some("image/png"), lease.lease_id.clone()),
+        )
+        .expect("preparation succeeds before arming the failpoint");
+
+    // The failpoint revokes the lease in the exact window between the
+    // blocking read and the post-read revalidation. The deterministic
+    // barrier proves no prepared result escapes after revocation.
+    let revoke_lease_id = lease.lease_id.clone();
+    service.arm_prepare_failpoint(Some(PrepareFailpoint::new(
+        move |store: &mut AssetStore| {
+            let tx = store.transaction().unwrap();
+            assert!(
+                tx.release_lease(&revoke_lease_id).unwrap(),
+                "failpoint revokes the lease"
+            );
+            tx.commit().unwrap();
+        },
+    )));
+    let err = service
+        .prepare_media(
+            &capability,
+            &prepare_request(asset_ref, MediaKind::Image, Some("image/png"), lease.lease_id),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.code,
+        AssetErrorCode::LeaseInvalid,
+        "revocation after the read fails the whole preparation before release"
+    );
 }

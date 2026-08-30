@@ -13,6 +13,10 @@ use crate::content::{ObjectReader, delete_staging};
 use crate::error::{AssetError, AssetErrorCode, ErrorPhase};
 use crate::gc::{self, GcReport};
 use crate::pipeline::{ImportPipeline, RecoveryReport, validate_request};
+use crate::prepare::{
+    MediaPrepareRequest, PreparedMedia, PrepareFailpoint, media_kind_of_type, read_and_verify,
+    validate_prepare_authority,
+};
 use crate::record::{
     AssetLease, AssetPin, AssetReference, ImportRecord, ImportRequest, StatusResult,
 };
@@ -132,6 +136,8 @@ pub struct AssetService {
     /// bound to it; a capability from another (stale) service instance is
     /// refused before any store read or mutation.
     epoch: u64,
+    /// Deterministic race control for tests; never armed in production.
+    prepare_failpoint: Option<PrepareFailpoint>,
 }
 
 impl AssetService {
@@ -162,6 +168,7 @@ impl AssetService {
         Ok(Self {
             store,
             clock: Box::new(SystemClock),
+            prepare_failpoint: None,
             file_caps: FileCapabilityTable::default(),
             stream_caps: StreamCapabilityTable::default(),
             fetcher: Box::new(DeniedFetcher),
@@ -204,6 +211,7 @@ impl AssetService {
         Ok(Self {
             store,
             clock: Box::new(clock),
+            prepare_failpoint: None,
             file_caps: FileCapabilityTable::default(),
             stream_caps: StreamCapabilityTable::default(),
             fetcher: Box::new(fetcher),
@@ -214,7 +222,8 @@ impl AssetService {
         })
     }
 
-    /// Mint a capability for one security domain and module (Host boundary).
+    /// Mint a capability for one security domain, instance, and module (Host
+    /// boundary).
     pub fn issue_capability(
         &self,
         domain: impl Into<String>,
@@ -240,6 +249,14 @@ impl AssetService {
             ));
         }
         Ok(())
+    }
+
+    /// Arm (or disarm) the deterministic preparation failpoint. Production
+    /// never arms it; tests use it to revoke the lease or alter durable
+    /// state in the exact window between the blocking read and the
+    /// post-read revalidation.
+    pub fn arm_prepare_failpoint(&mut self, failpoint: Option<PrepareFailpoint>) {
+        self.prepare_failpoint = failpoint;
     }
 
     /// Register a Host-issued file capability inside an allowed root.
@@ -549,6 +566,110 @@ impl AssetService {
     /// Iterator over deletion failures for operator enumeration.
     pub fn deletion_failures(&mut self) -> Result<Vec<crate::record::AssetTombstone>, AssetError> {
         gc::enumerate_deletion_failures(&mut self.store)
+    }
+
+    /// Prepare one available asset for transport (WP-013B seam).
+    ///
+    /// Accepts only a canonical `AssetRef` whose durable lifecycle row is
+    /// live and present in this security domain at the current generation,
+    /// with a caller-held lease that is unexpired and bound to this
+    /// capability's instance, domain, asset, and generation. The caller's
+    /// media-kind and media-type claims are checks; the result carries only
+    /// the authoritative detected type used at import, and active document
+    /// content is refused. Bytes are read through the content-addressed
+    /// `ObjectReader`, verified against the recorded digest, and the full
+    /// authority is revalidated after the blocking read and immediately
+    /// before the typed result is released.
+    pub fn prepare_media(
+        &mut self,
+        capability: &AssetCapability,
+        request: &MediaPrepareRequest,
+    ) -> Result<PreparedMedia, AssetError> {
+        self.check_live(capability)?;
+        request.asset_ref.validate().map_err(|reason| {
+            AssetError::new(
+                AssetErrorCode::InvalidRequest,
+                ErrorPhase::Validate,
+                format!("non-canonical asset reference: {reason}"),
+            )
+        })?;
+        let asset_id = request.asset_ref.asset_id.as_str().to_string();
+
+        // Phase 1: snapshot and validate the exact lease and durable
+        // AVAILABLE authority in one transaction.
+        let first = {
+            let tx = self.store.transaction().map_err(store_error_public)?;
+            let authority = validate_prepare_authority(
+                &tx,
+                capability,
+                request,
+                self.clock.now().millis,
+            )?;
+            tx.commit().map_err(store_error_public)?;
+            authority
+        };
+
+        // Config authority at preparation time: a lowered decoded bound
+        // fails closed here, exactly like any other admission.
+        if first.asset.byte_length > self.config.max_decoded_bytes {
+            return Err(AssetError::new(
+                AssetErrorCode::SizeLimit,
+                ErrorPhase::Acquire,
+                format!(
+                    "asset byte length {} exceeds the configured decoded bound {}",
+                    first.asset.byte_length, self.config.max_decoded_bytes
+                ),
+            ));
+        }
+
+        // Phase 2: bounded content-addressed read with digest verification.
+        let bytes = read_and_verify(
+            &self.config.local_root,
+            &asset_id,
+            first.asset.byte_length,
+            &first.asset.content_hash,
+        )?;
+
+        // Deterministic race control (tests only): run exactly between the
+        // blocking read and the post-read revalidation.
+        if let Some(failpoint) = &mut self.prepare_failpoint {
+            (failpoint.after_read)(&mut self.store);
+        }
+
+        // Phase 3: revalidate the full authority after the blocking work
+        // and immediately before releasing the bytes.
+        let revalidated = {
+            let tx = self.store.transaction().map_err(store_error_public)?;
+            let authority = validate_prepare_authority(
+                &tx,
+                capability,
+                request,
+                self.clock.now().millis,
+            )?;
+            if authority.asset.content_hash != first.asset.content_hash
+                || authority.asset.byte_length != first.asset.byte_length
+            {
+                tx.commit().map_err(store_error_public)?;
+                return Err(AssetError::new(
+                    AssetErrorCode::NotFound,
+                    ErrorPhase::Acquire,
+                    "asset state changed during preparation".to_string(),
+                ));
+            }
+            tx.commit().map_err(store_error_public)?;
+            authority
+        };
+
+        Ok(PreparedMedia {
+            asset_ref: request.asset_ref.clone(),
+            media_kind: media_kind_of_type(Some(&revalidated.detected_type)),
+            media_type: revalidated.detected_type,
+            byte_length: revalidated.asset.byte_length,
+            generation: revalidated.asset.generation,
+            digest: revalidated.asset.content_hash,
+            lease_id: revalidated.lease.lease_id,
+            bytes,
+        })
     }
 
     /// Reconciliation hook: a rejected/cancelled terminal import must keep
