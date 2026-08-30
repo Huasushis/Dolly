@@ -17,14 +17,14 @@
 //! These routes are the seam the production daemon and the G4 conformance
 //! routes both drive; the accepted Asset/Channel surfaces are used unchanged.
 
+use crate::multimodal::{ChannelAssetSeam, ChannelAttachmentImport};
 use dolly_asset::config::ResolvedAssetConfig;
 use dolly_asset::facade::AssetHostFacade;
 use dolly_asset::record::{ImportRequest, StatusResult};
 use dolly_asset::service::AssetCapability;
+use dolly_channel::clock::Clock;
 use dolly_channel::config::{ChannelConfig, EXTENSION_ID};
 use dolly_channel::receiver::{AuthenticatedChannelEvent, ChannelEventContent, InboundReceiver};
-use dolly_channel::clock::Clock;
-use crate::multimodal::{ChannelAssetSeam, ChannelAttachmentImport};
 use dolly_storage::{
     HostCapabilityGrant, HostConnectionAuthority, SqliteCoreStore, SqliteHostIngressStore,
     StorageError,
@@ -120,9 +120,9 @@ impl<'runtime> AssetHostRoute<'runtime> {
                 "the grant does not authorize host.asset.import/host.asset.status",
             ));
         }
-        config.validate().map_err(|detail| {
-            capability_denied(format!("asset config invalid: {detail}"))
-        })?;
+        config
+            .validate()
+            .map_err(|detail| capability_denied(format!("asset config invalid: {detail}")))?;
         let facade = AssetHostFacade::open(config).map_err(|error| {
             let envelope = error.to_envelope();
             HostRouteError::Rejected {
@@ -137,7 +137,10 @@ impl<'runtime> AssetHostRoute<'runtime> {
         // identifier (never a UUID); derive one deterministically from the
         // sealed worker epoch so no caller can choose or forge it.
         let instance_id = format!("i{worker_epoch}");
-        if instance_id.parse::<dolly_core_domain::InstanceId>().is_err() {
+        if instance_id
+            .parse::<dolly_core_domain::InstanceId>()
+            .is_err()
+        {
             return Err(capability_denied(
                 "sealed worker epoch cannot form a stable instance identifier",
             ));
@@ -205,12 +208,12 @@ impl<'runtime> AssetHostRoute<'runtime> {
                 "import request module/instance does not match the granted route",
             ));
         }
-        self.facade.import(&self.capability, request).map_err(|envelope| {
-            HostRouteError::Rejected {
+        self.facade
+            .import(&self.capability, request)
+            .map_err(|envelope| HostRouteError::Rejected {
                 code: envelope.code,
                 message: envelope.message,
-            }
-        })
+            })
     }
 
     /// Read one `host.asset.status` under the bound capability. Unknown and
@@ -221,12 +224,12 @@ impl<'runtime> AssetHostRoute<'runtime> {
         request: &dolly_asset::facade::AssetStatusRequest,
     ) -> Result<StatusResult, HostRouteError> {
         self.revalidate()?;
-        self.facade.status(&self.capability, request).map_err(|envelope| {
-            HostRouteError::Rejected {
+        self.facade
+            .status(&self.capability, request)
+            .map_err(|envelope| HostRouteError::Rejected {
                 code: envelope.code,
                 message: envelope.message,
-            }
-        })
+            })
     }
 }
 
@@ -314,12 +317,12 @@ pub fn authenticated_channel_event(
             "the grant does not authorize host.ingress.submit",
         ));
     }
-    AuthenticatedChannelEvent::new(authority, grant, config_revision, event).map_err(
-        |error| HostRouteError::Rejected {
+    AuthenticatedChannelEvent::new(authority, grant, config_revision, event).map_err(|error| {
+        HostRouteError::Rejected {
             code: error.code,
             message: error.message,
-        },
-    )
+        }
+    })
 }
 
 /// Open the durable Channel inbound route for one activated
@@ -483,10 +486,12 @@ pub fn reconcile_channel_inbound_route<'connection, 'principal>(
         authority,
         grant,
     )?;
-    receiver.reconcile().map_err(|error| HostRouteError::Rejected {
-        code: error.code,
-        message: error.message,
-    })
+    receiver
+        .reconcile()
+        .map_err(|error| HostRouteError::Rejected {
+            code: error.code,
+            message: error.message,
+        })
 }
 
 /// Restart/activation reconciliation for the multimodal inbound route: opens
@@ -515,10 +520,12 @@ pub fn reconcile_channel_inbound_route_with_assets<'connection, 'principal>(
         authority,
         grant,
     )?;
-    receiver.reconcile().map_err(|error| HostRouteError::Rejected {
-        code: error.code,
-        message: error.message,
-    })
+    receiver
+        .reconcile()
+        .map_err(|error| HostRouteError::Rejected {
+            code: error.code,
+            message: error.message,
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -530,9 +537,9 @@ pub fn reconcile_channel_inbound_route_with_assets<'connection, 'principal>(
 
 use dolly_channel::ledger::OutboundState;
 use dolly_channel::outbound_consumer::{ConsumerOutcome, OutboundConsumer};
-use std::collections::HashSet;
 use dolly_channel::outbound_queue::OutboundQueueGate;
 use dolly_channel::transport::ChannelTransport;
+use std::collections::HashSet;
 
 /// The result of one bounded runtime consumer/recovery pass.
 #[derive(Debug, Clone, PartialEq)]
@@ -552,7 +559,6 @@ pub struct ChannelOutboundRunReport {
     /// Terminal outcomes produced this pass (frozen ActionResult envelopes).
     pub terminal: Vec<ConsumerOutcome>,
 }
-
 
 /// Whether a terminal row carries direct transport sent/confirmed evidence:
 /// only `Confirmed` (every piece confirmed) and `Partial` (at least one
@@ -600,12 +606,11 @@ fn classify_outcome(outcome: &ConsumerOutcome) -> (bool, Option<String>, bool) {
     }
 }
 
-/// Bounded process/daemon shutdown for every registered Asset route: each
-/// registration's single Asset service/capability set is released
-/// deterministically (in-flight route and adapter handles complete normally;
-/// their stores are dropped when the last handle releases).
-pub fn shutdown_asset_routes() {
-    crate::multimodal::asset_route_shutdown();
+/// Bounded process/daemon shutdown for every registered Asset route. New
+/// opens are refused first; every owner is then drained and joined within the
+/// shared shutdown deadline. Closed route handles remain unusable.
+pub fn shutdown_asset_routes() -> Result<(), HostRouteError> {
+    crate::multimodal::asset_route_shutdown()
 }
 
 fn channel_error(code: String, message: String) -> HostRouteError {
@@ -627,11 +632,9 @@ fn channel_error(code: String, message: String) -> HostRouteError {
 pub struct ChannelOutboundRoute<'principal> {
     config: ChannelConfig,
     gate: std::sync::Arc<OutboundQueueGate>,
-    /// The route's single owned Asset registration when multimodal
-    /// (production): it owns the exact Asset service/capability set shared
-    /// by every outbound/inbound open; `None` keeps the route's outbound
-    /// Asset seam fail-closed on every asset part.
-    registration: Option<std::sync::Arc<crate::multimodal::AssetRouteRegistration>>,
+    /// The route's counted handle to the single identity-scoped Asset owner.
+    /// `None` keeps asset preparation fail-closed.
+    registration: Option<crate::multimodal::AssetRouteHandle>,
     authority: &'principal HostConnectionAuthority,
     grant: &'principal HostCapabilityGrant,
 }
@@ -689,16 +692,15 @@ impl<'principal> ChannelOutboundRoute<'principal> {
         Ok(route)
     }
 
-    /// Explicit lifecycle close for this route's owned Asset registration:
-    /// withholds the registration so new outbound/inbound opens fail closed
-    /// while any still-live route or adapter handle keeps the owned service
-    /// set alive safely. Returns whether the registration was present.
+    /// Mark this identity's Asset owner closing. Every existing handle
+    /// observes the close; this route cannot open another consumer afterward.
+    /// The registry retains the registration until all handles drop and the
+    /// owner thread joins.
     pub fn unregister(&self) -> Result<bool, HostRouteError> {
-        crate::multimodal::asset_route_unregister(
-            self.authority,
-            self.grant,
-            self.config.revision,
-        )
+        Ok(self
+            .registration
+            .as_ref()
+            .is_some_and(crate::multimodal::AssetRouteHandle::unregister))
     }
 
     /// The single shared gate for this store identity (registered above).
@@ -717,7 +719,7 @@ impl<'principal> ChannelOutboundRoute<'principal> {
         transport: Box<dyn ChannelTransport>,
     ) -> Result<OutboundConsumer<'store, 'core, 'principal>, HostRouteError> {
         let assets = match &self.registration {
-            Some(registration) => ChannelAssetSeam::from_registration(registration),
+            Some(registration) => ChannelAssetSeam::from_registration(registration)?,
             None => ChannelAssetSeam::unbound(),
         };
         OutboundConsumer::with_asset_preparation(
@@ -746,12 +748,7 @@ impl<'principal> ChannelOutboundRoute<'principal> {
         transport: Box<dyn ChannelTransport>,
         caller_deadline: &str,
     ) -> Result<ChannelOutboundRunReport, HostRouteError> {
-        let mut consumer = self.open(
-            module_connection,
-            runtime_connection,
-            clock,
-            transport,
-        )?;
+        let mut consumer = self.open(module_connection, runtime_connection, clock, transport)?;
         let outcomes = consumer
             .consume(caller_deadline)
             .map_err(|error| channel_error(error.code, error.message))?;
@@ -809,12 +806,7 @@ impl<'principal> ChannelOutboundRoute<'principal> {
         caller_deadline: &str,
         max_passes: usize,
     ) -> Result<ChannelOutboundRunReport, HostRouteError> {
-        let mut consumer = self.open(
-            module_connection,
-            runtime_connection,
-            clock,
-            transport,
-        )?;
+        let mut consumer = self.open(module_connection, runtime_connection, clock, transport)?;
         let mut transported = 0usize;
         let mut rejected = 0usize;
         let mut pending = 0usize;

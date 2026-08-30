@@ -18,24 +18,23 @@ use std::path::Path;
 use std::sync::Arc;
 
 use dolly_canonical_json::canonicalize;
+use dolly_channel::asset::{MediaKind as ChannelMediaKind, MediaType as ChannelMediaType};
 use dolly_channel::{
     AuthenticatedChannelEvent, ChannelConfig, ChannelConfigBuilder, ChannelEventContent, EventKind,
     InboundAttachment, IngressOutcome,
 };
-use dolly_channel::asset::{MediaKind as ChannelMediaKind, MediaType as ChannelMediaType};
 use dolly_core_reducer::{
     CoreCommand, EnvironmentInput, InstallConfigCommand, InstallGraphCommand, TransitionOutcome,
 };
 use dolly_runtime::{
-    ChannelOutboundRoute, HostRouteError, ProviderAttachmentReader,
-    install_channel_store_schema, open_channel_inbound_route_with_assets,
-    reconcile_channel_inbound_route_with_assets,
+    ChannelOutboundRoute, HostRouteError, ProviderAttachmentReader, install_channel_store_schema,
+    open_channel_inbound_route_with_assets, reconcile_channel_inbound_route_with_assets,
 };
 use dolly_storage::{
     HostCapabilityGrant, HostConnectionAuthority, SqliteCoreStore, create_host_ingress_schema,
 };
 use rusqlite::Connection;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const CHANNEL_NOW: &str = "2026-08-28T00:00:00.000000Z";
 const EXTENSION_ID: &str = "org.dolly.channel";
@@ -91,17 +90,20 @@ impl Scratch {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("wp013b-route-{tag}-{}-{stamp:x}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "wp013b-route-{tag}-{}-{stamp:x}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         Scratch(PathBufHolder(dir))
     }
     fn path(&self) -> &Path {
-        &self.0 .0
+        &self.0.0
     }
 }
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0 .0);
+        let _ = std::fs::remove_dir_all(&self.0.0);
     }
 }
 
@@ -181,7 +183,16 @@ fn graph_snapshot(module_id: &str, output_pages: &[&str]) -> Value {
 /// listing exactly the given host methods, plus the durable Host ingress
 /// slice and the module-scoped Channel store schema. The exact state the
 /// runtime registration binds to.
-fn harness(mark: &str, methods: &[&str]) -> (Connection, Connection, HostConnectionAuthority, HostCapabilityGrant, ChannelConfig) {
+fn harness(
+    mark: &str,
+    methods: &[&str],
+) -> (
+    Connection,
+    Connection,
+    HostConnectionAuthority,
+    HostCapabilityGrant,
+    ChannelConfig,
+) {
     let mut runtime = Connection::open_in_memory().unwrap();
     let authority = {
         let mut store = SqliteCoreStore::new(&mut runtime).unwrap();
@@ -318,17 +329,29 @@ fn committed_parts(runtime: &mut Connection, block_id: &str) -> Vec<Value> {
 #[test]
 fn bound_route_imports_attachment_and_commits_exact_asset_ref() {
     let scratch = Scratch::new("positive");
-    let methods = &["host.ingress.submit", "host.asset.import", "host.asset.status"];
+    let methods = &[
+        "host.ingress.submit",
+        "host.asset.import",
+        "host.asset.status",
+    ];
     let (mut runtime, mut module_store, authority, grant, config) = harness("route-pos", methods);
     let asset_config = asset_config_at(scratch.path());
-    register_outbound_assets(&mut module_store, &authority, &grant, &config, asset_config.clone());
+    register_outbound_assets(
+        &mut module_store,
+        &authority,
+        &grant,
+        &config,
+        asset_config.clone(),
+    );
 
     let provider = FakeProvider::serving(png_bytes());
     let mut receiver = open_channel_inbound_route_with_assets(
         &mut runtime,
         &mut module_store,
         config.clone(),
-        Box::new(dolly_channel::VirtualClock::at(CHANNEL_NOW.parse().unwrap())),
+        Box::new(dolly_channel::VirtualClock::at(
+            CHANNEL_NOW.parse().unwrap(),
+        )),
         asset_config,
         Box::new(provider),
         &authority,
@@ -355,7 +378,11 @@ fn bound_route_imports_attachment_and_commits_exact_asset_ref() {
         .iter()
         .filter(|part| part.get("kind").and_then(Value::as_str) == Some("asset"))
         .collect();
-    assert_eq!(asset_parts.len(), 1, "exactly one asset part in the committed block");
+    assert_eq!(
+        asset_parts.len(),
+        1,
+        "exactly one asset part in the committed block"
+    );
     let asset_part = asset_parts[0];
     let asset_id = asset_part["asset_id"].as_str().expect("canonical asset id");
     assert!(
@@ -373,7 +400,9 @@ fn bound_route_imports_attachment_and_commits_exact_asset_ref() {
         &mut runtime,
         &mut module_store,
         config.clone(),
-        Box::new(dolly_channel::VirtualClock::at(CHANNEL_NOW.parse().unwrap())),
+        Box::new(dolly_channel::VirtualClock::at(
+            CHANNEL_NOW.parse().unwrap(),
+        )),
         asset_config_at(scratch.path()),
         Box::new(FakeProvider::serving(png_bytes())),
         &authority,
@@ -384,7 +413,7 @@ fn bound_route_imports_attachment_and_commits_exact_asset_ref() {
         &authority,
         &grant,
         config.revision,
-        content("evt-status", "s"), 
+        content("evt-status", "s"),
         vec![attachment(0, "provider-blob-status-unrelated")],
     )
     .expect("sealed status event");
@@ -408,8 +437,7 @@ fn bound_route_imports_attachment_and_commits_exact_asset_ref() {
         "each attachment key imports exactly one asset part"
     );
     assert_eq!(
-        asset_part2["asset_id"],
-        asset_part["asset_id"],
+        asset_part2["asset_id"], asset_part["asset_id"],
         "identical content is content-addressed to the same canonical AssetRef"
     );
 }
@@ -443,7 +471,9 @@ fn missing_asset_grants_refuse_the_bound_route() {
         &mut runtime,
         &mut module_store,
         config.clone(),
-        Box::new(dolly_channel::VirtualClock::at(CHANNEL_NOW.parse().unwrap())),
+        Box::new(dolly_channel::VirtualClock::at(
+            CHANNEL_NOW.parse().unwrap(),
+        )),
         asset_config,
         Box::new(FakeProvider::serving(png_bytes())),
         &authority,
@@ -458,8 +488,13 @@ fn missing_asset_grants_refuse_the_bound_route() {
 #[test]
 fn missing_registered_asset_root_refuses_inbound_even_with_grants() {
     let scratch = Scratch::new("missing-root");
-    let methods = &["host.ingress.submit", "host.asset.import", "host.asset.status"];
-    let (mut runtime, mut module_store, authority, grant, config) = harness("route-noroot", methods);
+    let methods = &[
+        "host.ingress.submit",
+        "host.asset.import",
+        "host.asset.status",
+    ];
+    let (mut runtime, mut module_store, authority, grant, config) =
+        harness("route-noroot", methods);
     // No outbound registration ever ran: no registered Asset root exists, so
     // the inbound bound route fails closed instead of opening an unbounded
     // adapter set.
@@ -467,7 +502,9 @@ fn missing_registered_asset_root_refuses_inbound_even_with_grants() {
         &mut runtime,
         &mut module_store,
         config.clone(),
-        Box::new(dolly_channel::VirtualClock::at(CHANNEL_NOW.parse().unwrap())),
+        Box::new(dolly_channel::VirtualClock::at(
+            CHANNEL_NOW.parse().unwrap(),
+        )),
         asset_config_at(scratch.path()),
         Box::new(FakeProvider::serving(png_bytes())),
         &authority,
@@ -475,7 +512,9 @@ fn missing_registered_asset_root_refuses_inbound_even_with_grants() {
     );
     match inbound {
         Err(HostRouteError::CapabilityDenied { .. }) => {}
-        _other => panic!("expected CapabilityDenied for missing Asset root, got an unexpected success"),
+        _other => {
+            panic!("expected CapabilityDenied for missing Asset root, got an unexpected success")
+        }
     }
 }
 
@@ -483,7 +522,11 @@ fn missing_registered_asset_root_refuses_inbound_even_with_grants() {
 fn mismatched_asset_root_refuses_inbound() {
     let scratch_a = Scratch::new("root-a");
     let scratch_b = Scratch::new("root-b");
-    let methods = &["host.ingress.submit", "host.asset.import", "host.asset.status"];
+    let methods = &[
+        "host.ingress.submit",
+        "host.asset.import",
+        "host.asset.status",
+    ];
     let (mut runtime, mut module_store, authority, grant, config) = harness("route-rootm", methods);
     let registered = asset_config_at(scratch_a.path());
     register_outbound_assets(&mut module_store, &authority, &grant, &config, registered);
@@ -492,7 +535,9 @@ fn mismatched_asset_root_refuses_inbound() {
         &mut runtime,
         &mut module_store,
         config.clone(),
-        Box::new(dolly_channel::VirtualClock::at(CHANNEL_NOW.parse().unwrap())),
+        Box::new(dolly_channel::VirtualClock::at(
+            CHANNEL_NOW.parse().unwrap(),
+        )),
         asset_config_at(scratch_b.path()),
         Box::new(FakeProvider::serving(png_bytes())),
         &authority,
@@ -500,7 +545,9 @@ fn mismatched_asset_root_refuses_inbound() {
     );
     match inbound {
         Err(HostRouteError::CapabilityDenied { .. }) => {}
-        _other => panic!("expected CapabilityDenied for mismatched root, got an unexpected success"),
+        _other => {
+            panic!("expected CapabilityDenied for mismatched root, got an unexpected success")
+        }
     }
 }
 
@@ -511,10 +558,20 @@ fn mismatched_asset_root_refuses_inbound() {
 #[test]
 fn restart_reconcile_reuses_the_bound_adapter_set_status_first() {
     let scratch = Scratch::new("restart");
-    let methods = &["host.ingress.submit", "host.asset.import", "host.asset.status"];
+    let methods = &[
+        "host.ingress.submit",
+        "host.asset.import",
+        "host.asset.status",
+    ];
     let (mut runtime, mut module_store, authority, grant, config) = harness("route-recon", methods);
     let asset_config = asset_config_at(scratch.path());
-    register_outbound_assets(&mut module_store, &authority, &grant, &config, asset_config.clone());
+    register_outbound_assets(
+        &mut module_store,
+        &authority,
+        &grant,
+        &config,
+        asset_config.clone(),
+    );
 
     let provider = FakeProvider::serving(png_bytes());
     {
@@ -522,7 +579,9 @@ fn restart_reconcile_reuses_the_bound_adapter_set_status_first() {
             &mut runtime,
             &mut module_store,
             config.clone(),
-            Box::new(dolly_channel::VirtualClock::at(CHANNEL_NOW.parse().unwrap())),
+            Box::new(dolly_channel::VirtualClock::at(
+                CHANNEL_NOW.parse().unwrap(),
+            )),
             asset_config.clone(),
             Box::new(provider.clone()),
             &authority,
@@ -543,7 +602,11 @@ fn restart_reconcile_reuses_the_bound_adapter_set_status_first() {
             "first pass commits the imported attachment"
         );
     }
-    assert_eq!(provider.reads(), 1, "one bounded provider read on the first pass");
+    assert_eq!(
+        provider.reads(),
+        1,
+        "one bounded provider read on the first pass"
+    );
 
     // Restart: reconcile reopens the SAME bound provider+Asset adapter set
     // (never the unbound seam) and settles status-first with no re-read and
@@ -552,15 +615,24 @@ fn restart_reconcile_reuses_the_bound_adapter_set_status_first() {
         &mut runtime,
         &mut module_store,
         config.clone(),
-        Box::new(dolly_channel::VirtualClock::at(CHANNEL_NOW.parse().unwrap())),
+        Box::new(dolly_channel::VirtualClock::at(
+            CHANNEL_NOW.parse().unwrap(),
+        )),
         asset_config.clone(),
         Box::new(provider.clone()),
         &authority,
         &grant,
     )
     .expect("restart reconcile runs the bound set");
-    assert_eq!(remaining, 0, "status-first reconcile drains the durable intent");
-    assert_eq!(provider.reads(), 1, "restart settle never re-reads provider bytes");
+    assert_eq!(
+        remaining, 0,
+        "status-first reconcile drains the durable intent"
+    );
+    assert_eq!(
+        provider.reads(),
+        1,
+        "restart settle never re-reads provider bytes"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -571,17 +643,29 @@ fn restart_reconcile_reuses_the_bound_adapter_set_status_first() {
 #[test]
 fn unregister_withdraws_the_route_registration_for_new_opens() {
     let scratch = Scratch::new("withdraw");
-    let methods = &["host.ingress.submit", "host.asset.import", "host.asset.status"];
+    let methods = &[
+        "host.ingress.submit",
+        "host.asset.import",
+        "host.asset.status",
+    ];
     let (mut runtime, mut module_store, authority, grant, config) = harness("route-with", methods);
     let asset_config = asset_config_at(scratch.path());
-    register_outbound_assets(&mut module_store, &authority, &grant, &config, asset_config.clone());
+    register_outbound_assets(
+        &mut module_store,
+        &authority,
+        &grant,
+        &config,
+        asset_config.clone(),
+    );
 
     // While registered, inbound bound opens share the registration.
-    let mut receiver = open_channel_inbound_route_with_assets(
+    let receiver = open_channel_inbound_route_with_assets(
         &mut runtime,
         &mut module_store,
         config.clone(),
-        Box::new(dolly_channel::VirtualClock::at(CHANNEL_NOW.parse().unwrap())),
+        Box::new(dolly_channel::VirtualClock::at(
+            CHANNEL_NOW.parse().unwrap(),
+        )),
         asset_config.clone(),
         Box::new(FakeProvider::serving(png_bytes())),
         &authority,
@@ -605,21 +689,44 @@ fn unregister_withdraws_the_route_registration_for_new_opens() {
     let second_time = route.unregister().expect("second close is idempotent");
     assert!(!second_time, "a second close has nothing to remove");
 
+    // The route object still holds a counted handle, but close is observable:
+    // opening an outbound consumer through that old object fails closed.
+    let outbound = route.open(
+        &mut module_store,
+        &mut runtime,
+        Box::new(dolly_channel::VirtualClock::at(
+            CHANNEL_NOW.parse().unwrap(),
+        )),
+        Box::new(dolly_channel::transport::ScriptedTransport::new(true)),
+    );
+    assert!(
+        matches!(
+            outbound,
+            Err(HostRouteError::Rejected { ref code, .. }) if code == "ASSET_OWNER_CLOSED"
+        ),
+        "ChannelOutboundRoute::open must fail after unregister"
+    );
+
     // New inbound opens fail closed after the withdrawal.
     let inbound = open_channel_inbound_route_with_assets(
         &mut runtime,
         &mut module_store,
         config.clone(),
-        Box::new(dolly_channel::VirtualClock::at(CHANNEL_NOW.parse().unwrap())),
+        Box::new(dolly_channel::VirtualClock::at(
+            CHANNEL_NOW.parse().unwrap(),
+        )),
         asset_config,
         Box::new(FakeProvider::serving(png_bytes())),
         &authority,
         &grant,
     );
-    match inbound {
-        Err(HostRouteError::CapabilityDenied { .. }) => {}
-        other => panic!("withdrawn registration must fail new opens, got an unexpected success"),
-    }
+    assert!(
+        matches!(
+            inbound,
+            Err(HostRouteError::Rejected { ref code, .. }) if code == "ASSET_OWNER_CLOSED"
+        ),
+        "withdrawn registration must fail inbound opens closed"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -629,11 +736,21 @@ fn unregister_withdraws_the_route_registration_for_new_opens() {
 #[test]
 fn fail_closed_surfaces_never_leak_root_or_capability() {
     let scratch = Scratch::new("leak");
-    let methods = &["host.ingress.submit", "host.asset.import", "host.asset.status"];
+    let methods = &[
+        "host.ingress.submit",
+        "host.asset.import",
+        "host.asset.status",
+    ];
     let (mut runtime, mut module_store, authority, grant, config) = harness("route-leak", methods);
     let asset_config = asset_config_at(scratch.path());
     let root_text = asset_config.local_root.to_string_lossy().into_owned();
-    register_outbound_assets(&mut module_store, &authority, &grant, &config, asset_config.clone());
+    register_outbound_assets(
+        &mut module_store,
+        &authority,
+        &grant,
+        &config,
+        asset_config.clone(),
+    );
 
     // A provider refusal maps to a closed Channel error; the content root and
     // any capability token must never appear.
@@ -643,7 +760,9 @@ fn fail_closed_surfaces_never_leak_root_or_capability() {
         &mut runtime,
         &mut module_store,
         config.clone(),
-        Box::new(dolly_channel::VirtualClock::at(CHANNEL_NOW.parse().unwrap())),
+        Box::new(dolly_channel::VirtualClock::at(
+            CHANNEL_NOW.parse().unwrap(),
+        )),
         asset_config,
         Box::new(provider),
         &authority,

@@ -28,16 +28,19 @@
 //! the single production registration per store/account/config lifecycle.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dolly_asset::config::ResolvedAssetConfig;
 use dolly_asset::prepare::{MediaPrepareRequest, PreparedMedia};
 use dolly_asset::record::{ImportRequest, MediaKind, Source, StatusResult};
-use dolly_asset::service::{AssetCapability, AssetService};
+use dolly_asset::service::AssetService;
 use dolly_channel::asset::{
     AssetId as ChannelAssetId, AssetPayload, AssetPremise, AssetPreparation,
-    AssetRef as ChannelAssetRef, ContentHash as ChannelContentHash,
-    MediaKind as ChannelMediaKind, MediaType as ChannelMediaType,
+    AssetRef as ChannelAssetRef, ContentHash as ChannelContentHash, MediaKind as ChannelMediaKind,
+    MediaType as ChannelMediaType,
 };
 use dolly_channel::attachment::{
     AttachmentImportRequest, AttachmentImportStatus, AvailableAttachment, InboundAssetImport,
@@ -52,7 +55,7 @@ use crate::host_routes::HostRouteError;
 /// within a caller-supplied byte bound — never a raw path, ambient network,
 /// or caller authority claim. Acceptance injects a deterministic fake;
 /// production binds the transport's own provider fetch here.
-pub trait ProviderAttachmentReader {
+pub trait ProviderAttachmentReader: Send {
     /// Read the exact bytes for `provider_key`, refusing when the provider
     /// cannot authenticate the key, the bytes are unavailable, or the payload
     /// exceeds `max_bytes`. Errors are closed and must not expose a path,
@@ -65,15 +68,8 @@ pub trait ProviderAttachmentReader {
 // ---------------------------------------------------------------------------
 
 /// The sealed identity a registered Asset route belongs to. Both Channel
-/// directions (outbound prepare and inbound import) for the same
-/// store/account/activation must resolve to the exact same Asset store, so
-/// registration records ONE root per identity and every later binding must
-/// match it or fail closed.
-/// The stable lookup key of one Asset route registration: the sealed
-/// extension/module/connection/account/config lifecycle facts. The full
-/// recorded identity additionally pins the extension generation and the
-/// exact content root, so a mismatch of either fails closed instead of
-/// reusing another registered store.
+/// directions for one extension/module/account/config lifecycle resolve to
+/// this key and therefore to one Asset owner thread.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct AssetRouteKey {
     extension_connection_id: String,
@@ -84,84 +80,604 @@ struct AssetRouteKey {
     principal_account: String,
 }
 
-/// The complete recorded identity of one registration.
+/// The complete recorded identity of one registration. The stable key finds
+/// the registration; generation and canonical content root must also match.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct AssetRouteFacts {
     key: AssetRouteKey,
+    instance_id: String,
     extension_generation: i64,
     root_key: String,
 }
 
-/// The ONE owned Asset store/capability set shared by every outbound and
-/// inbound open of one Asset route identity. The accepted `AssetService` is
-/// not `Send`; the runtime serves a module sequentially (never two adapters
-/// at once), so the exact single service is shared through an
-/// interior-mutable handle and is never duplicated.
-struct SharedAssetStore {
-    service: std::cell::RefCell<AssetService>,
-    capability: AssetCapability,
+/// The registration lifecycle. `Closing` rejects every new handle and
+/// operation. `Stopping` means the bounded shutdown command has been or is
+/// being delivered. `Closed` is reached only after the owner thread joined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssetOwnerState {
+    Starting,
+    Active,
+    Closing,
+    Stopping,
+    Closed,
 }
 
-// SAFETY: the accepted `AssetService` is not marked `Send`, but every access
-// to a `SharedAssetStore` happens under one of two single-threaded
-// invariants: the registry mutex (register/open/unregister/shutdown) or an
-// adapter method that holds the `RefCell` borrow for the duration of one
-// call. The runtime processes a module sequentially and no store is ever
-// borrowed from two threads at once, so marking the holder Send+Sync (with
-// the RefCell still enforcing single-borrow at runtime) is sound.
-unsafe impl Send for SharedAssetStore {}
-unsafe impl Sync for SharedAssetStore {}
+struct AssetRouteLifecycle {
+    state: AssetOwnerState,
+    live_handles: usize,
+}
 
-/// One bounded, identity-scoped Asset route registration. It owns the exact
-/// Asset service/capability set and is SHARED (Arc, never duplicated) by
-/// every outbound/inbound open for the identity. The registration is removed
-/// only by explicit `unregister` (lifecycle close) or bounded `shutdown`.
+/// Only the data required for one lease plus authoritative media preparation
+/// crosses into the owner thread. No service, store, path, capability, or
+/// caller-provided closure is part of the request interface.
+struct LeaseAndPrepareRequest {
+    asset_id: dolly_asset::identity::AssetId,
+    expected_media_kind: MediaKind,
+    claimed_media_type: dolly_asset::identity::MediaType,
+}
+
+#[derive(Debug)]
+struct AssetOwnerFailure {
+    code: String,
+}
+
+enum AssetOwnerRequest {
+    LeaseAndPrepare {
+        request: LeaseAndPrepareRequest,
+        reply: SyncSender<Result<PreparedMedia, AssetOwnerFailure>>,
+    },
+    Import {
+        request: ImportRequest,
+        reply: SyncSender<Result<StatusResult, AssetOwnerFailure>>,
+    },
+    Status {
+        import_id: String,
+        reply: SyncSender<Result<StatusResult, AssetOwnerFailure>>,
+    },
+    Shutdown,
+}
+
+#[derive(Debug)]
+enum AssetOwnerCallError {
+    Closed,
+    QueueTimeout,
+    ReplyTimeout,
+    Disconnected,
+    Asset(AssetOwnerFailure),
+}
+
+impl AssetOwnerCallError {
+    fn code(&self) -> &str {
+        match self {
+            Self::Closed => "ASSET_OWNER_CLOSED",
+            Self::QueueTimeout => "ASSET_OWNER_QUEUE_TIMEOUT",
+            Self::ReplyTimeout => "ASSET_OWNER_REPLY_TIMEOUT",
+            Self::Disconnected => "ASSET_OWNER_DISCONNECTED",
+            Self::Asset(failure) => &failure.code,
+        }
+    }
+}
+
+/// Fixed process bounds for the identity-scoped owner. Every caller occupies
+/// at most one of eight queue slots, waits at most 250 ms for admission and
+/// 30 seconds for an operation reply, and shutdown has one 30-second bound.
+const ASSET_OWNER_QUEUE_CAPACITY: usize = 8;
+const ASSET_OWNER_ENQUEUE_TIMEOUT: Duration = Duration::from_millis(250);
+const ASSET_OWNER_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+const ASSET_OWNER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+const ASSET_OWNER_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+static LIVE_ASSET_OWNER_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Default)]
+struct AssetOwnerMetrics {
+    queued_requests: AtomicUsize,
+    active_operations: AtomicUsize,
+    maximum_active_operations: AtomicUsize,
+    thread_live: AtomicBool,
+}
+
+struct AssetOwnerThread {
+    sender: SyncSender<AssetOwnerRequest>,
+    completion: parking_lot::Mutex<Receiver<()>>,
+    join: parking_lot::Mutex<Option<JoinHandle<()>>>,
+    shutdown_sent: AtomicBool,
+    metrics: Arc<AssetOwnerMetrics>,
+}
+
+impl AssetOwnerThread {
+    fn spawn(
+        config: ResolvedAssetConfig,
+        facts: &AssetRouteFacts,
+    ) -> Result<(Self, Receiver<Result<(), AssetOwnerFailure>>), HostRouteError> {
+        let (sender, requests) = mpsc::sync_channel(ASSET_OWNER_QUEUE_CAPACITY);
+        let (initialization, initialized) = mpsc::sync_channel(1);
+        let (completed, completion) = mpsc::sync_channel(1);
+        let metrics = Arc::new(AssetOwnerMetrics::default());
+        let owner_metrics = Arc::clone(&metrics);
+        let domain = facts.key.extension_connection_id.clone();
+        let instance = facts.instance_id.clone();
+        let module = facts.key.module_id.clone();
+        let join = std::thread::Builder::new()
+            .name("dolly-asset-owner".to_string())
+            .spawn(move || {
+                LIVE_ASSET_OWNER_THREADS.fetch_add(1, Ordering::SeqCst);
+                owner_metrics.thread_live.store(true, Ordering::SeqCst);
+                let mut service = match AssetService::open(config) {
+                    Ok(service) => service,
+                    Err(error) => {
+                        let _ = initialization.send(Err(AssetOwnerFailure {
+                            code: error.to_envelope().code,
+                        }));
+                        owner_metrics.thread_live.store(false, Ordering::SeqCst);
+                        LIVE_ASSET_OWNER_THREADS.fetch_sub(1, Ordering::SeqCst);
+                        let _ = completed.send(());
+                        return;
+                    }
+                };
+                let capability = service.issue_capability(domain, instance, module);
+                if initialization.send(Ok(())).is_err() {
+                    owner_metrics.thread_live.store(false, Ordering::SeqCst);
+                    LIVE_ASSET_OWNER_THREADS.fetch_sub(1, Ordering::SeqCst);
+                    let _ = completed.send(());
+                    return;
+                }
+                while let Ok(request) = requests.recv() {
+                    owner_metrics.queued_requests.fetch_sub(1, Ordering::SeqCst);
+                    match request {
+                        AssetOwnerRequest::LeaseAndPrepare { request, reply } => {
+                            let active = owner_metrics
+                                .active_operations
+                                .fetch_add(1, Ordering::SeqCst)
+                                + 1;
+                            owner_metrics
+                                .maximum_active_operations
+                                .fetch_max(active, Ordering::SeqCst);
+                            let result = service
+                                .lease(
+                                    &capability,
+                                    request.asset_id.as_str(),
+                                    capability.instance_id(),
+                                    "channel send",
+                                    ASSET_LEASE_TTL_MS,
+                                )
+                                .and_then(|lease| {
+                                    service.prepare_media(
+                                        &capability,
+                                        &MediaPrepareRequest {
+                                            asset_id: request.asset_id,
+                                            expected_media_kind: request.expected_media_kind,
+                                            claimed_media_type: Some(request.claimed_media_type),
+                                            lease_id: lease.lease_id,
+                                        },
+                                    )
+                                })
+                                .map_err(|error| AssetOwnerFailure {
+                                    code: error.to_envelope().code,
+                                });
+                            owner_metrics
+                                .active_operations
+                                .fetch_sub(1, Ordering::SeqCst);
+                            let _ = reply.send(result);
+                        }
+                        AssetOwnerRequest::Import { request, reply } => {
+                            let active = owner_metrics
+                                .active_operations
+                                .fetch_add(1, Ordering::SeqCst)
+                                + 1;
+                            owner_metrics
+                                .maximum_active_operations
+                                .fetch_max(active, Ordering::SeqCst);
+                            let result = service.import(&capability, &request).map_err(|error| {
+                                AssetOwnerFailure {
+                                    code: error.to_envelope().code,
+                                }
+                            });
+                            owner_metrics
+                                .active_operations
+                                .fetch_sub(1, Ordering::SeqCst);
+                            let _ = reply.send(result);
+                        }
+                        AssetOwnerRequest::Status { import_id, reply } => {
+                            let active = owner_metrics
+                                .active_operations
+                                .fetch_add(1, Ordering::SeqCst)
+                                + 1;
+                            owner_metrics
+                                .maximum_active_operations
+                                .fetch_max(active, Ordering::SeqCst);
+                            let result = service.status(&capability, &import_id).map_err(|error| {
+                                AssetOwnerFailure {
+                                    code: error.to_envelope().code,
+                                }
+                            });
+                            owner_metrics
+                                .active_operations
+                                .fetch_sub(1, Ordering::SeqCst);
+                            let _ = reply.send(result);
+                        }
+                        AssetOwnerRequest::Shutdown => break,
+                    }
+                }
+                drop(service);
+                owner_metrics.thread_live.store(false, Ordering::SeqCst);
+                LIVE_ASSET_OWNER_THREADS.fetch_sub(1, Ordering::SeqCst);
+                let _ = completed.send(());
+            })
+            .map_err(|_| HostRouteError::Rejected {
+                code: "ASSET_OWNER_START_FAILED".to_string(),
+                message: "the identity-scoped Asset owner thread could not start".to_string(),
+            })?;
+        Ok((
+            Self {
+                sender,
+                completion: parking_lot::Mutex::new(completion),
+                join: parking_lot::Mutex::new(Some(join)),
+                shutdown_sent: AtomicBool::new(false),
+                metrics,
+            },
+            initialized,
+        ))
+    }
+
+    fn send_until(
+        &self,
+        request: AssetOwnerRequest,
+        deadline: Instant,
+    ) -> Result<(), AssetOwnerCallError> {
+        let mut pending = request;
+        loop {
+            match self.sender.try_send(pending) {
+                Ok(()) => {
+                    self.metrics.queued_requests.fetch_add(1, Ordering::SeqCst);
+                    return Ok(());
+                }
+                Err(TrySendError::Full(request)) => {
+                    pending = request;
+                    if Instant::now() >= deadline {
+                        return Err(AssetOwnerCallError::QueueTimeout);
+                    }
+                    std::thread::sleep(ASSET_OWNER_POLL_INTERVAL);
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(AssetOwnerCallError::Disconnected);
+                }
+            }
+        }
+    }
+
+    fn request_shutdown(&self, deadline: Instant) -> Result<(), HostRouteError> {
+        if self
+            .shutdown_sent
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        match self.send_until(AssetOwnerRequest::Shutdown, deadline) {
+            Ok(()) | Err(AssetOwnerCallError::Disconnected) => Ok(()),
+            Err(error) => {
+                self.shutdown_sent.store(false, Ordering::Release);
+                Err(owner_route_error(error.code()))
+            }
+        }
+    }
+
+    fn join_until(&self, deadline: Instant) -> Result<(), HostRouteError> {
+        // Holding the join slot serializes concurrent shutdown/retry callers:
+        // only one receiver consumes completion and joins the thread.
+        let mut join_slot = self.join.lock();
+        if join_slot.is_none() {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(owner_route_error("ASSET_OWNER_SHUTDOWN_TIMEOUT"));
+        }
+        self.completion
+            .lock()
+            .recv_timeout(remaining)
+            .map_err(|_| owner_route_error("ASSET_OWNER_SHUTDOWN_TIMEOUT"))?;
+        let join = join_slot.take().expect("owner join handle present");
+        join.join()
+            .map_err(|_| owner_route_error("ASSET_OWNER_THREAD_PANICKED"))
+    }
+
+    fn request<T>(
+        &self,
+        command: AssetOwnerRequest,
+        reply: Receiver<Result<T, AssetOwnerFailure>>,
+    ) -> Result<T, AssetOwnerCallError> {
+        self.send_until(command, Instant::now() + ASSET_OWNER_ENQUEUE_TIMEOUT)?;
+        match reply.recv_timeout(ASSET_OWNER_REPLY_TIMEOUT) {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(failure)) => Err(AssetOwnerCallError::Asset(failure)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(AssetOwnerCallError::ReplyTimeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(AssetOwnerCallError::Disconnected),
+        }
+    }
+
+    fn lease_and_prepare(
+        &self,
+        request: LeaseAndPrepareRequest,
+    ) -> Result<PreparedMedia, AssetOwnerCallError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.request(
+            AssetOwnerRequest::LeaseAndPrepare { request, reply },
+            response,
+        )
+    }
+
+    fn import(&self, request: ImportRequest) -> Result<StatusResult, AssetOwnerCallError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.request(AssetOwnerRequest::Import { request, reply }, response)
+    }
+
+    fn status(&self, import_id: String) -> Result<StatusResult, AssetOwnerCallError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.request(AssetOwnerRequest::Status { import_id, reply }, response)
+    }
+}
+
+fn owner_route_error(code: &str) -> HostRouteError {
+    HostRouteError::Rejected {
+        code: code.to_string(),
+        message: "the identity-scoped Asset owner failed closed".to_string(),
+    }
+}
+
+/// One real owner for one sealed Asset route identity. The owner thread creates
+/// and retains the non-`Send` Asset service and capability. Route handles hold
+/// only this typed bounded request endpoint.
 pub(crate) struct AssetRouteRegistration {
     facts: AssetRouteFacts,
-    store: Arc<SharedAssetStore>,
+    owner: AssetOwnerThread,
+    lifecycle: parking_lot::Mutex<AssetRouteLifecycle>,
+    lifecycle_changed: parking_lot::Condvar,
+    registered: bool,
 }
 
-#[cfg(test)]
-impl SharedAssetStore {
-    /// Extract the owned service/capability for a test that holds the last
-    /// reference to the shared store.
-    fn into_parts(store: Arc<SharedAssetStore>) -> (AssetService, AssetCapability) {
-        let store = Arc::try_unwrap(store)
-            .unwrap_or_else(|_| panic!("sole holder in test"));
-        let service = std::cell::RefCell::into_inner(store.service);
-        (service, store.capability)
+/// One counted route/adapter handle. Dropping the final handle of a closing
+/// registration performs bounded shutdown and removes the joined registration.
+pub(crate) struct AssetRouteHandle {
+    registration: Arc<AssetRouteRegistration>,
+}
+
+impl Drop for AssetRouteHandle {
+    fn drop(&mut self) {
+        self.registration.release_handle();
     }
 }
 
 impl AssetRouteRegistration {
-    /// The single shared store/capability set of this registration.
-    fn store(&self) -> Arc<SharedAssetStore> {
-        Arc::clone(&self.store)
+    fn state(&self) -> AssetOwnerState {
+        self.lifecycle.lock().state
     }
 
-    /// The exact registered content root key the inbound binding verifies.
+    fn wait_while_starting(&self, deadline: Instant) {
+        let mut lifecycle = self.lifecycle.lock();
+        while lifecycle.state == AssetOwnerState::Starting {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            self.lifecycle_changed.wait_for(&mut lifecycle, remaining);
+        }
+    }
+
+    fn activate(self: &Arc<Self>) -> Result<AssetRouteHandle, HostRouteError> {
+        let mut lifecycle = self.lifecycle.lock();
+        if lifecycle.state != AssetOwnerState::Starting {
+            return Err(owner_route_error("ASSET_OWNER_CLOSED"));
+        }
+        lifecycle.state = AssetOwnerState::Active;
+        lifecycle.live_handles = 1;
+        self.lifecycle_changed.notify_all();
+        Ok(AssetRouteHandle {
+            registration: Arc::clone(self),
+        })
+    }
+
+    fn open_handle(self: &Arc<Self>) -> Result<AssetRouteHandle, HostRouteError> {
+        let mut lifecycle = self.lifecycle.lock();
+        if lifecycle.state != AssetOwnerState::Active {
+            return Err(owner_route_error("ASSET_OWNER_CLOSED"));
+        }
+        lifecycle.live_handles += 1;
+        Ok(AssetRouteHandle {
+            registration: Arc::clone(self),
+        })
+    }
+
+    fn begin_close(self: &Arc<Self>) -> bool {
+        let stop_now = {
+            let mut lifecycle = self.lifecycle.lock();
+            if lifecycle.state != AssetOwnerState::Active {
+                return false;
+            }
+            lifecycle.state = AssetOwnerState::Closing;
+            self.lifecycle_changed.notify_all();
+            if lifecycle.live_handles == 0 {
+                lifecycle.state = AssetOwnerState::Stopping;
+                true
+            } else {
+                false
+            }
+        };
+        if stop_now {
+            let _ = self.stop_and_join(Instant::now() + ASSET_OWNER_SHUTDOWN_TIMEOUT);
+        }
+        true
+    }
+
+    fn begin_global_close(&self) {
+        let mut lifecycle = self.lifecycle.lock();
+        if matches!(
+            lifecycle.state,
+            AssetOwnerState::Starting | AssetOwnerState::Active | AssetOwnerState::Closing
+        ) {
+            lifecycle.state = AssetOwnerState::Stopping;
+            self.lifecycle_changed.notify_all();
+        }
+    }
+
+    fn release_handle(self: &Arc<Self>) {
+        let stop_now = {
+            let mut lifecycle = self.lifecycle.lock();
+            lifecycle.live_handles = lifecycle
+                .live_handles
+                .checked_sub(1)
+                .expect("Asset route handle count cannot underflow");
+            if lifecycle.live_handles == 0
+                && (lifecycle.state == AssetOwnerState::Closing
+                    || (!self.registered && lifecycle.state == AssetOwnerState::Active))
+            {
+                lifecycle.state = AssetOwnerState::Stopping;
+                true
+            } else {
+                false
+            }
+        };
+        if stop_now {
+            let _ = self.stop_and_join(Instant::now() + ASSET_OWNER_SHUTDOWN_TIMEOUT);
+        } else {
+            self.remove_if_closed_and_unused();
+        }
+    }
+
+    fn can_finish_close(&self) -> bool {
+        let mut lifecycle = self.lifecycle.lock();
+        if lifecycle.live_handles != 0 {
+            return false;
+        }
+        match lifecycle.state {
+            AssetOwnerState::Closing => {
+                lifecycle.state = AssetOwnerState::Stopping;
+                true
+            }
+            AssetOwnerState::Stopping | AssetOwnerState::Closed => true,
+            AssetOwnerState::Starting | AssetOwnerState::Active => false,
+        }
+    }
+
+    fn request_stop(&self, deadline: Instant) -> Result<(), HostRouteError> {
+        self.owner.request_shutdown(deadline)
+    }
+
+    fn stop_and_join(self: &Arc<Self>, deadline: Instant) -> Result<(), HostRouteError> {
+        self.owner.request_shutdown(deadline)?;
+        let result = self.owner.join_until(deadline);
+        if !matches!(
+            result,
+            Err(HostRouteError::Rejected { ref code, .. })
+                if code == "ASSET_OWNER_SHUTDOWN_TIMEOUT"
+        ) {
+            let mut lifecycle = self.lifecycle.lock();
+            lifecycle.state = AssetOwnerState::Closed;
+            self.lifecycle_changed.notify_all();
+        }
+        self.remove_if_closed_and_unused();
+        result
+    }
+
+    fn remove_if_closed_and_unused(self: &Arc<Self>) {
+        if !self.registered {
+            return;
+        }
+        let removable = {
+            let lifecycle = self.lifecycle.lock();
+            lifecycle.state == AssetOwnerState::Closed && lifecycle.live_handles == 0
+        };
+        if !removable {
+            return;
+        }
+        let mut registry = asset_route_registry().lock();
+        if registry
+            .entries
+            .get(&self.facts.key)
+            .is_some_and(|entry| std::ptr::eq(Arc::as_ptr(entry), Arc::as_ptr(self)))
+        {
+            registry.entries.remove(&self.facts.key);
+        }
+    }
+
+    fn call_lease_and_prepare(
+        &self,
+        request: LeaseAndPrepareRequest,
+    ) -> Result<PreparedMedia, AssetOwnerCallError> {
+        let lifecycle = self.lifecycle.lock();
+        if lifecycle.state != AssetOwnerState::Active {
+            return Err(AssetOwnerCallError::Closed);
+        }
+        self.owner.lease_and_prepare(request)
+    }
+
+    fn call_import(&self, request: ImportRequest) -> Result<StatusResult, AssetOwnerCallError> {
+        let lifecycle = self.lifecycle.lock();
+        if lifecycle.state != AssetOwnerState::Active {
+            return Err(AssetOwnerCallError::Closed);
+        }
+        self.owner.import(request)
+    }
+
+    fn call_status(&self, import_id: String) -> Result<StatusResult, AssetOwnerCallError> {
+        let lifecycle = self.lifecycle.lock();
+        if lifecycle.state != AssetOwnerState::Active {
+            return Err(AssetOwnerCallError::Closed);
+        }
+        self.owner.status(import_id)
+    }
+}
+
+impl AssetRouteHandle {
+    fn try_clone(&self) -> Result<Self, HostRouteError> {
+        self.registration.open_handle()
+    }
+
     fn identity_root_key(&self) -> &str {
-        &self.facts.root_key
+        &self.registration.facts.root_key
+    }
+
+    fn instance_id(&self) -> String {
+        self.registration.facts.instance_id.clone()
+    }
+
+    fn module_id(&self) -> &str {
+        &self.registration.facts.key.module_id
+    }
+
+    pub(crate) fn unregister(&self) -> bool {
+        self.registration.begin_close()
+    }
+
+    #[cfg(test)]
+    fn same_registration(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.registration, &other.registration)
     }
 }
 
-/// Process-wide registry of the registered Asset routes, keyed by the stable
-/// lifecycle identity. At most ONE live registration per identity; repeated
-/// registration shares it and never opens another service. Entries are
-/// removed only by explicit `unregister`/`shutdown`, so the map size is
-/// bounded by the finite set of distinct sealed identities and returns to
-/// its baseline after register/open/close/unregister cycles.
-static ASSET_ROUTE_REGISTRY: std::sync::OnceLock<
-    parking_lot::Mutex<std::collections::HashMap<AssetRouteKey, Arc<AssetRouteRegistration>>>,
-> = std::sync::OnceLock::new();
-
-fn asset_route_registry() -> &'static parking_lot::Mutex<std::collections::HashMap<AssetRouteKey, Arc<AssetRouteRegistration>>> {
-    ASSET_ROUTE_REGISTRY
-        .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+struct AssetRouteRegistry {
+    accepting: bool,
+    entries: std::collections::HashMap<AssetRouteKey, Arc<AssetRouteRegistration>>,
 }
 
-/// The sealed Channel principal of the current authority/grant (the account/
-/// extension/module identity used for registration keys).
+impl Default for AssetRouteRegistry {
+    fn default() -> Self {
+        Self {
+            accepting: true,
+            entries: std::collections::HashMap::new(),
+        }
+    }
+}
+
+static ASSET_ROUTE_REGISTRY: std::sync::LazyLock<parking_lot::Mutex<AssetRouteRegistry>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(AssetRouteRegistry::default()));
+
+fn asset_route_registry() -> &'static parking_lot::Mutex<AssetRouteRegistry> {
+    &ASSET_ROUTE_REGISTRY
+}
+
+/// The sealed Channel principal of the current authority/grant.
 fn route_principal(
     authority: &HostConnectionAuthority,
     grant: &HostCapabilityGrant,
@@ -174,8 +690,7 @@ fn route_principal(
     })
 }
 
-/// A canonical absolute form of the content root used for equality (never a
-/// capability or variable path component).
+/// A canonical absolute form of the content root used only at registration.
 fn asset_root_key(root: &std::path::Path) -> String {
     std::path::absolute(root)
         .ok()
@@ -192,7 +707,10 @@ fn asset_route_facts(
     config: &ResolvedAssetConfig,
 ) -> Result<AssetRouteFacts, HostRouteError> {
     let instance_id = format!("i{}", authority.worker_epoch());
-    if instance_id.parse::<dolly_core_domain::InstanceId>().is_err() {
+    if instance_id
+        .parse::<dolly_core_domain::InstanceId>()
+        .is_err()
+    {
         return Err(HostRouteError::CapabilityDenied {
             detail: "sealed worker epoch cannot form a stable instance identifier".into(),
         });
@@ -206,74 +724,123 @@ fn asset_route_facts(
             config_revision,
             principal_account: principal.account().to_string(),
         },
+        instance_id,
         extension_generation: grant.extension_generation(),
         root_key: asset_root_key(&config.local_root),
     })
 }
 
-/// Register the one Asset route for this sealed store/account/config identity
-/// and open its single Asset service/capability set EXACTLY ONCE. A later
-/// registration with the exact same identity shares the same owned set (never
-/// a second service); a mismatched content root or generation fails closed.
-/// Requires the current `host.asset.import` and `host.asset.status` grants
-/// under the same extension/module authority.
+fn finish_failed_start(
+    registration: &Arc<AssetRouteRegistration>,
+    code: &str,
+) -> Result<AssetRouteHandle, HostRouteError> {
+    registration.begin_global_close();
+    let _ = registration.stop_and_join(Instant::now() + ASSET_OWNER_SHUTDOWN_TIMEOUT);
+    Err(owner_route_error(code))
+}
+
+/// Register or share one identity-scoped owner. `AssetService` and its
+/// capability are created inside that owner thread exactly once.
 pub(crate) fn asset_route_register(
     authority: &HostConnectionAuthority,
     grant: &HostCapabilityGrant,
     config_revision: i64,
     config: ResolvedAssetConfig,
-) -> Result<Arc<AssetRouteRegistration>, HostRouteError> {
+) -> Result<AssetRouteHandle, HostRouteError> {
     if !grant.allows("host.asset.import") || !grant.allows("host.asset.status") {
         return Err(HostRouteError::CapabilityDenied {
             detail: "the multimodal Channel route requires host.asset.import and host.asset.status grants under the same authority".into(),
         });
     }
-    config.validate().map_err(|detail| HostRouteError::CapabilityDenied {
-        detail: format!("asset config invalid: {detail}"),
-    })?;
+    config
+        .validate()
+        .map_err(|detail| HostRouteError::CapabilityDenied {
+            detail: format!("asset config invalid: {detail}"),
+        })?;
     let principal = route_principal(authority, grant)?;
     let facts = asset_route_facts(&principal, authority, grant, config_revision, &config)?;
-    let mut registry = asset_route_registry().lock();
-    if let Some(existing) = registry.get(&facts.key) {
-        if existing.facts != facts {
-            return Err(HostRouteError::CapabilityDenied {
-                detail: "registration identity mismatch (a different Asset content root or extension generation is already registered for this store/account/config identity)".into(),
+    loop {
+        let existing = {
+            let registry = asset_route_registry().lock();
+            if !registry.accepting {
+                return Err(owner_route_error("ASSET_OWNER_REGISTRY_SHUT_DOWN"));
+            }
+            registry.entries.get(&facts.key).cloned()
+        };
+        if let Some(existing) = existing {
+            let state = existing.state();
+            if state == AssetOwnerState::Starting {
+                if existing.facts != facts {
+                    return Err(HostRouteError::CapabilityDenied {
+                        detail: "registration identity mismatch while the Asset owner is starting"
+                            .into(),
+                    });
+                }
+                existing.wait_while_starting(Instant::now() + ASSET_OWNER_REPLY_TIMEOUT);
+                continue;
+            }
+            // A prior bounded stop may have completed just after its caller's
+            // deadline. With no route handles, finish the safe join/remove
+            // before considering a replacement generation.
+            if existing.can_finish_close() {
+                existing.stop_and_join(Instant::now() + ASSET_OWNER_SHUTDOWN_TIMEOUT)?;
+                continue;
+            }
+            if existing.facts != facts {
+                return Err(HostRouteError::CapabilityDenied {
+                    detail: "registration identity mismatch (a different Asset content root or extension generation is already registered for this store/account/config identity)".into(),
+                });
+            }
+            return match state {
+                AssetOwnerState::Active => existing.open_handle(),
+                AssetOwnerState::Closing | AssetOwnerState::Stopping | AssetOwnerState::Closed => {
+                    Err(owner_route_error("ASSET_OWNER_CLOSING"))
+                }
+                AssetOwnerState::Starting => unreachable!("starting handled above"),
+            };
+        }
+
+        let (registration, initialized) = {
+            let mut registry = asset_route_registry().lock();
+            if !registry.accepting {
+                return Err(owner_route_error("ASSET_OWNER_REGISTRY_SHUT_DOWN"));
+            }
+            if registry.entries.contains_key(&facts.key) {
+                continue;
+            }
+            // Hold the registry lock through thread creation and insertion.
+            // The new owner is recorded as Starting before any concurrent
+            // registration can decide to create another owner.
+            let (owner, initialized) = AssetOwnerThread::spawn(config.clone(), &facts)?;
+            let registration = Arc::new(AssetRouteRegistration {
+                facts: facts.clone(),
+                owner,
+                lifecycle: parking_lot::Mutex::new(AssetRouteLifecycle {
+                    state: AssetOwnerState::Starting,
+                    live_handles: 0,
+                }),
+                lifecycle_changed: parking_lot::Condvar::new(),
+                registered: true,
             });
-        }
-        return Ok(Arc::clone(existing));
+            registry
+                .entries
+                .insert(facts.key.clone(), Arc::clone(&registration));
+            (registration, initialized)
+        };
+        return match initialized.recv_timeout(ASSET_OWNER_REPLY_TIMEOUT) {
+            Ok(Ok(())) => registration.activate(),
+            Ok(Err(failure)) => finish_failed_start(&registration, &failure.code),
+            Err(_) => finish_failed_start(&registration, "ASSET_OWNER_START_TIMEOUT"),
+        };
     }
-    let service = AssetService::open(config).map_err(|error| {
-        let envelope = error.to_envelope();
-        HostRouteError::Rejected {
-            code: envelope.code,
-            message: envelope.message,
-        }
-    })?;
-    let capability = service.issue_capability(
-        authority.extension_connection_id().to_owned(),
-        format!("i{}", authority.worker_epoch()),
-        grant.module_id().to_owned(),
-    );
-    let key = facts.key.clone();
-    let registration = Arc::new(AssetRouteRegistration {
-        facts,
-        store: Arc::new(SharedAssetStore {
-            service: std::cell::RefCell::new(service),
-            capability,
-        }),
-    });
-    registry.insert(key, Arc::clone(&registration));
-    Ok(registration)
 }
 
-/// Open (reuse) the registered Asset route for this sealed identity without
-/// constructing any new service/capability. Fails closed when no outbound
-/// registration created it yet (the outbound registration owns the store).
+/// Open the exact active owner already registered for this sealed identity.
 pub(crate) fn asset_route_open(
     authority: &HostConnectionAuthority,
     grant: &HostCapabilityGrant,
     config_revision: i64,
-) -> Result<Arc<AssetRouteRegistration>, HostRouteError> {
+) -> Result<AssetRouteHandle, HostRouteError> {
     let principal = route_principal(authority, grant)?;
     let key = AssetRouteKey {
         extension_connection_id: authority.extension_connection_id().to_owned(),
@@ -283,20 +850,26 @@ pub(crate) fn asset_route_open(
         config_revision,
         principal_account: principal.account().to_string(),
     };
-    let registry = asset_route_registry().lock();
-    registry
+    let registration = asset_route_registry()
+        .lock()
+        .entries
         .get(&key)
         .cloned()
         .ok_or_else(|| HostRouteError::CapabilityDenied {
             detail: "no Asset route is registered for this store/account/config identity; register the outbound Asset route first".into(),
-        })
+        })?;
+    if registration.facts.extension_generation != grant.extension_generation() {
+        return Err(HostRouteError::CapabilityDenied {
+            detail: "registered Asset owner generation does not match the current grant".into(),
+        });
+    }
+    registration.open_handle()
 }
 
-/// Explicit unregister/close of one Asset route (route/activation lifecycle
-/// end). Removes the registration so new opens fail closed; live route and
-/// adapter handles keep the owned set alive until they drop (in-use
-/// unregister is safe and never tears a live adapter). Returns whether an
-/// entry was present.
+/// Mark one registration closing. It stays in the registry until every live
+/// handle drops and the owner joins, so same-identity re-registration cannot
+/// overlap the old service or capability.
+#[cfg(test)]
 pub(crate) fn asset_route_unregister(
     authority: &HostConnectionAuthority,
     grant: &HostCapabilityGrant,
@@ -311,20 +884,78 @@ pub(crate) fn asset_route_unregister(
         config_revision,
         principal_account: principal.account().to_string(),
     };
-    let mut registry = asset_route_registry().lock();
-    Ok(registry.remove(&key).is_some())
+    let registration = asset_route_registry().lock().entries.get(&key).cloned();
+    Ok(registration.is_some_and(|registration| registration.begin_close()))
 }
 
-/// Bounded shutdown: releases every registered Asset route (services,
-/// capabilities, and the adapters that reference them) deterministically.
-pub(crate) fn asset_route_shutdown() {
-    asset_route_registry().lock().clear();
+/// Process shutdown closes admission first, marks every handle closed, queues
+/// one shutdown command per owner, then joins within one global bound. Joined
+/// entries remain only while a counted closed route handle is still live.
+pub(crate) fn asset_route_shutdown() -> Result<(), HostRouteError> {
+    let registrations = {
+        let mut registry = asset_route_registry().lock();
+        registry.accepting = false;
+        registry.entries.values().cloned().collect::<Vec<_>>()
+    };
+    let deadline = Instant::now() + ASSET_OWNER_SHUTDOWN_TIMEOUT;
+    let mut first_error = None;
+    for registration in &registrations {
+        registration.begin_global_close();
+    }
+    for registration in &registrations {
+        if let Err(error) = registration.request_stop(deadline) {
+            first_error.get_or_insert(error);
+        }
+    }
+    for registration in &registrations {
+        if let Err(error) = registration.stop_and_join(deadline) {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
-/// Test/diagnostic: the current number of registered Asset routes.
 #[cfg(test)]
 fn asset_route_registry_len() -> usize {
-    asset_route_registry().lock().len()
+    asset_route_registry().lock().entries.len()
+}
+
+#[cfg(test)]
+fn test_asset_route(
+    config: ResolvedAssetConfig,
+    domain: &str,
+    instance: &str,
+    module: &str,
+) -> Result<AssetRouteHandle, HostRouteError> {
+    let facts = AssetRouteFacts {
+        key: AssetRouteKey {
+            extension_connection_id: domain.to_string(),
+            worker_epoch: instance.to_string(),
+            extension_id: "test-extension".to_string(),
+            module_id: module.to_string(),
+            config_revision: 1,
+            principal_account: "test-account".to_string(),
+        },
+        instance_id: instance.to_string(),
+        extension_generation: 1,
+        root_key: asset_root_key(&config.local_root),
+    };
+    let (owner, initialized) = AssetOwnerThread::spawn(config, &facts)?;
+    let registration = Arc::new(AssetRouteRegistration {
+        facts,
+        owner,
+        lifecycle: parking_lot::Mutex::new(AssetRouteLifecycle {
+            state: AssetOwnerState::Starting,
+            live_handles: 0,
+        }),
+        lifecycle_changed: parking_lot::Condvar::new(),
+        registered: false,
+    });
+    match initialized.recv_timeout(ASSET_OWNER_REPLY_TIMEOUT) {
+        Ok(Ok(())) => registration.activate(),
+        Ok(Err(failure)) => finish_failed_start(&registration, &failure.code),
+        Err(_) => finish_failed_start(&registration, "ASSET_OWNER_START_TIMEOUT"),
+    }
 }
 
 /// The finite short Asset lease the outbound adapter holds per prepared
@@ -384,8 +1015,7 @@ fn now_unix_millis() -> u64 {
 /// Strict canonical base64 (RFC 4648 alphabet, terminal `=` padding),
 /// matching the Asset `InlineBase64` wire contract.
 fn strict_base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let mut index = 0usize;
     while index + 3 <= bytes.len() {
@@ -428,50 +1058,41 @@ fn wire_deadline_after(seconds: u64) -> String {
 // ---------------------------------------------------------------------------
 
 /// The Runtime's one outbound Asset preparation seam. Unbound by default
-/// (fail closed on every asset part); bound by the route with the module's
-/// resolved Asset configuration and the sealed authority/grant facts.
+/// (fail closed on every asset part); a bound seam holds one counted handle
+/// to the identity-scoped Asset owner.
 pub struct ChannelAssetSeam {
-    /// The ONE shared Asset store/capability set owned by the route's
-    /// registration; `None` is the fail-closed unbound seam.
-    store: Option<Arc<SharedAssetStore>>,
+    owner: Option<AssetRouteHandle>,
 }
 
 impl ChannelAssetSeam {
-    /// The fail-closed seam: no Asset store is bound to the route, so every
-    /// committed asset part is refused with the Channel asset code before
-    /// any durable prepared row or transport effect.
+    /// The fail-closed seam: no Asset owner is bound to the route.
     pub fn unbound() -> Self {
-        Self { store: None }
+        Self { owner: None }
     }
 
-    /// Construct the outbound seam from the route's single owned
-    /// registration: shares the exact registered Asset service/capability
-    /// and never opens another service for the identity.
-    pub(crate) fn from_registration(registration: &Arc<AssetRouteRegistration>) -> Self {
-        Self {
-            store: Some(registration.store()),
-        }
+    /// Acquire one live handle to the route's single owner. A closing or
+    /// closed registration refuses this open even when the route still holds
+    /// its original handle.
+    pub(crate) fn from_registration(
+        registration: &AssetRouteHandle,
+    ) -> Result<Self, HostRouteError> {
+        Ok(Self {
+            owner: Some(registration.try_clone()?),
+        })
     }
 
-    /// Test-support: bind a pre-opened service and capability directly, so
-    /// the adapter's prepare path can be proven without Host scaffolding.
+    /// Test support creates the service and capability inside an unregistered
+    /// owner thread; no service or capability crosses the thread boundary.
     #[cfg(test)]
-    pub(crate) fn for_test(
-        service: AssetService,
-        capability: AssetCapability,
-        _owner: &str,
-    ) -> Self {
-        Self {
-            store: Some(Arc::new(SharedAssetStore {
-                service: std::cell::RefCell::new(service),
-                capability,
-            })),
-        }
-    }
-
-    #[cfg(test)]
-    fn take_store(&mut self) -> Arc<SharedAssetStore> {
-        self.store.take().expect("store bound")
+    fn for_test(
+        config: ResolvedAssetConfig,
+        domain: &str,
+        instance: &str,
+        module: &str,
+    ) -> Result<Self, HostRouteError> {
+        Ok(Self {
+            owner: Some(test_asset_route(config, domain, instance, module)?),
+        })
     }
 }
 
@@ -480,56 +1101,36 @@ impl AssetPreparation for ChannelAssetSeam {
         &mut self,
         premises: &[AssetPremise],
     ) -> Result<Vec<AssetPayload>, ChannelError> {
-        let Some(store) = self.store.as_ref() else {
+        let Some(owner) = self.owner.as_ref() else {
             if let Some(first) = premises.first() {
-                return Err(asset_refused(first.ordinal, "NO_ASSET_STORE"));
+                return Err(asset_refused(first.ordinal, "NO_ASSET_OWNER"));
             }
             return Ok(Vec::new());
         };
-        let mut service = store.service.borrow_mut();
-        let capability = &store.capability;
         let mut payloads = Vec::with_capacity(premises.len());
         for premise in premises {
-            let asset_id = premise.asset_id.as_str().to_string();
-            // 1. A finite short lease under the committed AssetId and the
-            //    bound capability. `create_lease` re-checks availability,
-            //    domain, and the tombstone in the same durable transaction.
-            let lease = service
-                .lease(
-                    capability,
-                    &asset_id,
-                    capability.instance_id(),
-                    "channel send",
-                    ASSET_LEASE_TTL_MS,
-                )
-                .map_err(|error| asset_refused(premise.ordinal, &error_code(&error)))?;
-            // 2. Prepare under the exact lease. Only the committed AssetId is
-            //    trusted input; kind/type claims are checks, never labels,
-            //    and the service re-proves identity, digest, geometry, and
-            //    active-content safety before bytes are released.
-            let claimed_type: dolly_asset::identity::MediaType =
-                premise.media_type.as_str().parse().map_err(|_| {
-                    asset_refused(premise.ordinal, "INVALID_MEDIA_TYPE")
-                })?;
-            let request = MediaPrepareRequest {
-                asset_id: asset_id.parse().map_err(|_| {
-                    asset_refused(premise.ordinal, "NONCANONICAL_ASSET_ID")
-                })?,
-                expected_media_kind: asset_kind_of_type(&premise.media_type),
-                claimed_media_type: Some(claimed_type),
-                lease_id: lease.lease_id.clone(),
-            };
-            let prepared = service
-                .prepare_media(capability, &request)
-                .map_err(|error| asset_refused(premise.ordinal, &error_code(&error)))?;
+            let asset_id = premise
+                .asset_id
+                .as_str()
+                .parse()
+                .map_err(|_| asset_refused(premise.ordinal, "NONCANONICAL_ASSET_ID"))?;
+            let claimed_media_type = premise
+                .media_type
+                .as_str()
+                .parse()
+                .map_err(|_| asset_refused(premise.ordinal, "INVALID_MEDIA_TYPE"))?;
+            let prepared = owner
+                .registration
+                .call_lease_and_prepare(LeaseAndPrepareRequest {
+                    asset_id,
+                    expected_media_kind: asset_kind_of_type(&premise.media_type),
+                    claimed_media_type,
+                })
+                .map_err(|error| asset_refused(premise.ordinal, error.code()))?;
             payloads.push(convert_prepared_media(premise.ordinal, prepared)?);
         }
         Ok(payloads)
     }
-}
-
-fn error_code(error: &dolly_asset::error::AssetError) -> String {
-    error.to_envelope().code
 }
 
 /// Field-for-field mirror of the accepted Asset `PreparedMedia` into the
@@ -537,7 +1138,10 @@ fn error_code(error: &dolly_asset::error::AssetError) -> String {
 /// payload (never copied), and every reference field is the value the Asset
 /// service minted from the durable row; no caller metadata is echoed and no
 /// absent geometry is fabricated.
-fn convert_prepared_media(ordinal: u32, prepared: PreparedMedia) -> Result<AssetPayload, ChannelError> {
+fn convert_prepared_media(
+    ordinal: u32,
+    prepared: PreparedMedia,
+) -> Result<AssetPayload, ChannelError> {
     let PreparedMedia {
         asset_ref,
         media_kind,
@@ -548,12 +1152,10 @@ fn convert_prepared_media(ordinal: u32, prepared: PreparedMedia) -> Result<Asset
         bytes,
     } = prepared;
     let asset_ref = ChannelAssetRef {
-        asset_id: ChannelAssetId::parse(asset_ref.asset_id.as_str()).map_err(|_| {
-            asset_refused(ordinal, "NONCANONICAL_ASSET_ID")
-        })?,
-        media_type: ChannelMediaType::parse(asset_ref.media_type.as_str()).map_err(|_| {
-            asset_refused(ordinal, "INVALID_MEDIA_TYPE")
-        })?,
+        asset_id: ChannelAssetId::parse(asset_ref.asset_id.as_str())
+            .map_err(|_| asset_refused(ordinal, "NONCANONICAL_ASSET_ID"))?,
+        media_type: ChannelMediaType::parse(asset_ref.media_type.as_str())
+            .map_err(|_| asset_refused(ordinal, "INVALID_MEDIA_TYPE"))?,
         byte_length: asset_ref.byte_length,
         orientation: asset_ref.orientation,
         encoded_width: asset_ref.encoded_width,
@@ -585,21 +1187,15 @@ fn convert_prepared_media(ordinal: u32, prepared: PreparedMedia) -> Result<Asset
 // Inbound: provider attachment -> explicit Asset import -> name-based status.
 // ---------------------------------------------------------------------------
 
-/// The Runtime's one inbound Attachment import seam. Unbound by default
-/// (every attachment is refused with the Channel asset code); bound by the
-/// route with the module's resolved Asset configuration, the sealed
-/// authority/grant facts, and the authenticated Channel account.
+/// The Runtime's inbound attachment seam. A bound seam holds one counted
+/// handle to the same identity-scoped owner as outbound and reconcile.
 pub struct ChannelAttachmentImport {
-    /// The ONE shared Asset store/capability set owned by the route's
-    /// registration (never a second service for the identity).
-    store: Option<Arc<SharedAssetStore>>,
-    /// The sealed Channel principal account this seam serves. Every
-    /// attachment request key must be scoped to exactly this account;
-    /// anything else is refused before any Asset call.
+    owner: Option<AssetRouteHandle>,
+    /// The sealed Channel principal account this seam serves.
     account: String,
-    /// The bounded authenticated provider attachment reader. The multimodal
-    /// bound construction always injects one; `None` exists only on the
-    /// fail-closed unbound (text-only) seam.
+    /// The bounded authenticated provider attachment reader. Provider access
+    /// stays on the caller side; only the resulting bounded bytes enter the
+    /// typed Asset import request.
     provider: Option<Box<dyn ProviderAttachmentReader>>,
 }
 
@@ -608,21 +1204,14 @@ impl ChannelAttachmentImport {
     /// transport effect.
     pub fn unbound() -> Self {
         Self {
-            store: None,
+            owner: None,
             account: String::new(),
             provider: None,
         }
     }
 
-    /// Bind the module's registered Asset store and the sealed principal
-    /// account, with the required bounded provider reader. Fails closed when
-    /// the grant does not authorize `host.asset.import`/`host.asset.status`
-    /// under the same extension/module authority, when the caller account is
-    /// not the sealed Channel principal account, when no registered Asset
-    /// route exists for this identity (register the outbound route first),
-    /// when the Asset content root differs from the registered one, or when
-    /// the supplied reader is missing. Binding never opens a new service:
-    /// the inbound seam shares the outbound registration's owned set.
+    /// Bind the already registered owner and verify the exact sealed account,
+    /// grants, generation, config revision, and canonical content root.
     pub fn bind(
         config: ResolvedAssetConfig,
         config_revision: i64,
@@ -636,34 +1225,27 @@ impl ChannelAttachmentImport {
                 detail: "the grant does not authorize host.asset.import/host.asset.status".into(),
             });
         }
-        // The account is a sealed fact of the current authority/grant, never
-        // an unchecked caller choice.
         let principal = route_principal(authority, grant)?;
         if principal.account() != account {
             return Err(HostRouteError::CapabilityDenied {
                 detail: "caller account does not match the sealed Channel principal account".into(),
             });
         }
-        // The exact shared Asset store the outbound route registered for this
-        // identity must serve the inbound imports (one adapter set per
-        // store/account/config lifecycle; never a second service).
-        let registration = asset_route_open(authority, grant, config_revision)?;
-        if registration.identity_root_key() != asset_root_key(&config.local_root) {
+        let owner = asset_route_open(authority, grant, config_revision)?;
+        if owner.identity_root_key() != asset_root_key(&config.local_root) {
             return Err(HostRouteError::CapabilityDenied {
                 detail: "inbound Asset content root does not match the registered outbound Asset root for this identity".into(),
             });
         }
         Ok(Self {
-            store: Some(registration.store()),
+            owner: Some(owner),
             account: account.to_string(),
             provider: Some(provider),
         })
     }
 
     /// Fail closed unless the attachment key is scoped to exactly this
-    /// seam's bound account. Called before any provider read or Asset call,
-    /// so a foreign or forged key can never import or query under this
-    /// domain.
+    /// seam's bound account, before provider access or an Asset request.
     fn check_attachment_ownership(
         &self,
         request: &AttachmentImportRequest,
@@ -678,38 +1260,46 @@ impl ChannelAttachmentImport {
         Ok(())
     }
 
-    /// Test-support: bind a pre-opened service and capability directly, so
-    /// the adapter's import/status path can be proven without Host
-    /// scaffolding. The provider is required here as well: the multimodal
-    /// seam never runs without a bounded provider reader.
+    /// Test support creates the service/capability inside an unregistered
+    /// owner and binds the provider to a counted route handle.
     #[cfg(test)]
-    pub(crate) fn for_test(
-        service: AssetService,
-        capability: AssetCapability,
+    fn for_test(
+        config: ResolvedAssetConfig,
+        domain: &str,
+        instance: &str,
+        module: &str,
         account: &str,
         provider: Box<dyn ProviderAttachmentReader>,
-    ) -> Self {
-        Self {
-            store: Some(Arc::new(SharedAssetStore {
-                service: std::cell::RefCell::new(service),
-                capability,
-            })),
+    ) -> Result<Self, HostRouteError> {
+        Ok(Self {
+            owner: Some(test_asset_route(config, domain, instance, module)?),
             account: account.to_string(),
             provider: Some(provider),
-        }
+        })
+    }
+
+    #[cfg(test)]
+    fn from_test_owner(
+        owner: &AssetRouteHandle,
+        account: &str,
+        provider: Box<dyn ProviderAttachmentReader>,
+    ) -> Result<Self, HostRouteError> {
+        Ok(Self {
+            owner: Some(owner.try_clone()?),
+            account: account.to_string(),
+            provider: Some(provider),
+        })
     }
 
     fn import_id_for(&self, request: &AttachmentImportRequest) -> String {
         // Stable 128-bit UUID-v7-shaped id derived from the sealed account
-        // and the Channel account-scoped idempotency key, so a restart
-        // replays the exact same durable key without any caller-chosen id.
+        // and account-scoped idempotency key, preserving restart identity.
         let mut bytes = [0u8; 16];
         let mut seed = self.account.as_bytes().to_vec();
         seed.push(0);
         seed.extend_from_slice(request.attachment_key.as_bytes());
         let digest = blake3::hash(&seed);
         bytes.copy_from_slice(&digest.as_bytes()[0..16]);
-        // v7 flavour: version 7 in the high nibble, variant 0b10 in byte 8.
         bytes[6] = (bytes[6] & 0x0f) | 0x70;
         bytes[8] = (bytes[8] & 0x3f) | 0x80;
         format!(
@@ -733,14 +1323,12 @@ impl ChannelAttachmentImport {
     ) -> Result<AttachmentImportStatus, ChannelError> {
         self.check_attachment_ownership(request)?;
         let import_id = self.import_id_for(request);
-        let Some(store) = self.store.as_ref() else {
+        let Some(owner) = self.owner.as_ref() else {
             return Err(attachment_refused(
                 &request.provider_key,
-                "no Asset store/capability is bound to the Channel inbound route",
+                "no Asset owner is bound to the Channel inbound route",
             ));
         };
-        let mut service = store.service.borrow_mut();
-        let capability = &store.capability;
         let Some(reader) = self.provider.as_mut() else {
             return Err(attachment_refused(
                 &request.provider_key,
@@ -762,38 +1350,32 @@ impl ChannelAttachmentImport {
             ));
         }
         let import_request = ImportRequest {
-            import_id: import_id.clone(),
-            instance_id: capability.instance_id().to_string(),
-            module_id: capability.module_id().to_string(),
+            import_id,
+            instance_id: owner.instance_id(),
+            module_id: owner.module_id().to_string(),
             activation_id: None,
             lease_token: None,
             media_kind: asset_kind_of_type(&request.declared_media_type),
             source: Source::InlineBase64 {
                 base64: strict_base64_encode(&bytes),
             },
-            declared_media_type: Some(
-                request
-                    .declared_media_type
-                    .as_str()
-                    .parse()
-                    .map_err(|_| {
-                        attachment_refused(&request.provider_key, "declared media type is invalid")
-                    })?,
-            ),
+            declared_media_type: Some(request.declared_media_type.as_str().parse().map_err(
+                |_| attachment_refused(&request.provider_key, "declared media type is invalid"),
+            )?),
             remote_required: false,
             expected_byte_length: Some(bytes.len() as u64),
             deadline: wire_deadline_after(120),
         };
-        match service.import(capability, &import_request) {
-            Ok(status) => Ok(map_import_status(status)),
-            Err(error) => {
-                let code = error.to_envelope().code;
-                Err(attachment_refused(
+        owner
+            .registration
+            .call_import(import_request)
+            .map(map_import_status)
+            .map_err(|error| {
+                attachment_refused(
                     &request.provider_key,
-                    &format!("asset import refused (code {code})"),
-                ))
-            }
-        }
+                    &format!("asset import refused (code {})", error.code()),
+                )
+            })
     }
 
     fn run_status(
@@ -802,27 +1384,22 @@ impl ChannelAttachmentImport {
     ) -> Result<AttachmentImportStatus, ChannelError> {
         self.check_attachment_ownership(request)?;
         let import_id = self.import_id_for(request);
-        let Some(store) = self.store.as_ref() else {
+        let Some(owner) = self.owner.as_ref() else {
             return Err(attachment_refused(
                 &request.provider_key,
-                "no Asset store/capability is bound to the Channel inbound route",
+                "no Asset owner is bound to the Channel inbound route",
             ));
         };
-        let mut service = store.service.borrow_mut();
-        let capability = &store.capability;
-        // Authoritative exact-key status through the shared Asset service:
-        // `Absent` is emitted only when no durable ImportRecord/effect exists
-        // for exactly this key under the bound account/domain.
-        match service.status(capability, &import_id) {
-            Ok(status) => Ok(map_import_status(status)),
-            Err(error) => {
-                let code = error.to_envelope().code;
-                Err(attachment_refused(
+        owner
+            .registration
+            .call_status(import_id)
+            .map(map_import_status)
+            .map_err(|error| {
+                attachment_refused(
                     &request.provider_key,
-                    &format!("asset status refused (code {code})"),
-                ))
-            }
-        }
+                    &format!("asset status refused (code {})", error.code()),
+                )
+            })
     }
 }
 
@@ -841,7 +1418,7 @@ fn map_import_status(status: StatusResult) -> AttachmentImportStatus {
                         Err(_) => {
                             return AttachmentImportStatus::Refused {
                                 code: "NONCANONICAL_ASSET_REF".to_string(),
-                            }
+                            };
                         }
                     },
                     media_type: match ChannelMediaType::parse(reference.media_type.as_str()) {
@@ -849,7 +1426,7 @@ fn map_import_status(status: StatusResult) -> AttachmentImportStatus {
                         Err(_) => {
                             return AttachmentImportStatus::Refused {
                                 code: "INVALID_MEDIA_TYPE".to_string(),
-                            }
+                            };
                         }
                     },
                     byte_length: reference.byte_length,
@@ -937,7 +1514,10 @@ mod tests {
 
     impl ProviderAttachmentReader for FakeProvider {
         fn read(&mut self, provider_key: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
-            let payload = self.payload.clone().ok_or_else(|| format!("no payload for {provider_key}"))?;
+            let payload = self
+                .payload
+                .clone()
+                .ok_or_else(|| format!("no payload for {provider_key}"))?;
             if provider_key == "missing" {
                 return Err("no provider object for key".to_string());
             }
@@ -975,29 +1555,32 @@ mod tests {
         }
     }
 
-    fn import_available(root: &std::path::Path, id: &str, bytes: &[u8]) -> (AssetService, AssetCapability, String) {
-        let mut service = AssetService::open(config_at(root)).expect("asset service");
-        let capability = service.issue_capability("domain-a", "instance-a", "module-a");
-        let imported = service
-            .import(&capability, &import_request(id, bytes))
-            .expect("import succeeds");
+    fn import_available(owner: &AssetRouteHandle, id: &str, bytes: &[u8]) -> String {
+        let mut request = import_request(id, bytes);
+        request.instance_id = owner.instance_id();
+        request.module_id = owner.module_id().to_string();
+        let imported = owner
+            .registration
+            .call_import(request)
+            .expect("import succeeds through owner");
         assert_eq!(imported.state, "available", "import must be available");
-        let asset_id = imported
+        imported
             .asset
             .expect("asset ref")
             .asset_id
             .as_str()
-            .to_string();
-        (service, capability, asset_id)
+            .to_string()
     }
 
     #[test]
     fn outbound_seam_prepares_media_field_for_field_under_a_lease() {
         let dir = tempfile::tempdir().expect("tempdir");
         let png = png_bytes(4, 2);
-        let (service, capability, asset_id) =
-            import_available(dir.path(), "0198ab31-6c44-7e8a-b2bb-000000000001", &png);
-        let mut seam = ChannelAssetSeam::for_test(service, capability, "test-owner");
+        let owner = test_asset_route(config_at(dir.path()), "domain-a", "instance-a", "module-a")
+            .expect("test Asset owner");
+        let asset_id = import_available(&owner, "0198ab31-6c44-7e8a-b2bb-000000000001", &png);
+        let mut seam =
+            ChannelAssetSeam::from_registration(&owner).expect("open shared owner handle");
 
         let premise = AssetPremise {
             ordinal: 0,
@@ -1031,8 +1614,10 @@ mod tests {
     fn outbound_seam_fails_closed_on_unavailable_and_unbound_assets() {
         let dir = tempfile::tempdir().expect("tempdir");
         let png = png_bytes(4, 2);
-        let (service, capability, asset_id) =
-            import_available(dir.path(), "0198ab31-6c44-7e8a-b2bb-000000000002", &png);
+        let config = config_at(dir.path());
+        let owner = test_asset_route(config.clone(), "domain-a", "instance-a", "module-a")
+            .expect("test Asset owner");
+        let asset_id = import_available(&owner, "0198ab31-6c44-7e8a-b2bb-000000000002", &png);
 
         let premise = |asset: &str| AssetPremise {
             ordinal: 0,
@@ -1044,7 +1629,8 @@ mod tests {
         // A never-imported but canonical id is refused by the asset authority
         // with the Channel asset code and no path disclosure.
         let forged = "ast_b3_".to_string() + &"a".repeat(52);
-        let mut seam = ChannelAssetSeam::for_test(service, capability.clone(), "test-owner");
+        let mut seam =
+            ChannelAssetSeam::from_registration(&owner).expect("open shared owner handle");
         let refused = seam.prepare_assets(&[premise(&forged)]);
         match refused {
             Err(error) => {
@@ -1059,12 +1645,13 @@ mod tests {
             Ok(_) => panic!("unavailable asset must fail closed"),
         }
 
-        // A foreign-domain capability cannot prepare the identical AVAILABLE
-        // asset: the lease/authority is domain-bound.
-        let (service, _cap) = SharedAssetStore::into_parts(seam.take_store());
-        let foreign = service.issue_capability("other-domain", "instance-a", "module-a");
+        // A distinct foreign-domain owner cannot prepare the identical
+        // durable asset. Drop the first owner before opening the next service.
+        drop(seam);
+        drop(owner);
         let mut foreign_seam =
-            ChannelAssetSeam::for_test(service, foreign, "test-owner");
+            ChannelAssetSeam::for_test(config, "other-domain", "instance-a", "module-a")
+                .expect("foreign owner starts");
         let cross_domain = foreign_seam.prepare_assets(&[premise(&asset_id)]);
         match cross_domain {
             Err(error) => {
@@ -1080,39 +1667,47 @@ mod tests {
         let mut seam = ChannelAssetSeam::unbound();
         let premise = AssetPremise {
             ordinal: 0,
-            asset_id: ChannelAssetId::parse(
-                &("ast_b3_".to_string() + &"a".repeat(52)),
-            )
-            .expect("canonical id"),
+            asset_id: ChannelAssetId::parse(&("ast_b3_".to_string() + &"a".repeat(52)))
+                .expect("canonical id"),
             media_type: ChannelMediaType::parse("image/png").expect("canonical type"),
             view: None,
         };
-        let err = seam.prepare_assets(&[premise]).expect_err("unbound refuses");
+        let err = seam
+            .prepare_assets(&[premise])
+            .expect_err("unbound refuses");
         assert_eq!(err.code, codes::ASSET_IMPORT_FAILED);
         assert_eq!(err.outcome, ChannelOutcome::NotApplied);
-        assert!(seam.prepare_assets(&[]).unwrap().is_empty(), "no premises -> no work");
+        assert!(
+            seam.prepare_assets(&[]).unwrap().is_empty(),
+            "no premises -> no work"
+        );
     }
 
     #[test]
     fn inbound_seam_imports_available_and_reports_absent_for_unknown_keys() {
         let dir = tempfile::tempdir().expect("tempdir");
         let png = png_bytes(4, 2);
-        let service = AssetService::open(config_at(dir.path())).expect("service");
-        let capability = service.issue_capability("domain-a", "instance-a", "module-a");
         let mut seam = ChannelAttachmentImport::for_test(
-            service,
-            capability.clone(),
+            config_at(dir.path()),
+            "domain-a",
+            "instance-a",
+            "module-a",
             "account-a",
             Box::new(FakeProvider::serving(png.clone())),
-        );
+        )
+        .expect("inbound owner starts");
 
-        let request = AttachmentImportRequest::new("account-a", "evt-1", &dolly_channel::attachment::InboundAttachment {
-            ordinal: 0,
-            provider_key: "provider-blob-1".to_string(),
-            media_kind: ChannelMediaKind::Image,
-            declared_media_type: ChannelMediaType::parse("image/png").expect("type"),
-            byte_length_hint: png.len() as u64,
-        });
+        let request = AttachmentImportRequest::new(
+            "account-a",
+            "evt-1",
+            &dolly_channel::attachment::InboundAttachment {
+                ordinal: 0,
+                provider_key: "provider-blob-1".to_string(),
+                media_kind: ChannelMediaKind::Image,
+                declared_media_type: ChannelMediaType::parse("image/png").expect("type"),
+                byte_length_hint: png.len() as u64,
+            },
+        );
         match seam.import(&request).expect("import runs") {
             AttachmentImportStatus::Available(available) => {
                 assert_eq!(available.asset_ref.media_type.as_str(), "image/png");
@@ -1122,32 +1717,36 @@ mod tests {
             other => panic!("expected Available, got {other:?}"),
         }
         // Authoritative absent only for a key with no durable import record.
-        let unknown = AttachmentImportRequest::new("account-a", "nope", &dolly_channel::attachment::InboundAttachment {
-            ordinal: 1,
-            provider_key: "never-imported".to_string(),
-            media_kind: ChannelMediaKind::Image,
-            declared_media_type: ChannelMediaType::parse("image/png").expect("type"),
-            byte_length_hint: 4,
-        });
+        let unknown = AttachmentImportRequest::new(
+            "account-a",
+            "nope",
+            &dolly_channel::attachment::InboundAttachment {
+                ordinal: 1,
+                provider_key: "never-imported".to_string(),
+                media_kind: ChannelMediaKind::Image,
+                declared_media_type: ChannelMediaType::parse("image/png").expect("type"),
+                byte_length_hint: 4,
+            },
+        );
         match seam.status(&unknown).expect("status runs") {
             AttachmentImportStatus::Absent => {}
             other => panic!("expected Absent, got {other:?}"),
         }
     }
 
-
     #[test]
     fn inbound_seam_refuses_foreign_account_and_missing_provider_before_import() {
         let dir = tempfile::tempdir().expect("tempdir");
         let png = png_bytes(4, 2);
-        let service = AssetService::open(config_at(dir.path())).expect("service");
-        let capability = service.issue_capability("domain-a", "instance-a", "module-a");
         let mut seam = ChannelAttachmentImport::for_test(
-            service,
-            capability.clone(),
+            config_at(dir.path()),
+            "domain-a",
+            "instance-a",
+            "module-a",
             "account-a",
             Box::new(FakeProvider::serving(png.clone())),
-        );
+        )
+        .expect("inbound owner starts");
 
         // A key scoped to a different account is refused before any provider
         // read or Asset call (mismatch rejection, exact-key/domain binding).
@@ -1162,21 +1761,29 @@ mod tests {
                 byte_length_hint: png.len() as u64,
             },
         );
-        let err = seam.import(&foreign).expect_err("foreign account must refuse");
+        let err = seam
+            .import(&foreign)
+            .expect_err("foreign account must refuse");
         assert_eq!(err.code, codes::ASSET_IMPORT_FAILED);
         assert_eq!(err.outcome, ChannelOutcome::NotApplied);
         // No provider read happened and no durable import record exists.
-        let err = seam.status(&foreign).expect_err("foreign account must refuse status");
+        let err = seam
+            .status(&foreign)
+            .expect_err("foreign account must refuse status");
         assert_eq!(err.code, codes::ASSET_IMPORT_FAILED);
 
         // A provider that cannot serve the authenticated key fails closed
         // before any Asset record, with zero duplicate effect.
+        let other_dir = tempfile::tempdir().expect("other tempdir");
         let mut on_missing = ChannelAttachmentImport::for_test(
-            AssetService::open(config_at(dir.path())).expect("service"),
-            capability.clone(),
+            config_at(other_dir.path()),
+            "domain-b",
+            "instance-a",
+            "module-a",
             "account-a",
             Box::new(FakeProvider::default()),
-        );
+        )
+        .expect("missing-provider owner starts");
         let missing = AttachmentImportRequest::new(
             "account-a",
             "evt-m",
@@ -1188,7 +1795,9 @@ mod tests {
                 byte_length_hint: png.len() as u64,
             },
         );
-        let err = on_missing.import(&missing).expect_err("missing provider object must refuse");
+        let err = on_missing
+            .import(&missing)
+            .expect_err("missing provider object must refuse");
         assert_eq!(err.code, codes::ASSET_IMPORT_FAILED);
     }
 
@@ -1280,8 +1889,7 @@ mod tests {
         let now = "2026-08-28T00:00:00.000000Z";
         let mut runtime = rusqlite::Connection::open_in_memory().unwrap();
         let authority = {
-            let mut store =
-                dolly_storage::SqliteCoreStore::new(&mut runtime).expect("core schema");
+            let mut store = dolly_storage::SqliteCoreStore::new(&mut runtime).expect("core schema");
             let config = serde_json::json!({
                 "execution_timeout_ms": 120000,
                 "lease_grace_ms": 30000,
@@ -1304,7 +1912,9 @@ mod tests {
                 )
                 .expect("config install");
             assert_eq!(transition.outcome, TransitionOutcome::Committed);
-            store.bootstrap_host_connection().expect("host connection bootstrap");
+            store
+                .bootstrap_host_connection()
+                .expect("host connection bootstrap");
             let graph = life_graph("web-channel");
             let (_, gdigest) = dolly_canonical_json::canonicalize(&graph).expect("graph canonical");
             let transition = store
@@ -1341,14 +1951,9 @@ mod tests {
             authority
         };
         let grant = {
-            let store =
-                dolly_storage::SqliteCoreStore::new(&mut runtime).expect("core schema");
+            let store = dolly_storage::SqliteCoreStore::new(&mut runtime).expect("core schema");
             store
-                .current_host_capability_grant(
-                    &authority,
-                    "org.dolly.channel",
-                    "web-channel",
-                )
+                .current_host_capability_grant(&authority, "org.dolly.channel", "web-channel")
                 .expect("current grant read")
                 .expect("grant present")
         };
@@ -1364,99 +1969,240 @@ mod tests {
     }
 
     #[test]
-    fn asset_route_registration_is_shared_bounded_and_lifecycle_closed() {
+    fn asset_owner_serializes_concurrent_routes_and_closes_without_overlap() {
         let baseline = asset_route_registry_len();
-        let (_db, authority, grant) = life_authority_grant("acc-life");
+        let (mut db, authority, grant) = life_authority_grant("acc-life");
         let dir = tempfile::tempdir().expect("tempdir");
         let other_dir = tempfile::tempdir().expect("other tempdir");
         let config = life_config(dir.path());
+        let png = png_bytes(4, 2);
 
-        // Registering opens the single Asset service/capability set ONCE;
-        // a second registration shares the exact same owned set.
         let first = super::asset_route_register(&authority, &grant, 1, config.clone())
             .expect("first registration");
         let second = super::asset_route_register(&authority, &grant, 1, config.clone())
             .expect("second registration");
-        assert!(
-            std::sync::Arc::ptr_eq(&first, &second),
-            "re-registration shares the exact owned set, never a second service"
+        let opened = super::asset_route_open(&authority, &grant, 1).expect("shared open");
+        assert!(first.same_registration(&second));
+        assert!(first.same_registration(&opened));
+        assert_eq!(asset_route_registry_len(), baseline + 1);
+
+        let asset_id = import_available(&first, "0198ab31-6c44-7e8a-b2bb-000000000120", &png);
+        let prepare_premise = AssetPremise {
+            ordinal: 0,
+            asset_id: ChannelAssetId::parse(&asset_id).expect("canonical id"),
+            media_type: ChannelMediaType::parse("image/png").expect("canonical type"),
+            view: None,
+        };
+        let mut prepare =
+            ChannelAssetSeam::from_registration(&first).expect("prepare handle opens");
+        let mut import = ChannelAttachmentImport::from_test_owner(
+            &first,
+            "test-account",
+            Box::new(FakeProvider::serving(png.clone())),
+        )
+        .expect("import handle opens");
+        let import_request = AttachmentImportRequest::new(
+            "test-account",
+            "evt-concurrent",
+            &dolly_channel::attachment::InboundAttachment {
+                ordinal: 0,
+                provider_key: "provider-concurrent".to_string(),
+                media_kind: ChannelMediaKind::Image,
+                declared_media_type: ChannelMediaType::parse("image/png").expect("type"),
+                byte_length_hint: png.len() as u64,
+            },
         );
-        assert_eq!(asset_route_registry_len(), baseline + 1, "one entry per identity");
-        // Opens reuse the same owned set.
-        let opened = super::asset_route_open(&authority, &grant, 1).expect("open shares");
-        assert!(std::sync::Arc::ptr_eq(&first, &opened), "open never constructs a new service");
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let prepare_barrier = Arc::clone(&barrier);
+        let prepare_thread = std::thread::spawn(move || {
+            prepare_barrier.wait();
+            prepare
+                .prepare_assets(&[prepare_premise])
+                .expect("concurrent prepare")
+        });
+        let import_barrier = Arc::clone(&barrier);
+        let import_thread = std::thread::spawn(move || {
+            import_barrier.wait();
+            import.import(&import_request).expect("concurrent import")
+        });
+        barrier.wait();
+        assert_eq!(prepare_thread.join().expect("prepare thread").len(), 1);
+        assert!(matches!(
+            import_thread.join().expect("import thread"),
+            AttachmentImportStatus::Available(_)
+        ));
+        assert_eq!(
+            first
+                .registration
+                .owner
+                .metrics
+                .maximum_active_operations
+                .load(Ordering::SeqCst),
+            1,
+            "one owner serializes every AssetService operation"
+        );
+        assert_eq!(
+            first
+                .registration
+                .owner
+                .metrics
+                .queued_requests
+                .load(Ordering::SeqCst),
+            0
+        );
 
-        // A mismatched content root for the same identity fails closed and
-        // cannot reuse the registered store.
-        let mismatched =
+        let root_mismatch =
             super::asset_route_register(&authority, &grant, 1, life_config(other_dir.path()));
-        match mismatched {
-            Err(HostRouteError::CapabilityDenied { .. }) => {}
-            _ => panic!("expected CapabilityDenied for a mismatched root, got an unexpected success"),
-        }
-        assert_eq!(asset_route_registry_len(), baseline + 1, "no duplicate on mismatch");
+        assert!(matches!(
+            root_mismatch,
+            Err(HostRouteError::CapabilityDenied { .. })
+        ));
+        assert!(matches!(
+            super::asset_route_open(&authority, &grant, 99),
+            Err(HostRouteError::CapabilityDenied { .. })
+        ));
 
-        // Repeated register/open/close (unregister) cycles return the
-        // registry to its baseline: bounded growth.
+        let generation_two = {
+            let mut store = dolly_storage::SqliteCoreStore::new(&mut db).expect("core schema");
+            store
+                .install_host_capability_grant(
+                    &authority,
+                    grant.extension_id(),
+                    grant.module_id(),
+                    2,
+                    grant.descriptor_revision(),
+                    grant.descriptor_digest(),
+                    grant.manifest_revision(),
+                    grant.manifest_digest(),
+                    grant.graph_revision(),
+                    grant.graph_digest(),
+                    &["host.asset.import", "host.asset.status"],
+                )
+                .expect("replace grant generation");
+            store
+                .current_host_capability_grant(&authority, grant.extension_id(), grant.module_id())
+                .expect("read generation")
+                .expect("generation present")
+        };
+        assert!(matches!(
+            super::asset_route_register(&authority, &generation_two, 1, config.clone()),
+            Err(HostRouteError::CapabilityDenied { .. })
+        ));
+        assert!(matches!(
+            super::asset_route_open(&authority, &generation_two, 1),
+            Err(HostRouteError::CapabilityDenied { .. })
+        ));
+
+        let mut old_seam =
+            ChannelAssetSeam::from_registration(&first).expect("old handle before close");
+        assert!(super::asset_route_unregister(&authority, &grant, 1).expect("unregister"));
+        assert!(!super::asset_route_unregister(&authority, &grant, 1).expect("idempotent close"));
+        assert!(ChannelAssetSeam::from_registration(&first).is_err());
+        let closed_error = old_seam
+            .prepare_assets(&[AssetPremise {
+                ordinal: 0,
+                asset_id: ChannelAssetId::parse(&asset_id).expect("canonical id"),
+                media_type: ChannelMediaType::parse("image/png").expect("canonical type"),
+                view: None,
+            }])
+            .expect_err("existing handle observes close");
+        assert_eq!(closed_error.code, codes::ASSET_IMPORT_FAILED);
+        assert!(matches!(
+            super::asset_route_register(&authority, &grant, 1, config.clone()),
+            Err(HostRouteError::Rejected { ref code, .. }) if code == "ASSET_OWNER_CLOSING"
+        ));
+        assert_eq!(
+            asset_route_registry_len(),
+            baseline + 1,
+            "closing registration remains while handles are live"
+        );
+
+        let old_registration = Arc::clone(&first.registration);
+        drop(old_seam);
+        drop(opened);
+        drop(second);
+        drop(first);
+        assert_eq!(old_registration.state(), AssetOwnerState::Closed);
+        assert!(
+            !old_registration
+                .owner
+                .metrics
+                .thread_live
+                .load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            old_registration
+                .owner
+                .metrics
+                .queued_requests
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert!(old_registration.owner.join.lock().is_none());
+        assert_eq!(asset_route_registry_len(), baseline);
+
+        let replacement =
+            super::asset_route_register(&authority, &generation_two, 1, config.clone())
+                .expect("new generation registers after joined close");
+        let replacement_again =
+            super::asset_route_register(&authority, &generation_two, 1, config.clone())
+                .expect("new generation shares once");
+        assert!(replacement.same_registration(&replacement_again));
+        assert!(super::asset_route_unregister(&authority, &generation_two, 1).unwrap());
+        drop(replacement_again);
+        drop(replacement);
+        assert_eq!(asset_route_registry_len(), baseline);
+
         for cycle in 0..5 {
             let registered =
-                super::asset_route_register(&authority, &grant, 1, config.clone())
+                super::asset_route_register(&authority, &generation_two, 1, config.clone())
                     .expect("cycle register");
-            let _unused = super::asset_route_open(&authority, &grant, 1).expect("cycle open");
-            assert_eq!(
-                asset_route_registry_len(),
-                baseline + 1,
-                "cycle {cycle} holds exactly one live registration"
+            let opened =
+                super::asset_route_open(&authority, &generation_two, 1).expect("cycle open");
+            assert!(registered.same_registration(&opened));
+            assert!(super::asset_route_unregister(&authority, &generation_two, 1).unwrap());
+            assert!(
+                super::asset_route_register(&authority, &generation_two, 1, config.clone())
+                    .is_err()
             );
-            let removed = super::asset_route_unregister(&authority, &grant, 1).expect("cycle close");
-            assert!(removed, "cycle {cycle} unregister removes the entry");
+            drop(opened);
             drop(registered);
             assert_eq!(
                 asset_route_registry_len(),
                 baseline,
-                "cycle {cycle} returns the registry to its baseline"
+                "cycle {cycle} returns registry to baseline after join"
             );
         }
 
-        // In-use unregister is safe and fail-closed for new opens: the
-        // registration is withdrawn while a live handle keeps working.
-        let held = super::asset_route_register(&authority, &grant, 1, config.clone())
-            .expect("re-register");
-        let removed = super::asset_route_unregister(&authority, &grant, 1).expect("withdraw while in use");
-        assert!(removed);
-        match super::asset_route_open(&authority, &grant, 1) {
-            Err(HostRouteError::CapabilityDenied { .. }) => {}
-            _ => panic!("withdrawn registration must fail new opens, got an unexpected success"),
-        }
-        // The held handle's shared store is still alive and usable.
-        let mut seam = ChannelAssetSeam::from_registration(&held);
-        let refused = seam.prepare_assets(&[AssetPremise {
-            ordinal: 0,
-            asset_id: ChannelAssetId::parse(&("ast_b3_".to_string() + &"a".repeat(52)))
-                .expect("canonical id"),
-            media_type: ChannelMediaType::parse("image/png").expect("type"),
-            view: None,
-        }]);
-        let err = refused.expect_err("the withdrawn handle still answers through the owned set");
-        assert_eq!(err.code, codes::ASSET_IMPORT_FAILED);
-        drop(seam);
-        drop(held);
-
-        // Stale/mismatched identity can never reuse: registering under the
-        // wrong revision has no entry and fails closed.
-        match super::asset_route_open(&authority, &grant, 99) {
-            Err(HostRouteError::CapabilityDenied { .. }) => {}
-            _ => panic!("a stale/mismatched identity must fail closed, got an unexpected success"),
-        }
-
-        // Bounded shutdown releases every registration.
-        let _last = super::asset_route_register(&authority, &grant, 1, config).expect("final register");
-        super::asset_route_shutdown();
+        let shutdown_handle = super::asset_route_register(&authority, &generation_two, 1, config)
+            .expect("shutdown registration");
+        let shutdown_registration = Arc::clone(&shutdown_handle.registration);
+        super::asset_route_shutdown().expect("bounded shutdown joins owner");
+        assert_eq!(shutdown_registration.state(), AssetOwnerState::Closed);
+        assert!(
+            !shutdown_registration
+                .owner
+                .metrics
+                .thread_live
+                .load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            shutdown_registration
+                .owner
+                .metrics
+                .queued_requests
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert!(shutdown_registration.owner.join.lock().is_none());
         assert_eq!(
             asset_route_registry_len(),
-            0,
-            "shutdown releases every registered adapter set"
+            baseline + 1,
+            "closed entry remains until the live handle drops"
         );
+        assert!(super::asset_route_open(&authority, &generation_two, 1).is_err());
+        drop(shutdown_handle);
+        assert_eq!(asset_route_registry_len(), baseline);
     }
 
     // -------------------------------------------------------------------
@@ -1497,7 +2243,11 @@ mod tests {
         };
         let original_ptr = prepared.bytes.as_ptr();
         let payload = convert_prepared_media(0, prepared).expect("conversion consumes by value");
-        assert_eq!(payload.bytes.len(), 48 * 1024, "exact large bounded payload");
+        assert_eq!(
+            payload.bytes.len(),
+            48 * 1024,
+            "exact large bounded payload"
+        );
         assert_eq!(payload.bytes[0], 0xAB, "exact byte content");
         assert_eq!(
             payload.bytes.as_ptr(),
