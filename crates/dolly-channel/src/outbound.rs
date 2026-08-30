@@ -839,19 +839,24 @@ pub(crate) fn transport_and_settle(
     apply_transport_observations(config, ledger, &request.action_id, now, result)
 }
 
-/// Freeze a zero-effect failure as a terminal ActionResult. Used only before
-/// transport send, including Asset payload preparation and local expiry
-/// failures.
+/// Freeze a pre-provider-effect failure as the one authoritative terminal
+/// ActionResult. The original stable code/message survive, while the envelope
+/// is normalized to `retryable:false`, `outcome:not_applied`,
+/// `delivery_outcome:not_sent`, and `result:null`.
 pub(crate) fn settle_pre_effect_rejection(
     ledger: &mut ChannelLedger,
     action_id: &str,
     now: &str,
-    error: ChannelError,
+    mut error: ChannelError,
 ) -> SendDispatchResult {
+    error.retryable = false;
+    error.outcome = ChannelOutcome::NotApplied;
+    error.details.retain(|(key, _)| key != "delivery_outcome");
+    let error = error.with_delivery(ChannelDeliveryOutcome::NotSent);
     let result = error_to_action_result(action_id, error.clone());
     let result_jcs = canonicalize(&result)
         .map(|(bytes, _)| String::from_utf8(bytes.as_bytes().to_vec()).expect("canonical UTF-8"))
-        .unwrap_or_else(|_| "canonicalize-failed".to_string());
+        .expect("pre-effect ActionResult is canonical");
     if let Some(entry) = ledger.outbound.get_mut(action_id) {
         for piece in &mut entry.pieces {
             piece.outcome = Some(PieceOutcome::Rejected {

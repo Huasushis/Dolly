@@ -20,7 +20,7 @@ mod common;
 
 use common::g4::*;
 use dolly_channel::asset::{
-    AssetPayload, AssetPremise, AssetPreparation, AssetRef, ContentHash, MediaKind,
+    AssetPayload, AssetPremise, AssetPreparation, AssetRef, ContentHash, MediaKind, MediaType,
 };
 use dolly_channel::error::codes;
 use dolly_channel::transport::{
@@ -2476,6 +2476,7 @@ fn generic_ingress_without_manifest_cannot_mint_send_authority() {
 struct RefusingAssetPreparation {
     refuse_code: Option<String>,
     lease_expiry_unix_ms: u64,
+    authoritative_media_type: Option<MediaType>,
     inner: std::sync::Arc<std::sync::Mutex<RefusingInner>>,
 }
 
@@ -2489,6 +2490,7 @@ impl Default for RefusingAssetPreparation {
         Self {
             refuse_code: None,
             lease_expiry_unix_ms: 2_000_000_000_000,
+            authoritative_media_type: None,
             inner: Default::default(),
         }
     }
@@ -2505,6 +2507,13 @@ impl RefusingAssetPreparation {
     fn expired_lease() -> Self {
         Self {
             lease_expiry_unix_ms: 1,
+            ..Self::default()
+        }
+    }
+
+    fn mismatched_media_type(media_type: &str) -> Self {
+        Self {
+            authoritative_media_type: Some(MediaType::parse(media_type).unwrap()),
             ..Self::default()
         }
     }
@@ -2531,20 +2540,24 @@ impl AssetPreparation for RefusingAssetPreparation {
         if let Some(code) = &self.refuse_code {
             return Err(dolly_channel::ChannelError::new(
                 code.clone(),
-                false,
-                ChannelOutcome::NotApplied,
+                true,
+                ChannelOutcome::Unknown,
                 "Asset payload preparation failed under Channel authority",
             ));
         }
         Ok(premises
             .iter()
             .map(|premise| {
+                let media_type = self
+                    .authoritative_media_type
+                    .clone()
+                    .unwrap_or_else(|| premise.media_type.clone());
                 let digest: [u8; 32] = (&premise.asset_id).into();
-                let media_kind = if premise.media_type.as_str().starts_with("image/") {
+                let media_kind = if media_type.as_str().starts_with("image/") {
                     MediaKind::Image
-                } else if premise.media_type.as_str().starts_with("audio/") {
+                } else if media_type.as_str().starts_with("audio/") {
                     MediaKind::Audio
-                } else if premise.media_type.as_str().starts_with("video/") {
+                } else if media_type.as_str().starts_with("video/") {
                     MediaKind::Video
                 } else {
                     MediaKind::File
@@ -2552,7 +2565,7 @@ impl AssetPreparation for RefusingAssetPreparation {
                 AssetPayload {
                     asset_ref: AssetRef {
                         asset_id: premise.asset_id.clone(),
-                        media_type: premise.media_type.clone(),
+                        media_type,
                         byte_length: 1000,
                         orientation: Some(1),
                         encoded_width: Some(1000),
@@ -2590,6 +2603,28 @@ fn asset_part(asset_id: &str, media_type: &str) -> Value {
         "asset_id": asset_id,
         "media_type": media_type
     })
+}
+
+fn assert_exact_pre_effect_envelope(result_jcs: &str, action_id: &str, code: &str, message: &str) {
+    let envelope: Value = serde_json::from_str(result_jcs).expect("canonical ActionResult JSON");
+    assert_eq!(
+        envelope,
+        json!({
+            "schema": "dolly.action-result/v1",
+            "action_id": action_id,
+            "status": "failed",
+            "result": null,
+            "error": {
+                "code": code,
+                "retryable": false,
+                "outcome": "not_applied",
+                "message": message,
+                "details": {
+                    "delivery_outcome": "not_sent"
+                }
+            }
+        })
+    );
 }
 
 #[test]
@@ -2652,7 +2687,12 @@ fn targeted_asset_send_refused_by_injected_seam_yields_frozen_rejected_with_zero
         } => {
             assert_eq!(rejected_id, action_id);
             assert_eq!(state, OutboundState::Failed);
-            assert!(result_jcs.contains(codes::ASSET_IMPORT_FAILED));
+            assert_exact_pre_effect_envelope(
+                &result_jcs,
+                action_id,
+                codes::ASSET_IMPORT_FAILED,
+                "Asset payload preparation failed under Channel authority",
+            );
         }
         other => panic!("expected durable terminal rejection, got {other:?}"),
     }
@@ -2668,6 +2708,24 @@ fn targeted_asset_send_refused_by_injected_seam_yields_frozen_rejected_with_zero
     assert_eq!(rejected.entry.state, OutboundState::Failed);
     assert_eq!(rejected.entry.dispatched_at, None, "failure precedes claim");
     assert!(
+        rejected
+            .entry
+            .attempts
+            .iter()
+            .all(|attempt| attempt.kind != "dispatch"),
+        "no Dispatched marker"
+    );
+    assert_exact_pre_effect_envelope(
+        rejected
+            .entry
+            .result_jcs
+            .as_deref()
+            .expect("durable result"),
+        action_id,
+        codes::ASSET_IMPORT_FAILED,
+        "Asset payload preparation failed under Channel authority",
+    );
+    assert!(
         reopened.list_pending_outbound().unwrap().is_empty(),
         "no durable queue occupancy"
     );
@@ -2681,7 +2739,101 @@ fn targeted_asset_send_refused_by_injected_seam_yields_frozen_rejected_with_zero
     assert_eq!(prepared[0].ordinal, 1);
     assert_eq!(prepared[0].asset_id.as_str(), ASSET_ID);
     assert_eq!(prepared[0].media_type.as_str(), "image/png");
+
     assert_eq!(prepared[0].view, None);
+}
+#[test]
+fn authoritative_media_mismatch_freezes_exact_not_sent_terminal_before_transport() {
+    const ASSET_ID: &str = "ast_b3_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mut fixture = setup("consumer-asset-media-mismatch");
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000846";
+    let config = multimodal_channel_config();
+    commit_block_with_config(
+        &mut fixture.harness,
+        "consumer-asset-media-mismatch",
+        "ing-1",
+        &format!("{action_id}-block"),
+        send_block_with_asset_parts(
+            MODULE_ID,
+            action_id,
+            &fixture.session,
+            json!([asset_part(ASSET_ID, "image/png")]),
+        ),
+        vec!["page-c".to_string()],
+        config.clone(),
+    );
+    let transport = SharedTransport::new(true);
+    let assets = RefusingAssetPreparation::mismatched_media_type("image/jpeg");
+    let mut module_conn = reopen_module_store(&fixture);
+    let gate = OutboundQueueGate::register(
+        &config,
+        &mut module_conn,
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .unwrap();
+    let mut consumer = OutboundConsumer::with_asset_preparation(
+        config,
+        Box::new(channel_clock()),
+        &mut module_conn,
+        &mut fixture.harness.connection,
+        gate,
+        Box::new(transport.clone()),
+        Box::new(assets),
+        &fixture.harness.authority,
+        &fixture.harness.grant,
+    )
+    .expect("consumer registration");
+
+    let expected_message = "asset part at ordinal 0 is refused: the authoritative detected media type is image/jpeg but the committed Action declares image/png";
+    let outcomes = consumer.consume(&far_deadline()).expect("consume");
+    match outcomes.as_slice() {
+        [
+            dolly_channel::ConsumerOutcome::Terminal {
+                action_id: rejected_id,
+                state,
+                result_jcs,
+            },
+        ] => {
+            assert_eq!(rejected_id, action_id);
+            assert_eq!(*state, OutboundState::Failed);
+            assert_exact_pre_effect_envelope(
+                result_jcs,
+                action_id,
+                codes::MALFORMED_EVENT,
+                expected_message,
+            );
+        }
+        other => panic!("expected exact terminal media refusal, got {other:?}"),
+    }
+    assert_eq!(transport.calls().len(), 0, "zero provider transport calls");
+    drop(consumer);
+
+    let mut reopened = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
+    let rejected = reopened
+        .find_outbound(action_id)
+        .unwrap()
+        .expect("durable media refusal");
+    assert_eq!(rejected.entry.state, OutboundState::Failed);
+    assert_eq!(rejected.entry.dispatched_at, None);
+    assert!(
+        rejected
+            .entry
+            .attempts
+            .iter()
+            .all(|attempt| attempt.kind != "dispatch")
+    );
+    assert_exact_pre_effect_envelope(
+        rejected
+            .entry
+            .result_jcs
+            .as_deref()
+            .expect("durable result"),
+        action_id,
+        codes::MALFORMED_EVENT,
+        expected_message,
+    );
+    assert!(reopened.list_pending_outbound().unwrap().is_empty());
 }
 
 #[test]
@@ -2750,6 +2902,11 @@ fn targeted_asset_send_is_never_silently_dropped_by_the_production_consumer() {
             "{label}: zero durable outbound rows"
         );
         drop(consumer);
+        let mut store = SqliteChannelStore::new(&mut module_conn, &fixture.principal, 1).unwrap();
+        assert!(
+            store.find_outbound(action_id).unwrap().is_none(),
+            "{label}: structural pre-admission rejection has no terminal row"
+        );
     }
 }
 
